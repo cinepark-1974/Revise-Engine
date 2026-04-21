@@ -1247,10 +1247,12 @@ def show_step_4_complete():
             "verify":   st.session_state.verify_result,
         }
         json_bytes = json.dumps(full_state, ensure_ascii=False, indent=2).encode("utf-8")
+        safe_title = re.sub(r'[/*?:"<>|]', '_', title)
+        date_str = datetime.now().strftime("%Y%m%d")
         st.download_button(
             "📋 전체 JSON 다운로드",
             data=json_bytes,
-            file_name=f"{re.sub(r'[/*?:\"<>|]', '_', title)}_revise_full_{datetime.now().strftime('%Y%m%d')}.json",
+            file_name=f"{safe_title}_revise_full_{date_str}.json",
             mime="application/json",
             key="dl_json_full",
             use_container_width=True,
