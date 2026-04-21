@@ -140,21 +140,16 @@ Rewrite Engine이 "무엇이 문제인지"를 알려준다면, Revise Engine은 
 
 ---
 
-## 버전 히스토리
+## 버전
 
-### v1.0 (2026-04-21)
-- 초기 릴리스
-- 영화 시나리오 전용 (시리즈·소설은 별도 엔진)
+**v1.0** (2026-04-21) — 초기 릴리스
+
+- 영화 시나리오 전용 (시리즈·소설은 별도 엔진 예정)
 - 3-Stage 파이프라인 + 듀얼 모델 정책
 - AI ESCAPE A1~A20 내장
 - 9장르 Rule Pack 내장
 - LOCKED 우선 원칙
 - DOCX 입출력 + JSON 백업
-
-### 로드맵
-- v1.1: Rewrite Engine JSON 연동 (CHRIS+SHIHO 자동 파싱)
-- v2.0: Series Engine 연동 (OTT 시리즈 에피소드 수정)
-- v3.0: Novel Engine 연동 (장편 소설 챕터 수정)
 
 ---
 
