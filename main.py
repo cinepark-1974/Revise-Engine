@@ -212,6 +212,7 @@ INIT_STATE = {
     "raw_filename": "",
     "instruction": "",          # 수정 지시문
     "locked": "",               # LOCKED 요소
+    "profession_input": "",     # 주요 캐릭터 직업 (선택사항)
     "genre": "드라마",
     "intensity": "BALANCED",
     "diagnose_result": None,    # Stage 1 JSON 결과
@@ -697,6 +698,7 @@ def run_diagnose(client):
         locked=st.session_state.locked,
         genre=st.session_state.genre,
         intensity=st.session_state.intensity,
+        profession_input=st.session_state.profession_input,
     )
     raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
     if not raw:
@@ -712,6 +714,7 @@ def run_revise(client):
         genre=st.session_state.genre,
         intensity=st.session_state.intensity,
         locked=st.session_state.locked,
+        profession_input=st.session_state.profession_input,
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=16000)
     if not raw:
@@ -861,6 +864,20 @@ def show_step_0_input():
                     "• 엔딩에서 주인공이 혼자 남는 구도 유지\n"
                     "• S#50의 반전은 건드리지 말 것\n"
                     "• 세웅 캐릭터의 대사는 그대로 유지",
+        label_visibility="collapsed",
+    )
+
+    # ── 직업 전문성 (선택사항) ──
+    st.markdown('<div class="rev-card-title">4. 주요 캐릭터 직업 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">입력 시 해당 직업의 전문 용어·공간 디테일·금지 사항이 수정본 집필에 반영됩니다. '
+                '비워두면 원본에서 자동 감지합니다.</div>', unsafe_allow_html=True)
+    st.session_state.profession_input = st.text_area(
+        "직업",
+        value=st.session_state.profession_input,
+        height=80,
+        placeholder="예: 유진=쇼핑 호스트, 진호=변호사, 세웅=셰프\n"
+                    "또는 단순히: 변호사, 셰프, 쇼핑 호스트",
         label_visibility="collapsed",
     )
 
