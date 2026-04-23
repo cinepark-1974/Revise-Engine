@@ -13,6 +13,7 @@ Writer Engine에서 출력한 초고를 입력받아, 수정 지시문과 LOCKED
 - **수정 강도 3단계**: CONSERVATIVE (70%+ 보존) / BALANCED (50% 보존) / AGGRESSIVE (20~30% 유지)
 - **Writer Engine v3.5 룰팩 내장**: AI SCREENPLAY ESCAPE A1~A20, 9장르 Rule Pack
 - **2종 DOCX 출력**: 수정본 + 검증 보고서
+- **Profession Pack 연동**: 19개 직업 카테고리 전문성 블록 (Creator Engine v2.3.9 이식) — 명시 입력 + 원본 자동 감지
 
 ---
 
@@ -26,7 +27,10 @@ Writer Engine에서 출력한 초고를 입력받아, 수정 지시문과 LOCKED
    - 투자사 피드백
    - Rewrite Engine의 CHRIS/SHIHO 진단·처방 내용
 3. **LOCKED** — 절대 건드리지 말 요소 (자유 텍스트)
-4. **옵션** — 장르 선택 (9종) + 수정 강도 (3단계)
+4. **주요 캐릭터 직업** (선택사항) — 예: `유진=쇼핑 호스트, 진호=변호사`
+   - 비워두면 원본 DOCX에서 자동 감지
+   - Profession Pack 19개 카테고리의 전문 용어·공간 디테일·금지 사항 자동 주입
+5. **옵션** — 장르 선택 (11종) + 수정 강도 (3단계)
 
 ### 출력
 1. **수정본 DOCX** — 한국 시나리오 표준 서식, 수정된 씬 전문 + 변경 노트
@@ -86,13 +90,44 @@ streamlit run main.py
 
 ```
 revise-engine/
-├── main.py                 # Streamlit App (1,298줄)
-├── prompt.py               # System Prompt + AI ESCAPE + Genre Rules + 3-Stage builders (761줄)
+├── main.py                 # Streamlit App + 3-Stage 파이프라인
+├── prompt.py               # System Prompt + AI ESCAPE + Genre Rules + 3-Stage builders
+├── profession_pack.py      # 19개 직업 카테고리 전문성 블록 (Creator Engine v2.3.9 이식)
 ├── requirements.txt
 ├── README.md
 └── .streamlit/
     └── config.toml         # 라이트 모드 테마
 ```
+
+---
+
+## Profession Pack (19개 직업 카테고리)
+
+Creator Engine v2.3.9의 profession_pack.py를 그대로 이식. 각 카테고리는 8개 필드로 구성:
+
+**카테고리 목록:**
+- 법률직 / 의료직 / 금융기업직 / 언론창작직 / 공직정치 / 요식서비스직
+- 교육직 / 엔터테인먼트 / 기술IT직 / 예술전통
+- 강력수사 / 마약수사 / 지능수사 / 대공정보
+- 조직폭력 / 마약밀수 / 화이트칼라범죄
+- 건설부동산 / 농림수산자영업
+
+**각 카테고리의 8개 필드:**
+1. **subtypes** — 세부 직종 (3~6개)
+2. **daily_timeline** — 하루 타임라인 (아침→밤)
+3. **jargon** — 전문 용어 사전 (15~20개, 한/영 병기)
+4. **space_detail** — 공간 디테일 (소품·냄새·소리)
+5. **stress** — 직업적 스트레스 & 내적 갈등
+6. **forbidden** — 작가가 흔히 범하는 오류 (금지 목록)
+7. **korea_context** — 한국 고유 맥락 (계급·호칭·조직문화)
+8. **romance_style** — 연애/관계 스타일 경향성
+
+**작동 방식:**
+- 사용자 명시 입력 (`유진=쇼핑 호스트, 진호=변호사`) → 해당 직업 블록 주입
+- 명시 입력이 없으면 원본 DOCX 본문에서 자동 감지
+- Stage 1 DIAGNOSE: 직업별 금지 사항 위반 진단
+- Stage 2 REVISE: 집필 시 공간·용어·디테일 반영
+- 감지 실패해도 에러 없이 통과 (기본 집필로 진행)
 
 ---
 
