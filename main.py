@@ -32,6 +32,9 @@ from prompt import (
     build_revise_prompt,
     build_verify_prompt,
     get_report_filename,
+    get_period_keys_for_ui,
+    get_period_labels_for_ui,
+    parse_rewrite_engine_json,
 )
 
 # =================================================================
@@ -213,6 +216,9 @@ INIT_STATE = {
     "instruction": "",          # 수정 지시문
     "locked": "",               # LOCKED 요소
     "profession_input": "",     # 주요 캐릭터 직업 (선택사항)
+    "period_key": "(현대)",     # 시대 (사극·시대극)
+    "historical_type": "정통",  # 역사영화 유형 (정통/팩션/퓨전)
+    "fact_based": False,        # 실화 기반 작품 여부
     "genre": "드라마",
     "intensity": "BALANCED",
     "diagnose_result": None,    # Stage 1 JSON 결과
@@ -699,6 +705,9 @@ def run_diagnose(client):
         genre=st.session_state.genre,
         intensity=st.session_state.intensity,
         profession_input=st.session_state.profession_input,
+        period_key=st.session_state.period_key,
+        historical_type=st.session_state.historical_type,
+        fact_based=st.session_state.fact_based,
     )
     raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
     if not raw:
@@ -715,6 +724,9 @@ def run_revise(client):
         intensity=st.session_state.intensity,
         locked=st.session_state.locked,
         profession_input=st.session_state.profession_input,
+        period_key=st.session_state.period_key,
+        historical_type=st.session_state.historical_type,
+        fact_based=st.session_state.fact_based,
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=16000)
     if not raw:
@@ -841,6 +853,60 @@ def show_step_0_input():
     st.markdown('<div class="rev-card-title">2. 수정 지시문</div>', unsafe_allow_html=True)
     st.markdown('<div class="rev-caption">본인 지시, 모니터 보고서, 투자사 피드백, Rewrite Engine의 CHRIS/SHIHO 분석 내용을 자유롭게 입력하세요.</div>',
                 unsafe_allow_html=True)
+
+    # Rewrite Engine JSON 자동 변환 expander
+    with st.expander("🔗 Rewrite Engine 진단·처방 JSON 불러오기 (자동 변환)"):
+        st.caption("Rewrite Engine에서 다운로드한 진단·처방 JSON을 업로드하거나 텍스트로 붙여넣으면, "
+                   "CHRIS 분석 + SHIHO 처방이 자동으로 수정 지시문으로 변환됩니다. "
+                   "(MOON 리라이팅은 자동 제외됩니다.)")
+
+        rj_col1, rj_col2 = st.columns([1, 1])
+        with rj_col1:
+            uploaded_json = st.file_uploader(
+                "JSON 파일 업로드",
+                type=["json"],
+                key="rewrite_json_uploader",
+            )
+        with rj_col2:
+            pasted_json = st.text_area(
+                "또는 JSON 직접 붙여넣기",
+                height=120,
+                key="rewrite_json_pasted",
+                placeholder='{\n  "scores": {...},\n  "pros_cons": {...},\n  ...\n}',
+            )
+
+        if st.button("📥 Rewrite Engine JSON → 수정 지시문 변환", key="btn_convert_rewrite_json"):
+            json_source = None
+            if uploaded_json is not None:
+                try:
+                    json_source = uploaded_json.read().decode("utf-8")
+                except Exception as e:
+                    st.error(f"파일 읽기 실패: {e}")
+            elif pasted_json.strip():
+                json_source = pasted_json.strip()
+
+            if json_source:
+                try:
+                    converted = parse_rewrite_engine_json(json_source)
+                    if converted:
+                        # 기존 지시문이 있으면 추가, 없으면 대체
+                        if st.session_state.instruction.strip():
+                            st.session_state.instruction = (
+                                st.session_state.instruction.rstrip() +
+                                "\n\n--- Rewrite Engine 진단·처방 결과 ---\n\n" +
+                                converted
+                            )
+                        else:
+                            st.session_state.instruction = converted
+                        st.success(f"✅ 변환 완료! 지시문 입력창에 자동 추가되었습니다 ({len(converted):,}자)")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ JSON에서 변환 가능한 진단·처방 내용을 찾지 못했습니다.")
+                except Exception as e:
+                    st.error(f"변환 실패: {e}")
+            else:
+                st.warning("⚠️ JSON 파일을 업로드하거나 텍스트로 붙여넣어 주세요.")
+
     st.session_state.instruction = st.text_area(
         "지시문",
         value=st.session_state.instruction,
@@ -879,6 +945,57 @@ def show_step_0_input():
         placeholder="예: 유진=쇼핑 호스트, 진호=변호사, 세웅=셰프\n"
                     "또는 단순히: 변호사, 셰프, 쇼핑 호스트",
         label_visibility="collapsed",
+    )
+
+    # ── 시대 / 역사영화 / 실화 (선택사항) ──
+    st.markdown('<div class="rev-card-title">5. 시대 · 실화 정보 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(사극·시대극·실화영화 작업 시)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">현대 배경이면 그대로 두세요. 사극·시대극이면 시대를 선택하고, 실화 기반이면 체크하세요.</div>',
+                unsafe_allow_html=True)
+
+    period_keys = get_period_keys_for_ui()
+    period_labels = get_period_labels_for_ui()
+
+    cp1, cp2 = st.columns([1, 1])
+    with cp1:
+        # 시대 드롭다운
+        try:
+            current_idx = period_keys.index(st.session_state.period_key)
+        except ValueError:
+            current_idx = 0
+        selected_period = st.selectbox(
+            "시대 배경",
+            options=period_keys,
+            index=current_idx,
+            format_func=lambda k: period_labels.get(k, k),
+        )
+        st.session_state.period_key = selected_period
+
+    with cp2:
+        # 역사영화 유형 (사극일 때만 활성화)
+        is_historical = (st.session_state.period_key != "(현대)")
+        ht_options = ["정통", "팩션", "퓨전"]
+        try:
+            ht_idx = ht_options.index(st.session_state.historical_type)
+        except ValueError:
+            ht_idx = 0
+        selected_ht = st.radio(
+            "역사영화 유형",
+            options=ht_options,
+            index=ht_idx,
+            horizontal=True,
+            disabled=not is_historical,
+            help="정통: 사실 충실 / 팩션: 사실+허구 결합 / 퓨전: 현대 감각 적극 도입",
+        )
+        st.session_state.historical_type = selected_ht
+        if not is_historical:
+            st.caption("→ 시대 선택 시 활성화됩니다")
+
+    # 실화 기반 체크박스
+    st.session_state.fact_based = st.checkbox(
+        "🎬 이 작품은 실화 또는 역사적 사건을 기반으로 합니다 (명예훼손·인격권 가이드 적용)",
+        value=st.session_state.fact_based,
+        help="실명 사용·특정 가능 디테일·실존 공인 악역화 등의 리스크를 자동 점검합니다",
     )
 
     # ── 실행 버튼 ──
