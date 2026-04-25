@@ -35,6 +35,8 @@ from prompt import (
     get_period_keys_for_ui,
     get_period_labels_for_ui,
     parse_rewrite_engine_json,
+    split_into_batches,
+    merge_batch_results,
 )
 
 # =================================================================
@@ -229,7 +231,11 @@ INIT_STATE = {
     "genre": "드라마",
     "intensity": "BALANCED",
     "diagnose_result": None,    # Stage 1 JSON 결과
-    "revise_result": None,      # Stage 2 JSON 결과
+    "revise_batches": None,     # 배치 분할 결과 (list)
+    "batch_results": {},        # {batch_index: revise_result, ...}
+    "current_batch": 0,         # 현재 처리 중인 배치 (1부터)
+    "batch_size": 6,            # 한 배치당 씬 개수
+    "revise_result": None,      # Stage 2 통합 결과
     "verify_result": None,      # Stage 3 JSON 결과
 }
 
@@ -518,11 +524,45 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "") -
         header = scene.get("scene_header", f"Scene {idx}")
         content = scene.get("revised_content", "")
         notes = scene.get("revision_notes", {})
+        priority = scene.get("priority", "")
+        scene_type = scene.get("type", "REWRITE")
+        insert_pos = scene.get("insert_position", "")
 
-        # 씬 헤더
+        # 씬 헤더 (priority/type 메타 포함)
+        meta_parts = []
+        if priority:
+            meta_parts.append(f"[{priority}]")
+        if scene_type and scene_type != "REWRITE":
+            meta_parts.append(f"[{scene_type}]")
+        meta_str = " ".join(meta_parts)
+
         p = doc.add_paragraph()
+        if meta_str:
+            r_meta = p.add_run(f"{meta_str}  ")
+            meta_color = (225, 68, 68) if priority == "HIGH" else \
+                         (255, 140, 0) if priority == "MEDIUM" else \
+                         (142, 142, 153)
+            _set_font(r_meta, size_pt=9, bold=True, color=meta_color)
         r = p.add_run(header)
         _set_font(r, size_pt=12, bold=True, color=(25, 25, 112))
+
+        # ADD 타입 — 삽입 위치 표시
+        if scene_type == "ADD" and insert_pos:
+            p = doc.add_paragraph()
+            r = p.add_run(f"  ↳ 삽입 위치: {insert_pos}")
+            _set_font(r, size_pt=9, color=(46, 196, 132))
+
+        # DELETE 타입 — "삭제" 표시 + revised_content 없음
+        if scene_type == "DELETE":
+            p = doc.add_paragraph()
+            r = p.add_run("  ⊘ 이 씬은 삭제됩니다.")
+            _set_font(r, size_pt=10, bold=True, color=(225, 68, 68))
+            if notes.get("what_changed"):
+                p = doc.add_paragraph()
+                r = p.add_run(f"  사유: {notes.get('what_changed','')}")
+                _set_font(r, size_pt=9, color=(142, 142, 153))
+            doc.add_paragraph()
+            continue  # 본문 출력 건너뛰기
 
         # 씬 본문 (줄 단위로 나누어 입력)
         for line in content.split('\n'):
@@ -797,8 +837,37 @@ def run_diagnose(client):
     return parse_json(raw)
 
 
+def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches: int):
+    """Stage 2: Opus로 특정 배치만 집필.
+
+    Args:
+        client: Anthropic 클라이언트
+        batch_index: 배치 번호 (1부터)
+        batch_scenes: 이번 배치에서 처리할 씬 리스트
+        total_batches: 전체 배치 수
+    """
+    prompt_text = build_revise_prompt(
+        raw_text=st.session_state.raw_text,
+        diagnose_result=st.session_state.diagnose_result,
+        genre=st.session_state.genre,
+        intensity=st.session_state.intensity,
+        locked=st.session_state.locked,
+        profession_input=st.session_state.profession_input,
+        period_key=st.session_state.period_key,
+        historical_type=st.session_state.historical_type,
+        fact_based=st.session_state.fact_based,
+        batch_scenes=batch_scenes,
+        batch_index=batch_index,
+        total_batches=total_batches,
+    )
+    raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
+    if not raw:
+        return None
+    return parse_json(raw)
+
+
 def run_revise(client):
-    """Stage 2: Opus로 실제 집필."""
+    """Stage 2: 전체 배치 처리 (구버전 호환 — 사용하지 않는 것을 권장)."""
     prompt_text = build_revise_prompt(
         raw_text=st.session_state.raw_text,
         diagnose_result=st.session_state.diagnose_result,
@@ -1177,16 +1246,20 @@ def show_step_1_diagnose():
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("✍️ Stage 2: 집필 시작 (REVISE)", use_container_width=True):
-            client = get_client()
-            if client:
-                with st.spinner(f"✍️ {len(scenes)}개 씬 재집필 중... (Opus 4.6 · 2~5분 소요)"):
-                    result = run_revise(client)
-                    if result:
-                        st.session_state.revise_result = result
-                        st.session_state.step = 2
-                        st.rerun()
-                    else:
-                        st.error("집필 실패. 다시 시도해주세요.")
+            # 배치 분할 실행 (DIAGNOSE 결과 기반)
+            batches = split_into_batches(
+                st.session_state.diagnose_result,
+                batch_size=st.session_state.batch_size
+            )
+            if not batches:
+                st.error("수정 대상 씬이 없습니다. 진단 결과를 확인해주세요.")
+            else:
+                st.session_state.revise_batches = batches
+                st.session_state.batch_results = {}
+                st.session_state.current_batch = 0
+                st.session_state.step = 2
+                st.success(f"✅ {len(batches)}개 배치로 분할되었습니다. 배치별로 집필을 진행합니다.")
+                st.rerun()
     with c2:
         if st.button("◀ 입력으로 돌아가기", use_container_width=True):
             st.session_state.step = 0
@@ -1194,67 +1267,239 @@ def show_step_1_diagnose():
             st.rerun()
 
 
-def show_step_2_revise():
-    """Step 2: REVISE 결과 확인 + VERIFY 실행."""
-    rr = st.session_state.revise_result.get("revision_result", {})
+def _priority_badge(priority: str) -> str:
+    """우선순위 배지 HTML."""
+    colors = {
+        "HIGH":   ("#E14444", "#FFFFFF"),
+        "MEDIUM": ("#FFCB05", "#191970"),
+        "LOW":    ("#8E8E99", "#FFFFFF"),
+    }
+    bg, fg = colors.get(priority, ("#8E8E99", "#FFFFFF"))
+    return f'<span style="display:inline-block; padding:2px 8px; background:{bg}; color:{fg}; border-radius:4px; font-size:0.72rem; font-weight:800; font-family:Paperlogy,sans-serif;">{priority}</span>'
 
-    st.markdown('<div class="rev-card-title">✍️ Stage 2: 집필 결과 (Revised Scenes)</div>',
+
+def _type_badge(t: str) -> str:
+    """작업 종류 배지 HTML."""
+    icons = {
+        "REWRITE": "✏️",
+        "ADD":     "➕",
+        "DELETE":  "🗑️",
+        "MERGE":   "🔗",
+        "SPLIT":   "✂️",
+    }
+    icon = icons.get(t, "📝")
+    return f'<span style="display:inline-block; padding:2px 8px; background:#EEEEF6; color:#191970; border-radius:4px; font-size:0.72rem; font-weight:700; margin-left:4px;">{icon} {t}</span>'
+
+
+def show_step_2_revise():
+    """Step 2: 배치 단위 순차 집필 UI."""
+    batches = st.session_state.revise_batches or []
+    batch_results = st.session_state.batch_results or {}
+
+    if not batches:
+        st.error("배치 정보가 없습니다. 진단 단계로 돌아가주세요.")
+        if st.button("◀ 진단으로 돌아가기"):
+            st.session_state.step = 1
+            st.rerun()
+        return
+
+    total_batches = len(batches)
+    completed_count = sum(1 for i in range(1, total_batches + 1) if i in batch_results)
+
+    # 전체 씬 개수 / 완료 씬 개수
+    total_scenes = sum(len(b["scenes"]) for b in batches)
+    completed_scenes = sum(
+        len(batch_results[i].get("revision_result", {}).get("revised_scenes", []))
+        for i in range(1, total_batches + 1)
+        if i in batch_results
+    )
+
+    # ── 헤더 ──
+    st.markdown('<div class="rev-card-title">✍️ Stage 2: 배치 단위 집필 (REVISE)</div>',
                 unsafe_allow_html=True)
 
-    # 요약
-    summary = rr.get("summary", "")
-    if summary:
-        st.markdown('<div class="rev-card"><b style="color:#191970;">수정 요약</b></div>',
-                    unsafe_allow_html=True)
-        st.write(summary)
+    # 진행률 바
+    progress = completed_count / total_batches if total_batches else 0
+    st.progress(progress, text=f"배치 {completed_count} / {total_batches} 완료  ({completed_scenes} / {total_scenes} 씬)")
 
-    # 수정된 씬
-    scenes = rr.get("revised_scenes", [])
-    if scenes:
-        st.markdown(f'<div class="rev-card-title">📝 수정된 씬 ({len(scenes)}개)</div>',
-                    unsafe_allow_html=True)
-        for idx, sc in enumerate(scenes, 1):
-            header = sc.get("scene_header", f"Scene {idx}")
-            with st.expander(f"Scene {idx}: {header}"):
-                # Side-by-Side (원본 발췌 vs 수정본)
-                col_o, col_r = st.columns([1, 1])
-                with col_o:
-                    st.markdown("**📄 원본 발췌**")
-                    st.text(sc.get("original_excerpt", ""))
-                with col_r:
-                    st.markdown("**✏️ 수정본**")
-                    st.text(sc.get("revised_content", ""))
-
-                # 변경 노트
-                notes = sc.get("revision_notes", {})
-                if notes:
-                    st.markdown("---")
-                    st.markdown(f"**변경 내용:** {notes.get('what_changed','')}")
-                    st.markdown(f"**보존 요소:** {notes.get('what_preserved','')}")
-                    st.markdown(f"**보존 비율:** {notes.get('intensity_check','')}  |  "
-                                f"**LOCKED 체크:** {notes.get('locked_check','')}")
-
-    # Cross-scene impact
-    cross = rr.get("cross_scene_impact", "")
-    if cross:
-        with st.expander("🔄 플롯 흐름에 미치는 영향"):
-            st.write(cross)
-
-    # Unchanged note
-    un = rr.get("unchanged_scenes_note", "")
-    if un:
-        with st.expander("📎 수정 대상 외 씬 안내"):
-            st.write(un)
+    # 배치 전략 안내
+    plan = st.session_state.diagnose_result.get("revision_plan", {})
+    strategy = plan.get("batch_strategy", "")
+    if strategy:
+        st.info(f"📋 **배치 전략:** {strategy}")
 
     st.markdown("---")
 
-    # 실행 버튼
-    c1, c2 = st.columns([1, 1])
+    # ── 배치 카드 목록 ──
+    for batch in batches:
+        bidx = batch["batch_index"]
+        scenes = batch["scenes"]
+        is_done = bidx in batch_results
+        is_current = (bidx == completed_count + 1) and not is_done
+
+        # 카드 헤더
+        if is_done:
+            status_icon = "✅"
+            status_color = "#2EC484"
+            status_text = "완료"
+        elif is_current:
+            status_icon = "▶️"
+            status_color = "#FFCB05"
+            status_text = "다음 배치"
+        else:
+            status_icon = "⏸️"
+            status_color = "#8E8E99"
+            status_text = "대기"
+
+        with st.container():
+            st.markdown(
+                f'<div style="background:#FFFFFF; border:2px solid {status_color}; '
+                f'border-radius:10px; padding:16px; margin-bottom:12px;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
+                f'<div style="font-family:Paperlogy,sans-serif; font-weight:800; font-size:1.05rem; color:#191970;">'
+                f'{status_icon} 배치 {bidx} / {total_batches}'
+                f'</div>'
+                f'<div style="color:{status_color}; font-weight:700; font-size:0.85rem;">{status_text}</div>'
+                f'</div>'
+                f'<div style="color:#8E8E99; font-size:0.85rem; margin-bottom:8px;">'
+                f'{batch["priority_summary"]}  ·  {batch["type_summary"]}  ·  씬 {len(scenes)}개'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            # 씬 목록 (작은 expander)
+            with st.expander(f"씬 목록 ({len(scenes)}개)", expanded=is_current and not is_done):
+                for sc in scenes:
+                    sid = sc.get("scene_id", "")
+                    pri = sc.get("priority", "MEDIUM")
+                    typ = sc.get("type", "REWRITE")
+                    pos = sc.get("scene_position", "")
+                    func = sc.get("original_function", "")
+
+                    st.markdown(
+                        f'{_priority_badge(pri)} {_type_badge(typ)} '
+                        f'<b>{sid}</b>  '
+                        f'<span style="color:#8E8E99; font-size:0.85rem;">— {pos}</span>',
+                        unsafe_allow_html=True
+                    )
+                    if func:
+                        st.caption(f"플롯상 기능: {func}")
+
+                    # 수정 항목 요약
+                    items = sc.get("revision_items", [])
+                    for it in items[:3]:  # 최대 3개만 표시
+                        st.markdown(f"  └ *{it.get('issue','')}* → {it.get('proposed_direction','')}")
+                    st.markdown("")
+
+            # 배치 액션 버튼
+            bc1, bc2, bc3 = st.columns([2, 1, 1])
+            with bc1:
+                if is_done:
+                    # 완료된 배치 — 결과 미리보기 + 재집필
+                    btn_label = f"🔄 배치 {bidx} 재집필"
+                    if st.button(btn_label, key=f"rewrite_batch_{bidx}", use_container_width=True):
+                        client = get_client()
+                        if client:
+                            with st.spinner(f"✍️ 배치 {bidx} 재집필 중... (Opus 4.6)"):
+                                result = run_revise_batch(client, bidx, scenes, total_batches)
+                                if result:
+                                    st.session_state.batch_results[bidx] = result
+                                    st.success(f"✅ 배치 {bidx} 재집필 완료")
+                                    st.rerun()
+                                else:
+                                    st.error(f"배치 {bidx} 재집필 실패")
+                elif is_current:
+                    # 다음 차례 배치 — 집필 시작
+                    btn_label = f"▶️ 배치 {bidx} 집필 시작"
+                    if st.button(btn_label, key=f"run_batch_{bidx}", type="primary", use_container_width=True):
+                        client = get_client()
+                        if client:
+                            with st.spinner(f"✍️ 배치 {bidx} 집필 중... ({len(scenes)}개 씬, Opus 4.6, 1~3분 소요)"):
+                                result = run_revise_batch(client, bidx, scenes, total_batches)
+                                if result:
+                                    st.session_state.batch_results[bidx] = result
+                                    st.success(f"✅ 배치 {bidx} 완료")
+                                    st.rerun()
+                                else:
+                                    st.error(f"배치 {bidx} 집필 실패. 다시 시도해주세요.")
+                else:
+                    # 대기 중 (이전 배치 미완료)
+                    st.button(f"⏸️ 배치 {bidx} 대기 중", disabled=True, use_container_width=True,
+                              key=f"wait_batch_{bidx}")
+
+            with bc2:
+                if is_done:
+                    # 결과 미리보기 토글
+                    if st.button("👁️ 결과 보기", key=f"preview_batch_{bidx}", use_container_width=True):
+                        st.session_state[f"show_preview_{bidx}"] = not st.session_state.get(f"show_preview_{bidx}", False)
+                        st.rerun()
+
+            with bc3:
+                if is_done:
+                    if st.button("🗑️ 결과 삭제", key=f"delete_batch_{bidx}", use_container_width=True):
+                        del st.session_state.batch_results[bidx]
+                        # 이후 배치 결과도 삭제 (순차 의존성)
+                        for later_idx in range(bidx + 1, total_batches + 1):
+                            st.session_state.batch_results.pop(later_idx, None)
+                        st.rerun()
+
+            # 결과 미리보기 영역
+            if is_done and st.session_state.get(f"show_preview_{bidx}", False):
+                br = batch_results[bidx]
+                rr = br.get("revision_result", {})
+                with st.container():
+                    st.markdown(
+                        f'<div style="background:#F7F7F5; border-left:4px solid #2EC484; '
+                        f'padding:12px 16px; border-radius:0 8px 8px 0; margin-top:8px; margin-bottom:8px;">'
+                        f'<b style="color:#191970;">배치 {bidx} 결과 요약</b><br/>'
+                        f'<span style="color:#1A1A2E;">{rr.get("summary","(요약 없음)")}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
+                    revised_scenes = rr.get("revised_scenes", [])
+                    for sc in revised_scenes:
+                        header = sc.get("scene_header", "")
+                        pri = sc.get("priority", "MEDIUM")
+                        typ = sc.get("type", "REWRITE")
+                        with st.expander(f"{header}  [{pri} · {typ}]"):
+                            col_o, col_r = st.columns([1, 1])
+                            with col_o:
+                                st.markdown("**📄 원본 발췌**")
+                                excerpt = sc.get("original_excerpt", "")
+                                st.text(excerpt if excerpt else "(원본 없음 — 신규 추가/삭제)")
+                            with col_r:
+                                st.markdown("**✏️ 수정본**")
+                                content = sc.get("revised_content", "")
+                                st.text(content if content else "(삭제됨)")
+
+                            notes = sc.get("revision_notes", {})
+                            if notes:
+                                st.markdown("---")
+                                st.markdown(f"**변경:** {notes.get('what_changed','')}")
+                                st.markdown(f"**보존:** {notes.get('what_preserved','')}")
+
+    st.markdown("---")
+
+    # ── 모든 배치 완료 시 다음 단계 ──
+    all_done = (completed_count == total_batches)
+
+    if all_done:
+        st.success(f"🎉 모든 배치 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
+
+    c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        if st.button("✅ Stage 3: 검증 시작 (VERIFY)", use_container_width=True):
+        if st.button("✅ Stage 3: 검증 시작 (VERIFY)",
+                     disabled=not all_done, use_container_width=True, type="primary"):
+            # 모든 배치 결과 통합
+            all_results = [batch_results[i] for i in range(1, total_batches + 1) if i in batch_results]
+            merged = merge_batch_results(all_results)
+            st.session_state.revise_result = merged
+
             client = get_client()
             if client:
-                with st.spinner("✅ 수정본 검증 중... (Sonnet 4.6)"):
+                with st.spinner("✅ 통합 수정본 검증 중... (Sonnet 4.6)"):
                     result = run_verify(client)
                     if result:
                         st.session_state.verify_result = result
@@ -1263,9 +1508,34 @@ def show_step_2_revise():
                     else:
                         st.error("검증 실패. 다시 시도해주세요.")
     with c2:
-        if st.button("◀ 진단으로 돌아가기", use_container_width=True):
+        # 모두 한 번에 (남은 배치 자동 순차 실행)
+        remaining = total_batches - completed_count
+        if remaining > 0:
+            if st.button(f"⏩ 남은 {remaining}개 자동 진행", use_container_width=True):
+                client = get_client()
+                if client:
+                    progress_bar = st.progress(0, text="배치 자동 실행 중...")
+                    for i, batch in enumerate(batches):
+                        bidx = batch["batch_index"]
+                        if bidx in batch_results:
+                            continue
+                        progress_bar.progress(
+                            (completed_count + (i - completed_count + 1)) / total_batches,
+                            text=f"배치 {bidx} 집필 중... ({len(batch['scenes'])}개 씬)"
+                        )
+                        result = run_revise_batch(client, bidx, batch["scenes"], total_batches)
+                        if result:
+                            st.session_state.batch_results[bidx] = result
+                        else:
+                            st.error(f"배치 {bidx}에서 실패. 중단합니다.")
+                            break
+                    progress_bar.empty()
+                    st.rerun()
+    with c3:
+        if st.button("◀ 진단으로", use_container_width=True):
             st.session_state.step = 1
-            st.session_state.revise_result = None
+            st.session_state.revise_batches = None
+            st.session_state.batch_results = {}
             st.rerun()
 
 
