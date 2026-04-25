@@ -256,9 +256,21 @@ def get_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def call_claude(client, prompt_text: str, model: str, max_tokens: int = 8000, retries: int = 2):
-    """Claude API 스트리밍 호출 + max_tokens 잘림 시 자동 증량 재시도."""
-    current_tokens = max_tokens
+def call_claude(client, prompt_text: str, model: str, max_tokens: int = 32000, retries: int = 2):
+    """Claude API 스트리밍 호출 + max_tokens 잘림 시 자동 증량 재시도.
+
+    모델별 한도:
+    - Sonnet 4.6: 최대 64,000 토큰
+    - Opus 4.6:   최대 32,000 토큰
+    """
+    # 모델별 상한
+    if "opus" in model.lower():
+        absolute_cap = 32000
+    else:  # sonnet, haiku 등
+        absolute_cap = 64000
+
+    current_tokens = min(max_tokens, absolute_cap)
+
     for attempt in range(1 + retries):
         try:
             collected = ""
@@ -275,14 +287,20 @@ def call_claude(client, prompt_text: str, model: str, max_tokens: int = 8000, re
                 stop_reason = final_msg.stop_reason
 
             if stop_reason == "max_tokens":
-                if attempt < retries:
-                    next_tokens = min(int(current_tokens * 1.5), 32000)
-                    st.info(f"🔄 응답이 {current_tokens} 토큰에서 잘렸습니다. "
-                            f"{next_tokens} 토큰으로 재시도합니다... ({attempt+2}/{1+retries})")
+                if attempt < retries and current_tokens < absolute_cap:
+                    next_tokens = min(int(current_tokens * 1.5), absolute_cap)
+                    if next_tokens == current_tokens:
+                        # 이미 한도에 도달
+                        st.warning(f"⚠️ 모델 한도({absolute_cap} 토큰)에서 응답이 잘렸습니다. "
+                                   "결과가 불완전할 수 있습니다. 시나리오를 더 짧게 분할하거나 "
+                                   "지시문을 간소화하는 것을 권장합니다.")
+                        return collected
+                    st.info(f"🔄 응답이 {current_tokens:,} 토큰에서 잘렸습니다. "
+                            f"{next_tokens:,} 토큰으로 재시도합니다... ({attempt+2}/{1+retries})")
                     current_tokens = next_tokens
                     continue
                 else:
-                    st.warning(f"⚠️ {retries}회 재시도 후에도 {current_tokens} 토큰에서 잘렸습니다. "
+                    st.warning(f"⚠️ {retries}회 재시도 후에도 {current_tokens:,} 토큰에서 잘렸습니다. "
                                "결과가 불완전할 수 있습니다.")
             return collected
         except Exception as e:
@@ -292,23 +310,80 @@ def call_claude(client, prompt_text: str, model: str, max_tokens: int = 8000, re
 
 
 def parse_json(raw: str):
-    """JSON 파싱 (마크다운 코드블록 제거 + 양끝 트리밍)."""
+    """JSON 파싱 (마크다운 코드블록 제거 + 양끝 트리밍 + 잘린 JSON 복구 시도)."""
     if not raw:
         return None
     txt = raw.strip()
     # 코드블록 제거
     txt = re.sub(r'^```(?:json)?\s*\n', '', txt)
     txt = re.sub(r'\n```\s*$', '', txt)
-    # 첫 { 부터 마지막 } 까지만
+    # 첫 { 부터 시작
     s = txt.find('{')
-    e = txt.rfind('}')
-    if s == -1 or e == -1 or e < s:
+    if s == -1:
         return None
+
+    # 1. 정상 파싱 시도 — 마지막 } 까지
+    e = txt.rfind('}')
+    if e > s:
+        try:
+            return json.loads(txt[s:e+1])
+        except json.JSONDecodeError:
+            pass  # 복구 시도로 진행
+
+    # 2. 잘린 JSON 복구 시도 — 괄호 균형 맞추기
+    candidate = txt[s:]
+    open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape_next = False
+    last_valid_pos = -1
+
+    for i, ch in enumerate(candidate):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            open_braces += 1
+        elif ch == '}':
+            open_braces -= 1
+            if open_braces == 0 and open_brackets == 0:
+                last_valid_pos = i
+        elif ch == '[':
+            open_brackets += 1
+        elif ch == ']':
+            open_brackets -= 1
+
+    # 마지막 유효 위치까지로 시도
+    if last_valid_pos > 0:
+        try:
+            return json.loads(candidate[:last_valid_pos+1])
+        except json.JSONDecodeError:
+            pass
+
+    # 3. 잘린 끝부분 강제 닫기 시도
+    truncated = candidate.rstrip().rstrip(',')
+    # 마지막에 미완성 문자열이 있으면 닫기
+    if truncated.count('"') % 2 == 1:
+        truncated += '"'
+    # 열린 배열/객체 닫기
+    truncated += ']' * max(0, open_brackets) + '}' * max(0, open_braces)
+
     try:
-        return json.loads(txt[s:e+1])
+        result = json.loads(truncated)
+        st.warning("⚠️ 응답이 잘렸지만 부분 복구를 시도했습니다. 결과 일부가 누락될 수 있습니다.")
+        return result
     except json.JSONDecodeError as err:
         st.error(f"❌ JSON 파싱 실패: {err}")
-        st.code(txt[:500], language="json")
+        st.caption("응답 끝부분 (디버깅용):")
+        st.code(candidate[-500:], language="json")
         return None
 
 
@@ -716,7 +791,7 @@ def run_diagnose(client):
         historical_type=st.session_state.historical_type,
         fact_based=st.session_state.fact_based,
     )
-    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
     if not raw:
         return None
     return parse_json(raw)
@@ -735,7 +810,7 @@ def run_revise(client):
         historical_type=st.session_state.historical_type,
         fact_based=st.session_state.fact_based,
     )
-    raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=16000)
+    raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
         return None
     return parse_json(raw)
@@ -750,7 +825,7 @@ def run_verify(client):
         locked=st.session_state.locked,
         genre=st.session_state.genre,
     )
-    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
     if not raw:
         return None
     return parse_json(raw)
