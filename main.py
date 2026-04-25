@@ -135,17 +135,24 @@ section[data-testid="stSidebar"] { display: none; }
     margin-bottom: 40px;
 }
 .rev-hero .brand {
-    font-size: 0.72rem; font-weight: 900; letter-spacing: 0.5em;
-    color: var(--y);
+    font-size: 0.85rem; font-weight: 700;
+    color: var(--navy); letter-spacing: 0.15em;
+    font-family: var(--heading);
 }
 .rev-hero .title {
-    font-size: 3.4rem; font-weight: 950; color: var(--navy);
-    line-height: 1; letter-spacing: -0.03em; margin: 10px 0;
-    font-family: var(--display);
+    font-size: 2.6rem; font-weight: 900; color: var(--navy);
+    font-family: var(--display); letter-spacing: -0.02em;
+    position: relative; display: inline-block;
+    line-height: 1; margin: 14px 0 0 0;
+}
+.rev-hero .title::after {
+    content: ''; position: absolute; bottom: 2px; left: 0;
+    width: 100%; height: 4px; background: var(--y); border-radius: 2px;
 }
 .rev-hero .tag {
-    font-size: 0.78rem; letter-spacing: 0.2em;
-    color: var(--navy); opacity: 0.4;
+    font-size: 0.7rem; color: var(--dim);
+    letter-spacing: 0.15em;
+    margin-top: 0.6rem;
 }
 
 .rev-stepbar {
@@ -755,9 +762,9 @@ def run_verify(client):
 def render_hero():
     st.markdown("""
     <div class="rev-hero">
-        <div class="brand">BLUE JEANS PICTURES</div>
+        <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
         <div class="title">REVISE ENGINE</div>
-        <div class="tag">DIAGNOSE · REVISE · VERIFY</div>
+        <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
 
