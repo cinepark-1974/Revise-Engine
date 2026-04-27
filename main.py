@@ -37,6 +37,11 @@ from prompt import (
     parse_rewrite_engine_json,
     split_into_batches,
     merge_batch_results,
+    # v2.0 신규
+    build_tone_dna_extraction_prompt,
+    build_diff_analysis_prompt,
+    build_distribution_diagnostic_prompt,
+    absorb_rewrite_engine_metadata,
 )
 
 # =================================================================
@@ -237,6 +242,18 @@ INIT_STATE = {
     "batch_size": 6,            # 한 배치당 씬 개수
     "revise_result": None,      # Stage 2 통합 결과
     "verify_result": None,      # Stage 3 JSON 결과
+    # v2.0 — 톤 레퍼런스 + Diff 학습 + Rewrite 메타
+    "tone_ref_text": "",        # 톤 레퍼런스 DOCX의 전문
+    "tone_ref_filename": "",
+    "diff_orig_text": "",       # Diff 모드 — 원본 (이전 버전)
+    "diff_orig_filename": "",
+    "diff_refined_text": "",    # Diff 모드 — 손본본 (최신 버전)
+    "diff_refined_filename": "",
+    "rewrite_json_text": "",    # Rewrite Engine JSON 원문 (변환 + 흡수)
+    "tone_dna": None,           # 추출된 톤 DNA (DIAGNOSE 자동 실행)
+    "diff_analysis": None,      # Diff 학습 결과
+    "distribution_diagnostic": None,  # 분포 진단
+    "rewrite_metadata": None,   # Rewrite 메타 흡수
 }
 
 for k, v in INIT_STATE.items():
@@ -436,179 +453,398 @@ def _set_font(run, font_name="맑은 고딕", size_pt=10.5, bold=False, color=No
     rFonts.set(qn('w:eastAsia'), font_name)
 
 
-def create_revised_docx(revise_result: dict, title: str = "", genre: str = "") -> bytes:
-    """Stage 2 결과를 한국 시나리오 표준 서식의 DOCX로 변환."""
-    doc = Document()
+def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
+                        original_text: str = "",
+                        fact_based: bool = False,
+                        historical: bool = False,
+                        historical_type: str = "") -> bytes:
+    """Stage 2 결과를 한국 시나리오 표준 서식의 DOCX로 변환.
 
-    # 페이지 설정 (A4, 여백 2.5cm)
+    Writer Engine과 동일한 서식 사용:
+    - 함초롬바탕 10pt 기본
+    - 씬번호 / 대사 / 대사연속 / 지문 4가지 Word 스타일
+    - A4, 20mm 여백
+    - 캐릭터명\t\t대사 형식 자동 감지
+    - 메타데이터 자동 차단
+    """
+    from docx import Document as DocxDocument
+    from docx.shared import Pt, RGBColor, Mm, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.ns import qn
+    from io import BytesIO
+
+    doc = DocxDocument()
+
+    # ── 페이지 설정 (A4, 20mm 마진) ──
     section = doc.sections[0]
-    section.top_margin = Cm(2.5)
-    section.bottom_margin = Cm(2.5)
-    section.left_margin = Cm(2.5)
-    section.right_margin = Cm(2.5)
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+    section.top_margin = Mm(20)
+    section.bottom_margin = Mm(20)
+    section.left_margin = Mm(20)
+    section.right_margin = Mm(20)
 
-    # ── 표지 ──
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("BLUE JEANS PICTURES")
-    _set_font(r, size_pt=9, bold=True, color=(255, 203, 5))
+    # ── 기본 스타일: 함초롬바탕 10pt ──
+    style_normal = doc.styles["Normal"]
+    style_normal.font.name = "함초롬바탕"
+    style_normal.font.size = Pt(10)
+    style_normal.paragraph_format.space_after = Pt(2)
+    style_normal.paragraph_format.space_before = Pt(0)
+    rpr = style_normal.element.rPr
+    if rpr is None:
+        rpr = style_normal.element.makeelement(qn('w:rPr'), {})
+        style_normal.element.append(rpr)
+    rfonts = rpr.find(qn('w:rFonts'))
+    if rfonts is None:
+        rfonts = rpr.makeelement(qn('w:rFonts'), {})
+        rpr.append(rfonts)
+    rfonts.set(qn('w:eastAsia'), '함초롬바탕')
 
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("REVISE ENGINE")
-    _set_font(r, size_pt=11, bold=True, color=(25, 25, 112))
+    def _set_eastasia_font(rpr_elem, font_name='함초롬바탕'):
+        rf = rpr_elem.find(qn('w:rFonts'))
+        if rf is None:
+            rf = rpr_elem.makeelement(qn('w:rFonts'), {})
+            rpr_elem.append(rf)
+        rf.set(qn('w:eastAsia'), font_name)
 
-    doc.add_paragraph()
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(title if title else "수정본")
-    _set_font(r, size_pt=22, bold=True, color=(25, 25, 112))
+    # ── 커스텀 스타일: 씬번호 / 대사 / 대사연속 / 지문 ──
+    style_scene = doc.styles.add_style('씬번호', WD_STYLE_TYPE.PARAGRAPH)
+    style_scene.base_style = doc.styles['Normal']
+    style_scene.font.name = '함초롬바탕'
+    style_scene.font.size = Pt(11)
+    style_scene.font.bold = True
+    style_scene.paragraph_format.space_before = Pt(24)
+    style_scene.paragraph_format.space_after = Pt(6)
+    style_scene.paragraph_format.line_spacing = 1.5
+    _set_eastasia_font(style_scene.element.get_or_add_rPr())
 
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("수정본 (Revised Scenes)")
-    _set_font(r, size_pt=12, bold=False, color=(142, 142, 153))
+    style_dialogue = doc.styles.add_style('대사', WD_STYLE_TYPE.PARAGRAPH)
+    style_dialogue.base_style = doc.styles['Normal']
+    style_dialogue.font.name = '함초롬바탕'
+    style_dialogue.font.size = Pt(10)
+    style_dialogue.font.bold = True
+    style_dialogue.paragraph_format.left_indent = Cm(1.25)
+    style_dialogue.paragraph_format.space_before = Pt(8)
+    style_dialogue.paragraph_format.space_after = Pt(2)
+    style_dialogue.paragraph_format.line_spacing = 1.5
+    _set_eastasia_font(style_dialogue.element.get_or_add_rPr())
 
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    meta_txt = f"장르: {genre}    생성일: {datetime.now().strftime('%Y-%m-%d')}"
-    r = p.add_run(meta_txt)
-    _set_font(r, size_pt=9, color=(142, 142, 153))
+    style_dialogue_cont = doc.styles.add_style('대사연속', WD_STYLE_TYPE.PARAGRAPH)
+    style_dialogue_cont.base_style = style_dialogue
+    style_dialogue_cont.paragraph_format.space_before = Pt(0)
+    style_dialogue_cont.paragraph_format.space_after = Pt(0)
 
-    doc.add_page_break()
+    style_action = doc.styles.add_style('지문', WD_STYLE_TYPE.PARAGRAPH)
+    style_action.base_style = doc.styles['Normal']
+    style_action.font.name = '함초롬바탕'
+    style_action.font.size = Pt(10)
+    style_action.font.bold = False
+    style_action.paragraph_format.space_before = Pt(2)
+    style_action.paragraph_format.space_after = Pt(2)
+    _set_eastasia_font(style_action.element.get_or_add_rPr())
 
-    # ── 요약 ──
+    # ── 헬퍼 ──
+    def add_text(text, bold=False, size=None, color=None, align=None):
+        p = doc.add_paragraph()
+        if align:
+            p.alignment = align
+        r = p.add_run(text)
+        r.font.name = "함초롬바탕"
+        _set_eastasia_font(r._element.get_or_add_rPr())
+        if bold:
+            r.bold = True
+        if size:
+            r.font.size = size
+        if color:
+            r.font.color.rgb = color
+        return p
+
+    def add_scene_heading(text):
+        p = doc.add_paragraph(style='씬번호')
+        r = p.add_run(text)
+        r.font.name = "함초롬바탕"
+        _set_eastasia_font(r._element.get_or_add_rPr())
+        return p
+
+    def add_dialogue(char_name, parenthetical, line, continuation=False):
+        if continuation:
+            p = doc.add_paragraph(style='대사연속')
+            paren = f"({parenthetical}) " if parenthetical else ""
+            full = f"\t\t{paren}{line}"
+        else:
+            p = doc.add_paragraph(style='대사')
+            paren = f"({parenthetical}) " if parenthetical else ""
+            full = f"{char_name}\t\t{paren}{line}"
+        r = p.add_run(full)
+        r.font.name = "함초롬바탕"
+        _set_eastasia_font(r._element.get_or_add_rPr())
+        return p
+
+    def add_action(text):
+        p = doc.add_paragraph(style='지문')
+        r = p.add_run(text)
+        r.font.name = "함초롬바탕"
+        _set_eastasia_font(r._element.get_or_add_rPr())
+        return p
+
+    # ── 커버 페이지 ──
+    for _ in range(6):
+        doc.add_paragraph("")
+    add_text("시나리오 (수정본)", size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
+    doc.add_paragraph("")
+    proj_title = title or f"<{genre}>"
+    add_text(proj_title, bold=True, size=Pt(24), align=WD_ALIGN_PARAGRAPH.CENTER)
+    doc.add_paragraph("")
+    doc.add_paragraph("")
+    add_text("기획/제작 | 블루진픽처스", size=Pt(10),
+             align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x8E, 0x8E, 0x99))
     rr = revise_result.get("revision_result", {})
-    summary = rr.get("summary", "")
-    if summary:
-        p = doc.add_paragraph()
-        r = p.add_run("■ 수정 요약")
-        _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-
-        p = doc.add_paragraph()
-        r = p.add_run(summary)
-        _set_font(r, size_pt=10.5)
-        doc.add_paragraph()
-
-    cross = rr.get("cross_scene_impact", "")
-    if cross:
-        p = doc.add_paragraph()
-        r = p.add_run("■ 플롯 흐름에 미치는 영향")
-        _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-
-        p = doc.add_paragraph()
-        r = p.add_run(cross)
-        _set_font(r, size_pt=10.5)
-        doc.add_paragraph()
-
-    unchanged = rr.get("unchanged_scenes_note", "")
-    if unchanged:
-        p = doc.add_paragraph()
-        r = p.add_run("■ 수정 대상 외 씬 안내")
-        _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-
-        p = doc.add_paragraph()
-        r = p.add_run(unchanged)
-        _set_font(r, size_pt=10.5)
-
+    scenes = rr.get("revised_scenes", [])
+    add_text(f"Revise Engine v2.0  ·  {len(scenes)}개 씬 수정",
+             size=Pt(9), align=WD_ALIGN_PARAGRAPH.CENTER,
+             color=RGBColor(0x8E, 0x8E, 0x99))
     doc.add_page_break()
 
-    # ── 수정된 씬 본문 ──
-    p = doc.add_paragraph()
-    r = p.add_run("■ 수정된 씬")
-    _set_font(r, size_pt=15, bold=True, color=(25, 25, 112))
-    doc.add_paragraph()
+    # ── 면책 자막 (실화/팩션·퓨전) ──
+    _need_disclaimer = fact_based or (
+        historical and ("팩션" in (historical_type or "") or "퓨전" in (historical_type or ""))
+    )
+    if _need_disclaimer:
+        for _ in range(10):
+            doc.add_paragraph("")
+        add_text("본 작품에 등장하는 인물, 단체, 지명, 상호, 사건은",
+                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
+        add_text("모두 허구이며, 실존하는 것과 관련이 있더라도",
+                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
+        add_text("극적 구성을 위해 각색되었습니다.",
+                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
+        doc.add_page_break()
 
-    scenes = rr.get("revised_scenes", [])
-    for idx, scene in enumerate(scenes, 1):
-        header = scene.get("scene_header", f"Scene {idx}")
-        content = scene.get("revised_content", "")
-        notes = scene.get("revision_notes", {})
-        priority = scene.get("priority", "")
-        scene_type = scene.get("type", "REWRITE")
-        insert_pos = scene.get("insert_position", "")
+    # ─────────────────────────────────────────────────────────
+    # 본문 파싱: 원본 + 수정본을 통합한 "최종 시나리오" 생성
+    # ─────────────────────────────────────────────────────────
+    # 1) 원본 시나리오를 씬 단위로 분할
+    # 2) 수정 대상 씬은 revised_content로 교체
+    # 3) ADD 타입은 insert_position에 따라 삽입
+    # 4) DELETE 타입은 제거
+    #
+    # 결과: 시나리오 처음부터 끝까지 자연스럽게 흐르는 통합본
+    # ─────────────────────────────────────────────────────────
 
-        # 씬 헤더 (priority/type 메타 포함)
-        meta_parts = []
-        if priority:
-            meta_parts.append(f"[{priority}]")
-        if scene_type and scene_type != "REWRITE":
-            meta_parts.append(f"[{scene_type}]")
-        meta_str = " ".join(meta_parts)
+    import re as _re
 
-        p = doc.add_paragraph()
-        if meta_str:
-            r_meta = p.add_run(f"{meta_str}  ")
-            meta_color = (225, 68, 68) if priority == "HIGH" else \
-                         (255, 140, 0) if priority == "MEDIUM" else \
-                         (142, 142, 153)
-            _set_font(r_meta, size_pt=9, bold=True, color=meta_color)
-        r = p.add_run(header)
-        _set_font(r, size_pt=12, bold=True, color=(25, 25, 112))
+    # 씬 헤딩 패턴 (Writer Engine과 동일)
+    heading_re = _re.compile(r'^S?#?\d*\.?\s*(INT\.|EXT\.|INT\./EXT\.)\s*(.+)', _re.IGNORECASE)
 
-        # ADD 타입 — 삽입 위치 표시
-        if scene_type == "ADD" and insert_pos:
-            p = doc.add_paragraph()
-            r = p.add_run(f"  ↳ 삽입 위치: {insert_pos}")
-            _set_font(r, size_pt=9, color=(46, 196, 132))
 
-        # DELETE 타입 — "삭제" 표시 + revised_content 없음
-        if scene_type == "DELETE":
-            p = doc.add_paragraph()
-            r = p.add_run("  ⊘ 이 씬은 삭제됩니다.")
-            _set_font(r, size_pt=10, bold=True, color=(225, 68, 68))
-            if notes.get("what_changed"):
-                p = doc.add_paragraph()
-                r = p.add_run(f"  사유: {notes.get('what_changed','')}")
-                _set_font(r, size_pt=9, color=(142, 142, 153))
-            doc.add_paragraph()
-            continue  # 본문 출력 건너뛰기
+    def _merge_header_content(header: str, content: str) -> str:
+        """헤더와 본문이 중복되지 않도록 합친다.
+        본문 첫 줄에 이미 헤더 핵심부(S#번호 또는 INT./EXT.)가 있으면 헤더 생략."""
+        if not content.strip():
+            return header
+        first_line = content.strip().split('\n')[0].strip()
+        # S#번호 추출
+        import re as _re_inner
+        h_num = _re_inner.search(r'S#\d+', header or "")
+        c_num = _re_inner.search(r'S#\d+', first_line)
+        if h_num and c_num and h_num.group() == c_num.group():
+            return content  # 본문이 이미 헤더 포함
+        # INT./EXT. 매칭
+        if _re_inner.match(r'^(INT\.|EXT\.)', first_line, _re_inner.IGNORECASE):
+            # 첫 줄이 씬 헤더 형태 → 본문 그대로
+            return content
+        return f"{header}\n{content}"
 
-        # 씬 본문 (줄 단위로 나누어 입력)
-        for line in content.split('\n'):
-            line = line.strip()
-            if not line:
-                doc.add_paragraph()
-                continue
-            p = doc.add_paragraph()
-            # 대사 들여쓰기 감지 (인물명만 있는 줄, 대사 줄)
-            if len(line) <= 12 and not re.search(r'[.,!?]', line) and not line.startswith(('S#', 'INT.', 'EXT.', 'CUT')):
-                # 인물명 가능성 — 중앙 들여쓰기
-                p.paragraph_format.left_indent = Cm(3.5)
-                r = p.add_run(line)
-                _set_font(r, size_pt=10.5, bold=True)
-            elif line.startswith(('S#', 'INT.', 'EXT.', 'CUT')):
-                # 씬 헤더·전환
-                r = p.add_run(line)
-                _set_font(r, size_pt=11, bold=True, color=(25, 25, 112))
+    def split_into_scenes(text: str):
+        """원본 텍스트를 [(scene_id, scene_body), ...] 리스트로 분할."""
+        if not text:
+            return []
+        lines = text.split('\n')
+        scenes_list = []
+        current_id = ""
+        current_body = []
+
+        for line in lines:
+            stripped = line.strip()
+            # S#숫자 또는 INT./EXT. 패턴이 씬 헤딩
+            if heading_re.match(stripped) or _re.match(r'^S#\d+', stripped):
+                # 이전 씬 저장
+                if current_id or current_body:
+                    scenes_list.append((current_id, '\n'.join(current_body)))
+                # 새 씬 시작
+                current_id = stripped
+                current_body = [line]
             else:
-                r = p.add_run(line)
-                _set_font(r, size_pt=10.5)
+                current_body.append(line)
 
-        # 수정 노트 (작은 글씨로)
-        doc.add_paragraph()
-        what_changed = notes.get("what_changed", "")
-        if what_changed:
-            p = doc.add_paragraph()
-            r = p.add_run(f"  ▸ 변경: {what_changed}")
-            _set_font(r, size_pt=9, color=(142, 142, 153))
+        # 마지막 씬
+        if current_id or current_body:
+            scenes_list.append((current_id, '\n'.join(current_body)))
 
-        what_preserved = notes.get("what_preserved", "")
-        if what_preserved:
-            p = doc.add_paragraph()
-            r = p.add_run(f"  ▸ 보존: {what_preserved}")
-            _set_font(r, size_pt=9, color=(142, 142, 153))
+        return scenes_list
 
-        if idx < len(scenes):
-            doc.add_paragraph()
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run("━━━━━━━━━━━━━━━━━━━━━━━━")
-            _set_font(r, size_pt=10, color=(226, 226, 224))
-            doc.add_paragraph()
+    def extract_scene_number(scene_id_str: str) -> str:
+        """씬 식별자에서 'S#숫자' 패턴만 추출 (매칭용)."""
+        m = _re.search(r'S#(\d+)', scene_id_str)
+        return f"S#{m.group(1)}" if m else scene_id_str.strip()[:20]
+
+    # 수정본 씬을 scene_number로 인덱싱
+    revised_by_id = {}     # {"S#1": revised_content}
+    deleted_ids = set()    # {"S#5", ...}
+    add_after = {}         # {"S#42": [{header, content}, ...]}  ADD 타입
+
+    for sc in scenes:
+        sid = sc.get("scene_id", "")
+        s_type = sc.get("type", "REWRITE")
+        s_header = sc.get("scene_header", sid)
+        s_content = sc.get("revised_content", "")
+        s_num = extract_scene_number(sid)
+
+        if s_type == "DELETE":
+            deleted_ids.add(s_num)
+        elif s_type == "ADD":
+            insert_after = sc.get("insert_position", "") or sid
+            insert_num = extract_scene_number(insert_after)
+            if insert_num not in add_after:
+                add_after[insert_num] = []
+            # ADD 씬은 헤더가 본문에 없을 수 있으니 합쳐서
+            full_text = _merge_header_content(s_header, s_content)
+            add_after[insert_num].append(full_text)
+        else:
+            # REWRITE / MERGE / SPLIT: 단순 교체
+            full_text = _merge_header_content(s_header, s_content)
+            revised_by_id[s_num] = full_text
+
+    # 원본을 씬 단위로 분할 후 통합 시나리오 구성
+    final_scenes = []
+    if original_text:
+        original_scenes = split_into_scenes(original_text)
+        for orig_id, orig_body in original_scenes:
+            orig_num = extract_scene_number(orig_id)
+            if orig_num in deleted_ids:
+                continue  # 삭제
+            if orig_num in revised_by_id:
+                final_scenes.append(revised_by_id[orig_num])  # 교체
+            else:
+                final_scenes.append(orig_body)  # 원본 유지
+            # ADD 처리
+            if orig_num in add_after:
+                for added in add_after[orig_num]:
+                    final_scenes.append(added)
+    else:
+        # 원본이 없으면 수정본만 출력 (배치 부분만)
+        for sc in scenes:
+            s_type = sc.get("type", "REWRITE")
+            if s_type == "DELETE":
+                continue
+            s_header = sc.get("scene_header", "")
+            s_content = sc.get("revised_content", "")
+            full_text = _merge_header_content(s_header, s_content)
+            final_scenes.append(full_text)
+
+    full_text = '\n\n'.join(final_scenes)
+
+    # ─────────────────────────────────────────────────────────
+    # 본문 라인 단위 파싱 (Writer Engine 동일 로직)
+    # ─────────────────────────────────────────────────────────
+    char_re = _re.compile(
+        r'^\s{2,}([가-힣a-zA-Z\s]{1,15}?)\s*'
+        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*$',
+        _re.IGNORECASE
+    )
+    inline_dialogue_re = _re.compile(
+        r'^([가-힣a-zA-Z\s]{1,15}?)\s*'
+        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*'
+        r'\t{1,}\s*(?:\(([^)]*)\)\s*)?(.+)',
+        _re.IGNORECASE
+    )
+    paren_re = _re.compile(r'^\s{2,}\((.+?)\)\s*$')
+
+    # 문자열 그대로의 \n이 들어온 경우(JSON 이스케이프 잔존) 안전 처리
+    full_text = full_text.replace('\\n', '\n').replace('\\t', '\t')
+    lines = full_text.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if not stripped:
+            i += 1
+            continue
+
+        # 마크다운 강조 기호 제거 (** ** 등)
+        if stripped.startswith('**') and stripped.endswith('**'):
+            stripped = stripped[2:-2].strip()
+            line = stripped
+
+        # 메타 라인 차단 (간단 버전 — 메타 마커가 들어오면 스킵)
+        if stripped.startswith('▸') or stripped.startswith('━━━'):
+            i += 1
+            continue
+        if '내부 메모' in stripped or 'WRITER_NOTES' in stripped:
+            i += 1
+            continue
+
+        # 씬 헤딩
+        m = heading_re.match(stripped)
+        if m or _re.match(r'^S#\d+', stripped):
+            add_scene_heading(stripped)
+            i += 1
+            continue
+
+        # 인라인 대사
+        im = inline_dialogue_re.match(stripped)
+        if im:
+            char_name = im.group(1).strip()
+            vo_marker = im.group(2) or ""
+            inline_paren = im.group(3) or ""
+            inline_text = im.group(4).strip()
+            if vo_marker:
+                char_name = f"{char_name} ({vo_marker})"
+            add_dialogue(char_name, inline_paren, inline_text)
+            i += 1
+            continue
+
+        # 들여쓰기 캐릭터명 + 대사
+        cm = char_re.match(line)
+        if cm:
+            char_name = cm.group(1).strip()
+            vo_marker = cm.group(2) or ""
+            if vo_marker:
+                char_name = f"{char_name} ({vo_marker})"
+            parenthetical = ""
+            dialogue_lines = []
+            i += 1
+            if i < len(lines):
+                pm = paren_re.match(lines[i])
+                if pm:
+                    parenthetical = pm.group(1)
+                    i += 1
+            while i < len(lines):
+                dl = lines[i]
+                ds = dl.strip()
+                if not ds:
+                    break
+                if heading_re.match(ds) or _re.match(r'^S#\d+', ds):
+                    break
+                if char_re.match(dl):
+                    break
+                if inline_dialogue_re.match(ds):
+                    break
+                dialogue_lines.append(ds)
+                i += 1
+            if dialogue_lines:
+                merged = " ".join(dialogue_lines)
+                add_dialogue(char_name, parenthetical, merged)
+            continue
+
+        # 그 외: 지문
+        add_action(stripped)
+        i += 1
 
     # ── 바이트 반환 ──
-    buf = io.BytesIO()
+    buf = BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
@@ -818,8 +1054,102 @@ def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
 # =================================================================
 # [6] Stage 실행 함수
 # =================================================================
+def run_v2_pre_analyses(client) -> dict:
+    """v2.0 자동 분석 4종을 병렬적으로 실행하고 결과를 세션에 저장.
+
+    실행 항목:
+    1. 톤 DNA 추출 (tone_ref_text 있을 때)
+    2. Diff 학습 (diff_orig_text + diff_refined_text 있을 때)
+    3. 분포 진단 (항상 실행)
+    4. Rewrite 메타 흡수 (rewrite_json_text 있을 때)
+
+    Returns:
+        {tone_dna, diff_analysis, distribution_diagnostic, rewrite_metadata}
+    """
+    results = {
+        "tone_dna": None,
+        "diff_analysis": None,
+        "distribution_diagnostic": None,
+        "rewrite_metadata": None,
+    }
+
+    # 1. 톤 DNA 추출
+    if st.session_state.tone_ref_text and st.session_state.tone_ref_text.strip():
+        with st.spinner("📐 톤 DNA 자동 추출 중... (Sonnet 4.6)"):
+            prompt_text = build_tone_dna_extraction_prompt(st.session_state.tone_ref_text)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            if raw:
+                tone_dna = parse_json(raw)
+                if tone_dna:
+                    results["tone_dna"] = tone_dna
+                    st.session_state.tone_dna = tone_dna
+                    summary = tone_dna.get("tone_dna", {}).get("summary", "톤 추출 완료")
+                    st.success(f"✅ 톤 DNA 추출 완료: {summary[:120]}")
+
+    # 2. Diff 학습
+    if (st.session_state.diff_orig_text and st.session_state.diff_refined_text
+            and st.session_state.diff_orig_text.strip() and st.session_state.diff_refined_text.strip()):
+        with st.spinner("🔬 작가 편집 패턴 학습 중... (Sonnet 4.6)"):
+            prompt_text = build_diff_analysis_prompt(
+                st.session_state.diff_orig_text,
+                st.session_state.diff_refined_text
+            )
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            if raw:
+                diff = parse_json(raw)
+                if diff:
+                    results["diff_analysis"] = diff
+                    st.session_state.diff_analysis = diff
+                    summary = diff.get("diff_analysis", {}).get("summary", "편집 패턴 학습 완료")
+                    st.success(f"✅ Diff 학습 완료: {summary[:120]}")
+
+    # 3. 분포 진단 (항상 실행)
+    with st.spinner("📊 장르 메트릭 + 캐릭터 분포 진단 중... (Sonnet 4.6)"):
+        prompt_text = build_distribution_diagnostic_prompt(
+            st.session_state.raw_text,
+            st.session_state.genre
+        )
+        raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+        if raw:
+            dist = parse_json(raw)
+            if dist:
+                results["distribution_diagnostic"] = dist
+                st.session_state.distribution_diagnostic = dist
+                summary = dist.get("distribution_diagnostic", {}).get("summary", "분포 진단 완료")
+                upgrades = dist.get("distribution_diagnostic", {}).get("auto_priority_upgrades", [])
+                st.success(f"✅ 분포 진단 완료: {summary[:100]}  (자동 격상 {len(upgrades)}개)")
+
+    # 4. Rewrite 메타 흡수
+    if st.session_state.rewrite_json_text and st.session_state.rewrite_json_text.strip():
+        meta = absorb_rewrite_engine_metadata(st.session_state.rewrite_json_text)
+        if meta and any([
+            meta.get("preserve_notes_by_seq"),
+            meta.get("weak_zone_scenes"),
+            meta.get("auto_priority_high"),
+        ]):
+            results["rewrite_metadata"] = meta
+            st.session_state.rewrite_metadata = meta
+            preserve_count = len(meta.get("preserve_notes_by_seq", {}))
+            weak_count = len(meta.get("weak_zone_scenes", []))
+            st.success(f"✅ Rewrite 메타 흡수: preserve_notes {preserve_count}개, weak_zones {weak_count}개")
+
+    return results
+
+
 def run_diagnose(client):
-    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성."""
+    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0 자동 분석 사전 실행."""
+
+    # v2.0 — 사전 분석 4종 자동 실행 (이미 캐시된 결과 있으면 재사용)
+    pre_results = {
+        "tone_dna": st.session_state.tone_dna,
+        "diff_analysis": st.session_state.diff_analysis,
+        "distribution_diagnostic": st.session_state.distribution_diagnostic,
+        "rewrite_metadata": st.session_state.rewrite_metadata,
+    }
+    # 어느 것도 없으면 사전 분석 실행
+    if not any(pre_results.values()):
+        pre_results = run_v2_pre_analyses(client)
+
     prompt_text = build_diagnose_prompt(
         raw_text=st.session_state.raw_text,
         instruction=st.session_state.instruction,
@@ -830,6 +1160,10 @@ def run_diagnose(client):
         period_key=st.session_state.period_key,
         historical_type=st.session_state.historical_type,
         fact_based=st.session_state.fact_based,
+        tone_dna=pre_results.get("tone_dna"),
+        diff_analysis=pre_results.get("diff_analysis"),
+        distribution_diagnostic=pre_results.get("distribution_diagnostic"),
+        rewrite_metadata=pre_results.get("rewrite_metadata"),
     )
     raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
     if not raw:
@@ -859,6 +1193,8 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
         batch_scenes=batch_scenes,
         batch_index=batch_index,
         total_batches=total_batches,
+        tone_dna=st.session_state.tone_dna,
+        diff_analysis=st.session_state.diff_analysis,
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
@@ -1038,6 +1374,10 @@ def show_step_0_input():
 
             if json_source:
                 try:
+                    # v2.0 — 원문도 별도 저장 (메타 흡수용)
+                    st.session_state.rewrite_json_text = json_source
+                    st.session_state.rewrite_metadata = None  # 캐시 무효화
+
                     converted = parse_rewrite_engine_json(json_source)
                     if converted:
                         # 기존 지시문이 있으면 추가, 없으면 대체
@@ -1049,7 +1389,7 @@ def show_step_0_input():
                             )
                         else:
                             st.session_state.instruction = converted
-                        st.success(f"✅ 변환 완료! 지시문 입력창에 자동 추가되었습니다 ({len(converted):,}자)")
+                        st.success(f"✅ 변환 완료! 지시문에 추가되었습니다 ({len(converted):,}자). v2.0 진단 시 preserve_notes·weak_zones도 자동 흡수됩니다.")
                         st.rerun()
                     else:
                         st.warning("⚠️ JSON에서 변환 가능한 진단·처방 내용을 찾지 못했습니다.")
@@ -1148,6 +1488,103 @@ def show_step_0_input():
         value=st.session_state.fact_based,
         help="실명 사용·특정 가능 디테일·실존 공인 악역화 등의 리스크를 자동 점검합니다",
     )
+
+    # ── v2.0 신규 — 톤 레퍼런스 + Diff 학습 ──
+    st.markdown('<div class="rev-card-title">6. 작가 톤 학습 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(v2.0 신규 · 선택사항)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">이미 손본 시나리오가 있으면 업로드하세요. AI가 작가의 톤·편집 패턴을 학습해 다음 각색에 강제로 적용합니다.</div>',
+                unsafe_allow_html=True)
+
+    tab_a, tab_b = st.tabs(["📐 톤 레퍼런스 (간편)", "🔬 Diff 학습 모드 (강력)"])
+
+    # 탭 A: 톤 레퍼런스
+    with tab_a:
+        st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 그 톤을 자동 추출해 모든 새 각색에 주입합니다.")
+        ref_file = st.file_uploader(
+            "손본 시나리오 DOCX",
+            type=["docx"],
+            key="tone_ref_uploader",
+            help="예: 테이스티 러브 v2_3 같은 작가가 직접 다듬은 버전"
+        )
+        if ref_file:
+            try:
+                from docx import Document as _Doc
+                _doc = _Doc(ref_file)
+                _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                st.session_state.tone_ref_text = _text
+                st.session_state.tone_ref_filename = ref_file.name
+                st.success(f"✅ 톤 레퍼런스 로드됨: {ref_file.name} ({len(_text):,}자)")
+                if st.session_state.tone_dna:
+                    st.info("✓ 톤 DNA가 이미 추출되어 있습니다. 새 진단 시 자동 적용됩니다.")
+                else:
+                    st.caption("→ 진단(Stage 1) 시 톤 DNA가 자동 추출됩니다.")
+            except Exception as e:
+                st.error(f"파일 읽기 실패: {e}")
+        elif st.session_state.tone_ref_filename:
+            st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
+            if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
+                st.session_state.tone_ref_text = ""
+                st.session_state.tone_ref_filename = ""
+                st.session_state.tone_dna = None
+                st.rerun()
+
+    # 탭 B: Diff 학습 모드
+    with tab_b:
+        st.caption("이전 버전 + 작가가 손본 최신 버전 두 개를 업로드하면, AI가 편집 패턴(삭제·압축·통합 기준)을 학습합니다.")
+        c_orig, c_ref = st.columns(2)
+        with c_orig:
+            orig_file = st.file_uploader(
+                "이전 버전 DOCX (Before)",
+                type=["docx"],
+                key="diff_orig_uploader",
+                help="예: 최종통합본 (어제 작업)"
+            )
+            if orig_file:
+                try:
+                    from docx import Document as _Doc
+                    _doc = _Doc(orig_file)
+                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                    st.session_state.diff_orig_text = _text
+                    st.session_state.diff_orig_filename = orig_file.name
+                    st.success(f"✅ Before: {orig_file.name}")
+                except Exception as e:
+                    st.error(f"파일 읽기 실패: {e}")
+            elif st.session_state.diff_orig_filename:
+                st.info(f"📎 {st.session_state.diff_orig_filename}")
+
+        with c_ref:
+            ref2_file = st.file_uploader(
+                "손본 최신 버전 DOCX (After)",
+                type=["docx"],
+                key="diff_refined_uploader",
+                help="예: v2_3 (오늘 작업)"
+            )
+            if ref2_file:
+                try:
+                    from docx import Document as _Doc
+                    _doc = _Doc(ref2_file)
+                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                    st.session_state.diff_refined_text = _text
+                    st.session_state.diff_refined_filename = ref2_file.name
+                    st.success(f"✅ After: {ref2_file.name}")
+                except Exception as e:
+                    st.error(f"파일 읽기 실패: {e}")
+            elif st.session_state.diff_refined_filename:
+                st.info(f"📎 {st.session_state.diff_refined_filename}")
+
+        if st.session_state.diff_orig_text and st.session_state.diff_refined_text:
+            if st.session_state.diff_analysis:
+                st.success("✓ Diff 분석이 이미 완료되었습니다. 새 진단 시 자동 적용됩니다.")
+            else:
+                st.caption("→ 진단(Stage 1) 시 자동으로 편집 패턴을 학습합니다.")
+
+            if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
+                st.session_state.diff_orig_text = ""
+                st.session_state.diff_orig_filename = ""
+                st.session_state.diff_refined_text = ""
+                st.session_state.diff_refined_filename = ""
+                st.session_state.diff_analysis = None
+                st.rerun()
 
     # ── 실행 버튼 ──
     st.markdown("---")
@@ -1677,10 +2114,15 @@ def show_step_4_complete():
     # 수정본 DOCX
     with c1:
         try:
+            is_historical = (st.session_state.period_key != "(현대)")
             docx_bytes = create_revised_docx(
                 st.session_state.revise_result,
                 title=title,
                 genre=genre,
+                original_text=st.session_state.raw_text,
+                fact_based=st.session_state.fact_based,
+                historical=is_historical,
+                historical_type=st.session_state.historical_type if is_historical else "",
             )
             st.download_button(
                 "📄 수정본 (DOCX)",
@@ -1688,7 +2130,7 @@ def show_step_4_complete():
                 file_name=get_report_filename(title, "revised"),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key="dl_revised",
-                help="Revise Engine이 생성한 수정된 씬들 + 요약",
+                help="원본 + 수정된 씬을 통합한 최종 시나리오 (한국 표준 서식)",
                 use_container_width=True,
             )
         except Exception as e:
@@ -1722,7 +2164,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v1.0",
+                "engine": "BLUE JEANS REVISE ENGINE v2.0",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -1779,7 +2221,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v1.0  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.0  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6'
     '</div>',
     unsafe_allow_html=True,
