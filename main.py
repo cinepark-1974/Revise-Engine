@@ -1713,7 +1713,7 @@ def show_step_0_input():
         bool(st.session_state.instruction.strip()),
         bool(st.session_state.diff_refined_text),
         bool(st.session_state.rewrite_json_text.strip()),
-        bool(st.session_state.benchmark_text),
+        bool(st.session_state.genre_dna or st.session_state.genre_ref_texts),
         bool(st.session_state.tone_ref_text),
     ]
     has_aux = any(aux_inputs)
