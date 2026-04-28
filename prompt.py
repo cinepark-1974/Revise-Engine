@@ -11,7 +11,20 @@
 # - 듀얼 모델: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # - Writer Engine v3.5 룰팩 내장 (AI ESCAPE A1~A20, 장르 Override)
 # - Profession Pack v2.3.9 연동 (직업 전문성 블록 자동 주입)
+#
+# v2.0 (2026-04-27)
+# - 톤 DNA 자동 추출·주입 (작가 손본 시나리오 → 톤 학습)
+# - Diff 학습 모드 (Before vs After → 편집 패턴 학습)
+# - 분포 진단 (장르 메트릭 + 캐릭터 등장 분포)
+# - Rewrite Engine 메타 흡수 강화 (preserve_notes·weak_zones 자동 활용)
+#
+# v2.1 (2026-04-28)
+# - 장르 DNA 추출·주입 (참고작 1~3편 → 장르 본질 강제 룰)
+# - 라이브러리 시스템 (장르 DNA JSON 다운/업로드 가능)
+# - 입력 UI 5종 재구성 (시나리오 / 손본본 / Rewrite JSON / 피드백 / 장르 DNA)
+# - 피드백 자료 = 자유 텍스트 (구 "수정 지시문"의 재명명, 선택사항으로 강등)
 # =================================================================
+
 
 # ─────────────────────────────────────────────────────────────────
 # Profession Pack 연동 (선택적 — 없어도 엔진은 정상 동작)
@@ -734,8 +747,6 @@ def build_diff_analysis_prompt(original_text: str, refined_text: str) -> str:
 
 JSON만 출력하라. 설명 금지.
 """.strip()
-
-
 def build_distribution_diagnostic_prompt(raw_text: str, genre: str) -> str:
     """장르 메트릭 + 캐릭터 등장 분포를 측정하는 프롬프트.
     Sonnet 4.6으로 호출 권장."""
@@ -920,15 +931,205 @@ def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
     return metadata
 
 
+# =================================================================
+# [4-C] v2.1 — 장르 DNA 추출 (Genre DNA Extraction)
+# =================================================================
+def build_genre_dna_extraction_prompt(reference_texts: list, genre: str) -> str:
+    """참고작 1~3편으로부터 장르 DNA를 자동 추출하는 프롬프트.
+    Sonnet 4.6으로 호출 권장.
+
+    톤 DNA(작가 개인 스타일)와 달리, 장르 본질을 정량 메트릭으로 추출:
+    - 비트당 코믹 폭발 (로코) / 정보 비대칭 (스릴러) / 일상 균열 (호러)
+    - Misdirection 패턴 횟수
+    - Setpiece 분포
+    - Signature devices
+
+    Args:
+        reference_texts: 참고작 텍스트 리스트 (1~3편)
+        genre: 장르 명 (한국어)
+    """
+    g = (genre or "").lower()
+
+    # 장르별 추출 항목 정의
+    if "로맨틱" in genre or "코미디" in g or "롬코" in g:
+        genre_metrics_focus = """
+[로맨틱 코미디 / 코미디 핵심 장르 DNA]
+- 코믹 폭발 빈도: 비트당 평균 횟수 (1회? 2회? 3회?)
+- 코믹 기법 분포:
+  * Misdirection (기대-반전): 작품당 횟수
+  * Comic Specificity (구체적 숫자·사물·시간): 횟수
+  * 신체 위트 (체형·소도구 활용)
+  * 잘못 들음·잘못 말함 (relationship marker)
+- 두 주인공 케미 씬 비율 (전체 대비 %)
+- 평균 대사 교환 회수 / 씬
+- 침묵 vs 대사 비율
+- 일상 vs 비일상 톤 균형"""
+    elif "느와르" in g or "스릴러" in g or "범죄" in g:
+        genre_metrics_focus = """
+[느와르 / 스릴러 / 범죄 핵심 장르 DNA]
+- 정보 비대칭 빈도: 비트당 횟수 (관객이 인물보다 많이/적게 알기)
+- Misdirection: 작품당 횟수
+- 데드라인·타이머 가시화 횟수
+- Setpiece 긴장 시퀀스 분포 (작품당 몇 회, 어느 비트에)
+- 빌런 대 영웅의 정보 격차 변화 곡선
+- 도덕적 회색지대 표현 방식
+- 폭력의 결과 묘사 vs 행위 묘사 비율"""
+    elif "호러" in g:
+        genre_metrics_focus = """
+[호러 핵심 장르 DNA]
+- 일상 균열 누적: 비트당 균열 포인트 (소리·온도·냄새 변화)
+- Mystery Box 유지 비율: 정보를 어디까지 숨기는가
+- 신체적 불편함 디테일 빈도
+- 안전 공간이 위협받는 순간들
+- 고립 장면 비율
+- 시청각 침묵 vs 음향 사용 균형
+- 점프 스케어 vs 슬로우 빌드 비율"""
+    elif "액션" in g:
+        genre_metrics_focus = """
+[액션 핵심 장르 DNA]
+- Setpiece 액션 시퀀스 분포 (작품당 몇 회)
+- 물리적 위협 가시화 횟수
+- 주인공 대가 (부상·손실) 사례
+- 공간 활용 다양성 (실내·실외·고저·이동수단)
+- 액션 1회당 평균 시간(러닝타임)
+- 액션 직전·직후의 호흡 씬 패턴"""
+    elif "드라마" in g or "가족" in g:
+        genre_metrics_focus = """
+[드라마 핵심 장르 DNA]
+- 침묵 비트 분포: 작품당 몇 회, 어느 시점에
+- 결정의 순간 (3초 이상 망설임) 배치
+- 관계 변화 가시화 사례 (행동·소품으로)
+- B스토리가 메인 테마를 반사하는 사례
+- 감정의 직접 표현 vs 행동 표현 비율
+- 일상 디테일 밀도"""
+    elif "판타지" in g or "sf" in g or "SF" in genre:
+        genre_metrics_focus = """
+[판타지 / SF 핵심 장르 DNA]
+- 세계관 노출 방식: Show vs Tell 비율
+- Sense of Wonder 순간들 분포
+- 룰 설정 → 룰 위반 → 결과 패턴
+- 현실 비유의 강도 (메타포 vs 직설)
+- 기술·마법 디테일 밀도"""
+    else:
+        genre_metrics_focus = """
+[일반 장르 DNA]
+- 씬 시작 방식 패턴 (Drop in Middle vs Establishment)
+- 씬 종료 방식 (Hook/Punch vs Cut)
+- 평균 씬 길이 (단락 수)
+- 정보 배분 곡선
+- 감정 곡선 패턴"""
+
+    # 참고작 합치기 (각 작품 사이에 구분선)
+    refs_combined = "\n\n━━━━━━━━━━━━ 다음 참고작 ━━━━━━━━━━━━\n\n".join(
+        rt[:18000] for rt in reference_texts if rt and rt.strip()
+    )
+
+    return f"""
+[TASK — GENRE DNA EXTRACTION]
+다음은 {genre} 장르의 명작 시나리오 {len(reference_texts)}편이다.
+이 장르의 본질적 매력 ("장르 DNA")을 정량 메트릭과 정성 패턴으로 추출하여 JSON으로 정리하라.
+이 DNA는 다른 작품의 같은 장르를 강화할 때 강제 룰로 사용된다.
+
+[참고작]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{refs_combined}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[추출 핵심 항목]
+{genre_metrics_focus}
+
+[추가 추출 항목 (모든 장르 공통)]
+1. 장르 정체성 한 문장 정의
+2. 이 장르가 관객에게 약속하는 감각 (재미·공포·감동 등) 3가지
+3. Signature Devices: 이 장르가 자주 쓰는 기법 5~7가지 (구체 예시 포함)
+4. 비트별 메트릭 권장값 (예: 비트당 코믹 폭발 ≥ 2회)
+5. 미달 시 대체 패턴 (예: 코믹 폭발이 어렵다면 → Comic Specificity)
+6. 피해야 할 안티-패턴 (이 장르에서 절대 하면 안 되는 것)
+
+[출력 형식 — JSON 단일 객체]
+{{
+  "genre_dna": {{
+    "genre_name": "{genre}",
+    "reference_count": {len(reference_texts)},
+    "core_identity": "이 장르의 본질을 한 문장으로",
+    "promised_sensations": ["관객에게 약속하는 감각 1", "감각 2", "감각 3"],
+    "metrics": {{
+      "metric_1_name": {{
+        "target_value": "권장값 (예: 비트당 2회 이상)",
+        "what_it_is": "이 메트릭이 무엇인지 1줄 설명",
+        "examples_from_references": ["참고작 예시 1", "참고작 예시 2"]
+      }},
+      "metric_2_name": {{
+        "target_value": "권장값",
+        "what_it_is": "설명",
+        "examples_from_references": ["..."]
+      }}
+    }},
+    "signature_devices": [
+      {{
+        "device_name": "기법 이름",
+        "description": "어떻게 작동하는지",
+        "example": "참고작에서 발견한 구체 예시",
+        "frequency_in_references": "참고작에서의 사용 빈도"
+      }}
+    ],
+    "fallback_patterns": {{
+      "if_metric_X_low": "대체 패턴 설명"
+    }},
+    "anti_patterns": [
+      "절대 하면 안 되는 것 1 (이유)",
+      "절대 하면 안 되는 것 2 (이유)"
+    ],
+    "summary": "이 장르 DNA를 한 문단으로 요약 (3~5문장)"
+  }}
+}}
+
+JSON만 출력하라. 설명·주석·마크다운 금지.
+""".strip()
+
+
 def build_v2_diagnose_context_block(
     tone_dna: dict = None,
     diff_analysis: dict = None,
     distribution_diagnostic: dict = None,
-    rewrite_metadata: dict = None
+    rewrite_metadata: dict = None,
+    genre_dna: dict = None,
+    feedback_text: str = ""
 ) -> str:
-    """v2.0 자동 분석 결과들을 DIAGNOSE 프롬프트에 주입할 단일 블록으로 통합."""
+    """v2.0/v2.1 자동 분석 결과들을 DIAGNOSE 프롬프트에 주입할 단일 블록으로 통합.
+
+    Args:
+        tone_dna: 작가 개인 톤 DNA (build_tone_dna_extraction_prompt 결과)
+        diff_analysis: Diff 학습 결과 (build_diff_analysis_prompt 결과)
+        distribution_diagnostic: 분포 진단 결과
+        rewrite_metadata: Rewrite Engine 메타 흡수 결과
+        genre_dna: 장르 DNA (build_genre_dna_extraction_prompt 결과) — v2.1 신규
+        feedback_text: 피드백 자유 텍스트 (모니터·투자사·본인 메모)
+    """
     import json as _json
     parts = []
+
+    # ── v2.1 — 장르 DNA (가장 위에 배치 — 강제력 최상) ──
+    if genre_dna:
+        gd = genre_dna.get("genre_dna", genre_dna)
+        gd_brief = {
+            "core_identity": gd.get("core_identity", ""),
+            "promised_sensations": gd.get("promised_sensations", []),
+            "metrics": gd.get("metrics", {}),
+            "signature_devices": gd.get("signature_devices", []),
+            "anti_patterns": gd.get("anti_patterns", []),
+        }
+        parts.append(f"""
+[★ v2.1 — 장르 DNA (자동 추출 · 강제 룰) ★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{_json.dumps(gd_brief, ensure_ascii=False, indent=2)[:4000]}
+━━━━━━━━━━━━━━━━━━━━━━━━
+※ 위 장르 DNA는 같은 장르 명작 시나리오 {gd.get('reference_count', 0)}편에서 추출됨.
+※ 진단 시 이 메트릭을 기준으로 약점 식별:
+   - metrics의 target_value에 미달하는 영역을 식별해 priority HIGH로 격상
+   - signature_devices가 부족하면 도입 권장
+   - anti_patterns에 해당하는 부분이 있으면 즉시 수정 대상
+※ 집필 시 metrics target_value를 충족하도록 강제.""")
 
     if tone_dna:
         td = tone_dna.get("tone_dna", tone_dna)
@@ -987,6 +1188,17 @@ genre_fun_recovery weak_zones (자동 priority HIGH 격상):
 ※ preserve_notes를 해당 씬의 preservation_notes에 자동 매핑.
 ※ weak_zones에 속한 씬은 priority HIGH로 자동 격상.""")
 
+    if feedback_text and feedback_text.strip():
+        parts.append(f"""
+[v2.1 — 피드백 자료 (모니터·투자사·본인 메모)]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{feedback_text.strip()[:8000]}
+━━━━━━━━━━━━━━━━━━━━━━━━
+※ 위 피드백은 작가가 받은 외부·내부 의견이다.
+※ 씬 단위 언급(예: "S#15 약하다")이 있으면 해당 씬을 자동으로 target_scenes에 포함.
+※ 추상적 의견(예: "1막이 늘어진다")은 해당 구간의 모든 씬을 검토 대상으로.
+※ 피드백과 LOCKED가 충돌하면 LOCKED 우선.""")
+
     if not parts:
         return ""
     return "\n".join(parts)
@@ -997,10 +1209,10 @@ genre_fun_recovery weak_zones (자동 priority HIGH 격상):
 # =================================================================
 def build_diagnose_prompt(
     raw_text: str,
-    instruction: str,
-    locked: str,
-    genre: str,
-    intensity: str,
+    instruction: str = "",
+    locked: str = "",
+    genre: str = "드라마",
+    intensity: str = "BALANCED",
     profession_input: str = "",
     period_key: str = "",
     historical_type: str = "",
@@ -1008,22 +1220,38 @@ def build_diagnose_prompt(
     tone_dna: dict = None,
     diff_analysis: dict = None,
     distribution_diagnostic: dict = None,
-    rewrite_metadata: dict = None
+    rewrite_metadata: dict = None,
+    genre_dna: dict = None
 ) -> str:
-    """Stage 1: 원본 + 지시문 + LOCKED를 분석해 수정 플랜(JSON)을 생성.
+    """Stage 1: 원본 + 자료(들)을 분석해 수정 플랜(JSON)을 생성.
     Sonnet 4.6 사용 권장 (구조 분석).
 
-    profession_input: 주요 캐릭터의 직업 (선택사항).
-    period_key: 시대 키 (조선_전기 등). 빈 문자열이면 현대로 간주.
-    historical_type: 정통/팩션/퓨전 (period_key 있을 때만 의미 있음).
-    fact_based: 실화 기반 작품 여부.
+    [필수]
+    raw_text: 각색 대상 시나리오
 
-    [v2.0 신규]
-    tone_dna: 톤 DNA 추출 결과 (build_tone_dna_extraction_prompt 결과).
-    diff_analysis: Diff 학습 결과 (build_diff_analysis_prompt 결과).
-    distribution_diagnostic: 분포 진단 결과 (build_distribution_diagnostic_prompt 결과).
-    rewrite_metadata: Rewrite Engine 메타 (absorb_rewrite_engine_metadata 결과).
+    [선택 — 1개 이상 권장]
+    instruction: 피드백 자료 텍스트 (모니터·투자사·메모)
+    diff_analysis: 손본본 비교 결과 (편집 패턴 학습)
+    rewrite_metadata: Rewrite Engine JSON 메타
+    genre_dna: 장르 DNA (참고작에서 추출한 장르 본질)
+
+    [부가]
+    locked: 절대 건드리지 말 요소
+    profession_input, period_key, historical_type, fact_based: 작품 컨텍스트
+    tone_dna: 작가 본인 톤 (손본본 기반)
+    distribution_diagnostic: 분포 진단 (자동 생성)
     """
+
+    # 입력 자료가 하나라도 있는지 체크 (instruction 외에)
+    has_aux_input = any([
+        instruction.strip() if instruction else False,
+        diff_analysis,
+        rewrite_metadata,
+        genre_dna,
+    ])
+    if not has_aux_input:
+        # 보조 자료가 전혀 없으면 자동 진단 모드로 안내
+        instruction = (instruction or "") + "\n\n[자동 진단 모드]\n사용자가 별도 피드백 자료를 제공하지 않았다. 시나리오 자체를 분석해 장르 메트릭·캐릭터 분포·구조적 약점을 자동 진단하고, 개선이 필요한 씬들을 target_scenes에 포함하라."
 
     genre_block = get_genre_rules_block(genre)
     locked_text = locked.strip() if locked.strip() else "(명시된 LOCKED 요소 없음 — 기본 원칙 적용: 플롯의 큰 흐름·핵심 반전·엔딩은 유지)"
@@ -1082,12 +1310,14 @@ def build_diagnose_prompt(
 
 ※ 진단 시 실명 사용·특정 가능 디테일·실존 공인 악역화 등 리스크를 식별하라."""
 
-    # v2.0 자동 분석 결과 통합 블록
+    # v2.0/v2.1 자동 분석 결과 통합 블록
     v2_context_section = build_v2_diagnose_context_block(
         tone_dna=tone_dna,
         diff_analysis=diff_analysis,
         distribution_diagnostic=distribution_diagnostic,
         rewrite_metadata=rewrite_metadata,
+        genre_dna=genre_dna,
+        feedback_text=instruction,
     )
 
     return f"""
@@ -1100,9 +1330,9 @@ def build_diagnose_prompt(
 {raw_text}
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-[수정 지시문]
+[피드백 자료 / 수정 방향]
 ━━━━━━━━━━━━━━━━━━━━━━━━
-{instruction}
+{instruction if instruction.strip() else "(별도 피드백 자료 없음 — 자동 진단 모드로 진행)"}
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 [LOCKED — 절대 건드리지 않을 요소]
@@ -1216,7 +1446,8 @@ def build_revise_prompt(
     batch_index: int = 0,
     total_batches: int = 0,
     tone_dna: dict = None,
-    diff_analysis: dict = None
+    diff_analysis: dict = None,
+    genre_dna: dict = None
 ) -> str:
     """Stage 2: Stage 1의 수정 플랜에 따라 실제 수정본을 집필.
     Opus 4.6 사용 필수 (집필).
@@ -1400,6 +1631,55 @@ def build_revise_prompt(
 ※ 편집 철학을 모든 씬에 일관되게 적용하라."""
 
         v2_tone_section = td_block + df_block
+
+    # v2.1 — 장르 DNA (강제 룰)
+    if genre_dna:
+        gd = genre_dna.get("genre_dna", genre_dna)
+        metrics = gd.get("metrics", {})
+        sig_devices = gd.get("signature_devices", [])
+        anti_patterns = gd.get("anti_patterns", [])
+
+        metrics_lines = []
+        for m_name, m_data in metrics.items():
+            if isinstance(m_data, dict):
+                target = m_data.get("target_value", "")
+                what = m_data.get("what_it_is", "")
+                metrics_lines.append(f"  ▸ {m_name}: {target}\n     ({what})")
+        metrics_str = "\n".join(metrics_lines) if metrics_lines else "  (없음)"
+
+        sig_lines = []
+        for sd in sig_devices[:5]:  # 최대 5개
+            if isinstance(sd, dict):
+                name = sd.get("device_name", "")
+                example = sd.get("example", "")
+                sig_lines.append(f"  ▸ {name}\n     예: {example}")
+        sig_str = "\n".join(sig_lines) if sig_lines else "  (없음)"
+
+        anti_str = "\n".join(f"  ✗ {a}" for a in anti_patterns[:5]) if anti_patterns else "  (없음)"
+
+        gd_block = f"""
+
+[★ v2.1 — 장르 DNA 강제 룰 (집필 시 절대 준수) ★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+장르 정체성: {gd.get('core_identity', '')}
+참고작 분석: {gd.get('reference_count', 0)}편
+
+권장 메트릭:
+{metrics_str}
+
+시그니처 기법 (적극 활용):
+{sig_str}
+
+안티 패턴 (절대 금지):
+{anti_str}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+※ 위 메트릭의 target_value를 충족하도록 집필하라.
+   미달 시 fallback_patterns 참조하여 대체 패턴 사용.
+※ signature_devices를 자연스럽게 녹여라. 모방이 아닌 응용.
+※ anti_patterns에 해당하는 표현은 절대 만들지 마라.
+※ 작가 톤 DNA가 함께 있으면 톤은 작가 것, 장르 강도는 DNA 메트릭."""
+        v2_tone_section += gd_block
 
     return f"""
 [TASK — Stage 2: REVISE]
