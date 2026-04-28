@@ -1633,6 +1633,7 @@ def show_step_0_input():
     # 탭 3: 장르 DNA (참고작 1~3편)
     with tab_genre:
         st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
+        st.caption("📝 한국어·영문 시나리오 모두 가능. 영문 명작도 자유롭게 사용하세요 (출력은 항상 한국어).")
 
         # ─────────────────────────────────────────
         # STEP 1. 참고작 업로드 (메인 동선)
@@ -1647,7 +1648,8 @@ def show_step_0_input():
             type=["docx"],
             key="genre_ref_uploader",
             accept_multiple_files=True,
-            help="예: 로코 → 「조별과제」+「프로듀스 101」 / 느와르 → 「달콤한 인생」+「올드보이」"
+            help="한국·영문 모두 가능. 예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
+                 "느와르 → 「Drive」+「No Country for Old Men」 / 호러 → 「Hereditary」+「Get Out」"
         )
         if genre_files:
             try:
