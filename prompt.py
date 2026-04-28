@@ -1084,6 +1084,13 @@ def build_genre_dna_extraction_prompt(reference_texts: list, genre: str) -> str:
   }}
 }}
 
+[다국어 지원 안내]
+- 참고작이 영문이어도 정상 처리. 영문 시나리오에서 패턴·메트릭·signature devices를 추출하라.
+- 참고작이 한국어/영어 혼합이어도 무방.
+- 다만 출력 JSON의 모든 텍스트는 반드시 한국어로 작성하라.
+- examples_from_references에 영문 인용을 넣을 때는 원문(영문) + 한국어 번역을 같이 표기하라.
+  예: "「Knives Out」 — 'Just because' (그냥) — 살인 동기를 단순한 문구로 압축"
+
 JSON만 출력하라. 설명·주석·마크다운 금지.
 """.strip()
 
