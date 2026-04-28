@@ -276,6 +276,56 @@ def reset_workflow():
 
 
 # =================================================================
+# [2-B] 통합 파일 추출 헬퍼 — DOCX + PDF
+# =================================================================
+def extract_text_from_uploaded_file(uploaded_file) -> str:
+    """업로드된 파일(DOCX 또는 PDF)에서 텍스트 추출.
+
+    Args:
+        uploaded_file: st.file_uploader가 반환한 파일 객체
+
+    Returns:
+        추출된 전체 텍스트. 실패 시 빈 문자열.
+    """
+    if uploaded_file is None:
+        return ""
+
+    name = uploaded_file.name.lower()
+
+    # DOCX
+    if name.endswith(".docx"):
+        try:
+            from docx import Document as _Doc
+            _doc = _Doc(uploaded_file)
+            return "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+        except Exception as e:
+            st.error(f"DOCX 읽기 실패 ({uploaded_file.name}): {e}")
+            return ""
+
+    # PDF
+    elif name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(uploaded_file)
+            text_parts = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    text_parts.append(t)
+            full_text = "\n".join(text_parts)
+            if not full_text.strip():
+                st.warning(f"⚠️ PDF에서 텍스트를 추출하지 못했습니다. 스캔본/이미지 PDF는 지원되지 않습니다 ({uploaded_file.name})")
+            return full_text
+        except Exception as e:
+            st.error(f"PDF 읽기 실패 ({uploaded_file.name}): {e}")
+            return ""
+
+    else:
+        st.error(f"지원하지 않는 파일 형식: {uploaded_file.name} (DOCX 또는 PDF만 가능)")
+        return ""
+
+
+# =================================================================
 # [3] API 클라이언트 & 호출
 # =================================================================
 def get_client():
@@ -1309,23 +1359,23 @@ def render_stepbar():
 # =================================================================
 def show_step_0_input():
     """Step 0: 원본 업로드 + 지시문 + LOCKED + 옵션 입력."""
-    st.markdown('<div class="rev-card-title">1. 원본 시나리오 업로드 (DOCX)</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">Writer Engine에서 출력한 DOCX 파일을 업로드하세요.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rev-card-title">1. 원본 시나리오 업로드 (DOCX 또는 PDF)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">Writer Engine 출력 DOCX, 외부 시나리오 PDF 모두 가능합니다.</div>', unsafe_allow_html=True)
 
     uploaded = st.file_uploader(
-        "DOCX 파일 선택",
-        type=["docx"],
+        "DOCX 또는 PDF 파일 선택",
+        type=["docx", "pdf"],
         key="docx_uploader",
         label_visibility="collapsed"
     )
 
     if uploaded:
-        text = extract_docx_text(uploaded)
+        text = extract_text_from_uploaded_file(uploaded)
         if text:
             st.session_state.raw_text = text
             st.session_state.raw_filename = uploaded.name
-            # 제목은 파일명에서 추출
-            st.session_state.title = re.sub(r'\.docx$', '', uploaded.name)
+            # 제목은 파일명에서 추출 (확장자 제거)
+            st.session_state.title = re.sub(r'\.(docx|pdf)$', '', uploaded.name, flags=re.IGNORECASE)
             st.success(f"✅ 업로드 완료: {uploaded.name}  ({len(text):,}자)")
             with st.expander("📄 추출된 본문 미리보기 (앞 1,000자)"):
                 st.text(text[:1000] + ("..." if len(text) > 1000 else ""))
@@ -1541,16 +1591,14 @@ def show_step_0_input():
     with tab_tone:
         st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 작가 고유의 톤 DNA를 자동 추출해 모든 새 각색에 강제 주입합니다.")
         ref_file = st.file_uploader(
-            "작가가 손본 시나리오 DOCX",
-            type=["docx"],
+            "작가가 손본 시나리오 (DOCX 또는 PDF)",
+            type=["docx", "pdf"],
             key="tone_ref_uploader",
             help="예: v2_3 같은 작가가 직접 다듬은 버전"
         )
         if ref_file:
-            try:
-                from docx import Document as _Doc
-                _doc = _Doc(ref_file)
-                _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+            _text = extract_text_from_uploaded_file(ref_file)
+            if _text:
                 st.session_state.tone_ref_text = _text
                 st.session_state.tone_ref_filename = ref_file.name
                 st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
@@ -1558,8 +1606,6 @@ def show_step_0_input():
                     st.info("✓ 톤 DNA가 이미 추출되어 있습니다.")
                 else:
                     st.caption("→ 진단(Stage 1) 시 톤 DNA 자동 추출.")
-            except Exception as e:
-                st.error(f"파일 읽기 실패: {e}")
         elif st.session_state.tone_ref_filename:
             st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
             if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
@@ -1581,41 +1627,33 @@ def show_step_0_input():
         st.session_state.diff_use_main_as_before = use_main
 
         ref2_file = st.file_uploader(
-            "손본 최신 버전 DOCX (After)",
-            type=["docx"],
+            "손본 최신 버전 (After · DOCX 또는 PDF)",
+            type=["docx", "pdf"],
             key="diff_refined_uploader",
             help="예: v2_3"
         )
         if ref2_file:
-            try:
-                from docx import Document as _Doc
-                _doc = _Doc(ref2_file)
-                _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+            _text = extract_text_from_uploaded_file(ref2_file)
+            if _text:
                 st.session_state.diff_refined_text = _text
                 st.session_state.diff_refined_filename = ref2_file.name
                 st.success(f"✅ After 등록: {ref2_file.name} ({len(_text):,}자)")
-            except Exception as e:
-                st.error(f"파일 읽기 실패: {e}")
         elif st.session_state.diff_refined_filename:
             st.info(f"📎 After: {st.session_state.diff_refined_filename}")
 
         if not use_main:
             st.markdown("**고급 옵션 — Before 별도 업로드:**")
             orig_file = st.file_uploader(
-                "Before DOCX (별도 지정)",
-                type=["docx"],
+                "Before (별도 지정 · DOCX 또는 PDF)",
+                type=["docx", "pdf"],
                 key="diff_orig_uploader",
             )
             if orig_file:
-                try:
-                    from docx import Document as _Doc
-                    _doc = _Doc(orig_file)
-                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                _text = extract_text_from_uploaded_file(orig_file)
+                if _text:
                     st.session_state.diff_orig_text = _text
                     st.session_state.diff_orig_filename = orig_file.name
                     st.success(f"✅ Before: {orig_file.name}")
-                except Exception as e:
-                    st.error(f"파일 읽기 실패: {e}")
 
         if st.session_state.diff_refined_text:
             if st.session_state.diff_analysis:
@@ -1644,32 +1682,31 @@ def show_step_0_input():
                     '</div>', unsafe_allow_html=True)
 
         genre_files = st.file_uploader(
-            "참고작 시나리오 DOCX (1~3편 · 같은 장르)",
-            type=["docx"],
+            "참고작 시나리오 (1~3편 · 같은 장르 · DOCX 또는 PDF)",
+            type=["docx", "pdf"],
             key="genre_ref_uploader",
             accept_multiple_files=True,
-            help="한국·영문 모두 가능. 예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
+            help="한국·영문 모두 가능. 외부 시나리오는 보통 PDF로 유통됩니다 (IMSDb·SimplyScripts 등). "
+                 "예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
                  "느와르 → 「Drive」+「No Country for Old Men」 / 호러 → 「Hereditary」+「Get Out」"
         )
         if genre_files:
-            try:
-                from docx import Document as _Doc
-                texts = []
-                names = []
-                for gf in genre_files[:3]:
-                    _doc = _Doc(gf)
-                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+            texts = []
+            names = []
+            for gf in genre_files[:3]:
+                _text = extract_text_from_uploaded_file(gf)
+                if _text:
                     texts.append(_text)
                     names.append(gf.name)
+            if texts:
                 st.session_state.genre_ref_texts = texts
                 st.session_state.genre_ref_filenames = names
-                st.success(f"✅ 참고작 {len(texts)}편 로드: {', '.join(names)}")
+                total_chars = sum(len(t) for t in texts)
+                st.success(f"✅ 참고작 {len(texts)}편 로드 (총 {total_chars:,}자): {', '.join(names)}")
                 if st.session_state.genre_dna:
                     st.info("✓ 장르 DNA 추출 완료. 진단 시 자동 적용됩니다.")
                 else:
                     st.caption("→ 진단(Stage 1) 시 장르 DNA 자동 추출됩니다.")
-            except Exception as e:
-                st.error(f"파일 읽기 실패: {e}")
         elif st.session_state.genre_ref_filenames:
             st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
 
