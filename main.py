@@ -42,6 +42,8 @@ from prompt import (
     build_diff_analysis_prompt,
     build_distribution_diagnostic_prompt,
     absorb_rewrite_engine_metadata,
+    # v2.1 신규
+    build_genre_dna_extraction_prompt,
 )
 
 # =================================================================
@@ -254,6 +256,12 @@ INIT_STATE = {
     "diff_analysis": None,      # Diff 학습 결과
     "distribution_diagnostic": None,  # 분포 진단
     "rewrite_metadata": None,   # Rewrite 메타 흡수
+    # v2.1 — 장르 DNA (참고작 1~3편에서 추출)
+    "genre_ref_texts": [],      # [참고작1 텍스트, 참고작2, ...] 최대 3편
+    "genre_ref_filenames": [],  # 파일명 리스트
+    "genre_dna": None,          # 추출된 장르 DNA
+    # v2.1 — Diff 모드: Before로 원본을 자동 사용할지 옵션
+    "diff_use_main_as_before": True,
 }
 
 for k, v in INIT_STATE.items():
@@ -601,7 +609,7 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
              align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x8E, 0x8E, 0x99))
     rr = revise_result.get("revision_result", {})
     scenes = rr.get("revised_scenes", [])
-    add_text(f"Revise Engine v2.0  ·  {len(scenes)}개 씬 수정",
+    add_text(f"Revise Engine v2.1  ·  {len(scenes)}개 씬 수정",
              size=Pt(9), align=WD_ALIGN_PARAGRAPH.CENTER,
              color=RGBColor(0x8E, 0x8E, 0x99))
     doc.add_page_break()
@@ -1055,22 +1063,24 @@ def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
 # [6] Stage 실행 함수
 # =================================================================
 def run_v2_pre_analyses(client) -> dict:
-    """v2.0 자동 분석 4종을 병렬적으로 실행하고 결과를 세션에 저장.
+    """v2.0/v2.1 자동 분석을 실행하고 결과를 세션에 저장.
 
     실행 항목:
     1. 톤 DNA 추출 (tone_ref_text 있을 때)
-    2. Diff 학습 (diff_orig_text + diff_refined_text 있을 때)
+    2. Diff 학습 (After 있고 Before는 자동/수동 선택)
     3. 분포 진단 (항상 실행)
     4. Rewrite 메타 흡수 (rewrite_json_text 있을 때)
+    5. 장르 DNA 추출 (genre_ref_texts 있을 때) [v2.1]
 
     Returns:
-        {tone_dna, diff_analysis, distribution_diagnostic, rewrite_metadata}
+        {tone_dna, diff_analysis, distribution_diagnostic, rewrite_metadata, genre_dna}
     """
     results = {
         "tone_dna": None,
         "diff_analysis": None,
         "distribution_diagnostic": None,
         "rewrite_metadata": None,
+        "genre_dna": None,
     }
 
     # 1. 톤 DNA 추출
@@ -1086,14 +1096,18 @@ def run_v2_pre_analyses(client) -> dict:
                     summary = tone_dna.get("tone_dna", {}).get("summary", "톤 추출 완료")
                     st.success(f"✅ 톤 DNA 추출 완료: {summary[:120]}")
 
-    # 2. Diff 학습
-    if (st.session_state.diff_orig_text and st.session_state.diff_refined_text
-            and st.session_state.diff_orig_text.strip() and st.session_state.diff_refined_text.strip()):
+    # 2. Diff 학습 (Before는 옵션에 따라 main 시나리오 또는 별도 업로드)
+    diff_before = ""
+    diff_after = st.session_state.diff_refined_text.strip() if st.session_state.diff_refined_text else ""
+    if diff_after:
+        if st.session_state.diff_use_main_as_before:
+            diff_before = st.session_state.raw_text.strip() if st.session_state.raw_text else ""
+        else:
+            diff_before = st.session_state.diff_orig_text.strip() if st.session_state.diff_orig_text else ""
+
+    if diff_before and diff_after:
         with st.spinner("🔬 작가 편집 패턴 학습 중... (Sonnet 4.6)"):
-            prompt_text = build_diff_analysis_prompt(
-                st.session_state.diff_orig_text,
-                st.session_state.diff_refined_text
-            )
+            prompt_text = build_diff_analysis_prompt(diff_before, diff_after)
             raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
             if raw:
                 diff = parse_json(raw)
@@ -1133,18 +1147,36 @@ def run_v2_pre_analyses(client) -> dict:
             weak_count = len(meta.get("weak_zone_scenes", []))
             st.success(f"✅ Rewrite 메타 흡수: preserve_notes {preserve_count}개, weak_zones {weak_count}개")
 
+    # 5. 장르 DNA 추출 (v2.1)
+    if st.session_state.genre_ref_texts and any(t.strip() for t in st.session_state.genre_ref_texts):
+        ref_count = len(st.session_state.genre_ref_texts)
+        with st.spinner(f"🎬 장르 DNA 추출 중... 참고작 {ref_count}편 분석 (Sonnet 4.6)"):
+            prompt_text = build_genre_dna_extraction_prompt(
+                st.session_state.genre_ref_texts,
+                st.session_state.genre
+            )
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            if raw:
+                gd = parse_json(raw)
+                if gd:
+                    results["genre_dna"] = gd
+                    st.session_state.genre_dna = gd
+                    summary = gd.get("genre_dna", {}).get("summary", "장르 DNA 추출 완료")
+                    st.success(f"✅ 장르 DNA 추출 완료: {summary[:120]}")
+
     return results
 
 
 def run_diagnose(client):
-    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0 자동 분석 사전 실행."""
+    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0/v2.1 자동 분석 사전 실행."""
 
-    # v2.0 — 사전 분석 4종 자동 실행 (이미 캐시된 결과 있으면 재사용)
+    # v2.0/v2.1 — 사전 분석 자동 실행 (이미 캐시된 결과 있으면 재사용)
     pre_results = {
         "tone_dna": st.session_state.tone_dna,
         "diff_analysis": st.session_state.diff_analysis,
         "distribution_diagnostic": st.session_state.distribution_diagnostic,
         "rewrite_metadata": st.session_state.rewrite_metadata,
+        "genre_dna": st.session_state.genre_dna,
     }
     # 어느 것도 없으면 사전 분석 실행
     if not any(pre_results.values()):
@@ -1164,6 +1196,7 @@ def run_diagnose(client):
         diff_analysis=pre_results.get("diff_analysis"),
         distribution_diagnostic=pre_results.get("distribution_diagnostic"),
         rewrite_metadata=pre_results.get("rewrite_metadata"),
+        genre_dna=pre_results.get("genre_dna"),
     )
     raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
     if not raw:
@@ -1195,6 +1228,7 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
         total_batches=total_batches,
         tone_dna=st.session_state.tone_dna,
         diff_analysis=st.session_state.diff_analysis,
+        genre_dna=st.session_state.genre_dna,
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
@@ -1336,9 +1370,11 @@ def show_step_0_input():
 
     st.markdown("---")
 
-    # ── 수정 지시문 ──
-    st.markdown('<div class="rev-card-title">2. 수정 지시문</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">본인 지시, 모니터 보고서, 투자사 피드백, Rewrite Engine의 CHRIS/SHIHO 분석 내용을 자유롭게 입력하세요.</div>',
+    # ── 피드백 자료 (v2.1: 선택사항으로 격하) ──
+    st.markdown('<div class="rev-card-title">2. 피드백 자료 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">모니터 보고서·투자사 피드백·본인 메모·Rewrite Engine 진단 등 수정 방향에 도움되는 자료를 자유롭게 입력하세요. '
+                '비워두어도 자동 진단이 작동합니다.</div>',
                 unsafe_allow_html=True)
 
     # Rewrite Engine JSON 자동 변환 expander
@@ -1489,22 +1525,26 @@ def show_step_0_input():
         help="실명 사용·특정 가능 디테일·실존 공인 악역화 등의 리스크를 자동 점검합니다",
     )
 
-    # ── v2.0 신규 — 톤 레퍼런스 + Diff 학습 ──
-    st.markdown('<div class="rev-card-title">6. 작가 톤 학습 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(v2.0 신규 · 선택사항)</span></div>',
+    # ── v2.1 신규 — 작가 톤 학습 + 장르 DNA ──
+    st.markdown('<div class="rev-card-title">6. 작가 톤 학습 + 장르 DNA <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항 · 강력 추천)</span></div>',
                 unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">이미 손본 시나리오가 있으면 업로드하세요. AI가 작가의 톤·편집 패턴을 학습해 다음 각색에 강제로 적용합니다.</div>',
+    st.markdown('<div class="rev-caption">손본 시나리오로 작가 톤을 학습시키거나, 같은 장르 명작으로 장르 DNA를 추출해 강제 적용합니다. 모두 자동 분석됩니다.</div>',
                 unsafe_allow_html=True)
 
-    tab_a, tab_b = st.tabs(["📐 톤 레퍼런스 (간편)", "🔬 Diff 학습 모드 (강력)"])
+    tab_tone, tab_diff, tab_genre = st.tabs([
+        "📐 톤 레퍼런스 (작가 톤 1편)",
+        "🔬 Diff 학습 (Before vs After)",
+        "🎬 장르 DNA (참고작 1~3편)"
+    ])
 
-    # 탭 A: 톤 레퍼런스
-    with tab_a:
-        st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 그 톤을 자동 추출해 모든 새 각색에 주입합니다.")
+    # 탭 1: 톤 레퍼런스 (작가 손본 1편)
+    with tab_tone:
+        st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 작가 고유의 톤 DNA를 자동 추출해 모든 새 각색에 강제 주입합니다.")
         ref_file = st.file_uploader(
-            "손본 시나리오 DOCX",
+            "작가가 손본 시나리오 DOCX",
             type=["docx"],
             key="tone_ref_uploader",
-            help="예: 테이스티 러브 v2_3 같은 작가가 직접 다듬은 버전"
+            help="예: v2_3 같은 작가가 직접 다듬은 버전"
         )
         if ref_file:
             try:
@@ -1513,11 +1553,11 @@ def show_step_0_input():
                 _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
                 st.session_state.tone_ref_text = _text
                 st.session_state.tone_ref_filename = ref_file.name
-                st.success(f"✅ 톤 레퍼런스 로드됨: {ref_file.name} ({len(_text):,}자)")
+                st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
                 if st.session_state.tone_dna:
-                    st.info("✓ 톤 DNA가 이미 추출되어 있습니다. 새 진단 시 자동 적용됩니다.")
+                    st.info("✓ 톤 DNA가 이미 추출되어 있습니다.")
                 else:
-                    st.caption("→ 진단(Stage 1) 시 톤 DNA가 자동 추출됩니다.")
+                    st.caption("→ 진단(Stage 1) 시 톤 DNA 자동 추출.")
             except Exception as e:
                 st.error(f"파일 읽기 실패: {e}")
         elif st.session_state.tone_ref_filename:
@@ -1528,16 +1568,43 @@ def show_step_0_input():
                 st.session_state.tone_dna = None
                 st.rerun()
 
-    # 탭 B: Diff 학습 모드
-    with tab_b:
-        st.caption("이전 버전 + 작가가 손본 최신 버전 두 개를 업로드하면, AI가 편집 패턴(삭제·압축·통합 기준)을 학습합니다.")
-        c_orig, c_ref = st.columns(2)
-        with c_orig:
+    # 탭 2: Diff 학습 (Before + After)
+    with tab_diff:
+        st.caption("이전 버전(Before) vs 작가 손본 최신(After) 두 개를 비교해 편집 패턴(삭제·압축·통합 기준)을 자동 학습합니다.")
+
+        use_main = st.checkbox(
+            "✅ Before로 1번 원본 시나리오를 자동 사용 (권장)",
+            value=st.session_state.diff_use_main_as_before,
+            key="diff_use_main_chk",
+            help="대부분의 경우 1번 원본을 Before로 쓰는 것이 자연스럽습니다."
+        )
+        st.session_state.diff_use_main_as_before = use_main
+
+        ref2_file = st.file_uploader(
+            "손본 최신 버전 DOCX (After)",
+            type=["docx"],
+            key="diff_refined_uploader",
+            help="예: v2_3"
+        )
+        if ref2_file:
+            try:
+                from docx import Document as _Doc
+                _doc = _Doc(ref2_file)
+                _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                st.session_state.diff_refined_text = _text
+                st.session_state.diff_refined_filename = ref2_file.name
+                st.success(f"✅ After 등록: {ref2_file.name} ({len(_text):,}자)")
+            except Exception as e:
+                st.error(f"파일 읽기 실패: {e}")
+        elif st.session_state.diff_refined_filename:
+            st.info(f"📎 After: {st.session_state.diff_refined_filename}")
+
+        if not use_main:
+            st.markdown("**고급 옵션 — Before 별도 업로드:**")
             orig_file = st.file_uploader(
-                "이전 버전 DOCX (Before)",
+                "Before DOCX (별도 지정)",
                 type=["docx"],
                 key="diff_orig_uploader",
-                help="예: 최종통합본 (어제 작업)"
             )
             if orig_file:
                 try:
@@ -1549,49 +1616,122 @@ def show_step_0_input():
                     st.success(f"✅ Before: {orig_file.name}")
                 except Exception as e:
                     st.error(f"파일 읽기 실패: {e}")
-            elif st.session_state.diff_orig_filename:
-                st.info(f"📎 {st.session_state.diff_orig_filename}")
 
-        with c_ref:
-            ref2_file = st.file_uploader(
-                "손본 최신 버전 DOCX (After)",
-                type=["docx"],
-                key="diff_refined_uploader",
-                help="예: v2_3 (오늘 작업)"
-            )
-            if ref2_file:
-                try:
-                    from docx import Document as _Doc
-                    _doc = _Doc(ref2_file)
-                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
-                    st.session_state.diff_refined_text = _text
-                    st.session_state.diff_refined_filename = ref2_file.name
-                    st.success(f"✅ After: {ref2_file.name}")
-                except Exception as e:
-                    st.error(f"파일 읽기 실패: {e}")
-            elif st.session_state.diff_refined_filename:
-                st.info(f"📎 {st.session_state.diff_refined_filename}")
-
-        if st.session_state.diff_orig_text and st.session_state.diff_refined_text:
+        if st.session_state.diff_refined_text:
             if st.session_state.diff_analysis:
-                st.success("✓ Diff 분석이 이미 완료되었습니다. 새 진단 시 자동 적용됩니다.")
+                st.success("✓ Diff 분석 완료. 진단 시 자동 적용됩니다.")
             else:
-                st.caption("→ 진단(Stage 1) 시 자동으로 편집 패턴을 학습합니다.")
-
+                st.caption("→ 진단(Stage 1) 시 자동으로 편집 패턴 학습.")
             if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
-                st.session_state.diff_orig_text = ""
-                st.session_state.diff_orig_filename = ""
                 st.session_state.diff_refined_text = ""
                 st.session_state.diff_refined_filename = ""
+                st.session_state.diff_orig_text = ""
+                st.session_state.diff_orig_filename = ""
                 st.session_state.diff_analysis = None
                 st.rerun()
 
+    # 탭 3: 장르 DNA (참고작 1~3편)
+    with tab_genre:
+        st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
+
+        # 라이브러리 — JSON 업로드 (이전에 추출한 DNA 재사용)
+        with st.expander("💾 장르 DNA 라이브러리 (이전에 추출한 JSON 재사용)"):
+            st.caption("이전에 추출해 다운로드해둔 장르 DNA JSON이 있으면 바로 로드할 수 있습니다.")
+            dna_json_file = st.file_uploader(
+                "장르 DNA JSON 업로드",
+                type=["json"],
+                key="genre_dna_json_uploader"
+            )
+            if dna_json_file:
+                try:
+                    import json as _json
+                    raw = dna_json_file.read().decode("utf-8")
+                    loaded = _json.loads(raw)
+                    st.session_state.genre_dna = loaded
+                    summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
+                    st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
+                except Exception as e:
+                    st.error(f"JSON 로드 실패: {e}")
+
+        # 참고작 업로드 (새로 추출)
+        st.markdown("**또는 참고작 업로드해서 즉석 추출:**")
+        genre_files = st.file_uploader(
+            "참고작 시나리오 DOCX (1~3편)",
+            type=["docx"],
+            key="genre_ref_uploader",
+            accept_multiple_files=True,
+            help="같은 장르의 명작 1~3편 (예: 로코 → 「조별과제」, 「프로듀스 101」)"
+        )
+        if genre_files:
+            try:
+                from docx import Document as _Doc
+                texts = []
+                names = []
+                for gf in genre_files[:3]:
+                    _doc = _Doc(gf)
+                    _text = "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+                    texts.append(_text)
+                    names.append(gf.name)
+                st.session_state.genre_ref_texts = texts
+                st.session_state.genre_ref_filenames = names
+                st.success(f"✅ 참고작 {len(texts)}편 로드: {', '.join(names)}")
+                if st.session_state.genre_dna:
+                    st.info("✓ 장르 DNA 추출 완료. 진단 시 자동 적용됩니다.")
+                else:
+                    st.caption("→ 진단(Stage 1) 시 장르 DNA 자동 추출.")
+            except Exception as e:
+                st.error(f"파일 읽기 실패: {e}")
+        elif st.session_state.genre_ref_filenames:
+            st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
+
+        # 추출된 DNA 다운로드 (라이브러리 저장용)
+        if st.session_state.genre_dna:
+            import json as _json
+            dna_json = _json.dumps(st.session_state.genre_dna, ensure_ascii=False, indent=2)
+            st.download_button(
+                "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
+                data=dna_json.encode("utf-8"),
+                file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
+                mime="application/json",
+                key="dl_genre_dna",
+                help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요"
+            )
+
+            if st.button("🗑️ 장르 DNA 제거", key="btn_clear_genre_dna"):
+                st.session_state.genre_ref_texts = []
+                st.session_state.genre_ref_filenames = []
+                st.session_state.genre_dna = None
+                st.rerun()
+
+    # ── 실행 버튼 ──
     # ── 실행 버튼 ──
     st.markdown("---")
-    ready = bool(st.session_state.raw_text and st.session_state.instruction.strip())
 
-    if not ready:
-        st.warning("⚠️ 원본 DOCX 업로드 + 수정 지시문이 모두 있어야 시작할 수 있습니다.")
+    # v2.1: 입력 검증 — 시나리오 + (피드백 자료 / 손본본 / Rewrite JSON / 장르 DNA 중 1개 이상)
+    has_scenario = bool(st.session_state.raw_text)
+    aux_inputs = [
+        bool(st.session_state.instruction.strip()),
+        bool(st.session_state.diff_refined_text),
+        bool(st.session_state.rewrite_json_text.strip()),
+        bool(st.session_state.benchmark_text),
+        bool(st.session_state.tone_ref_text),
+    ]
+    has_aux = any(aux_inputs)
+    ready = has_scenario  # 시나리오만 있으면 자동 진단 모드로 진행 가능
+
+    if not has_scenario:
+        st.warning("⚠️ 1번 원본 시나리오 DOCX 업로드는 필수입니다.")
+    elif not has_aux:
+        st.info("ℹ️ 피드백·손본본·Rewrite JSON·장르 DNA 등 보조 자료가 없습니다. 시나리오 자체를 자동 진단해 약점을 찾습니다.")
+    else:
+        # 어떤 자료가 등록되어 있는지 한눈에
+        active = []
+        if st.session_state.instruction.strip(): active.append("📝 피드백")
+        if st.session_state.diff_refined_text: active.append("🔬 Diff")
+        if st.session_state.rewrite_json_text.strip(): active.append("🔗 Rewrite JSON")
+        if st.session_state.tone_ref_text: active.append("📐 톤 레퍼런스")
+        if st.session_state.genre_dna or st.session_state.genre_ref_texts: active.append("🎬 장르 DNA")
+        st.caption(f"등록된 자료: {' · '.join(active)}")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -2164,7 +2304,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.0",
+                "engine": "BLUE JEANS REVISE ENGINE v2.1",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -2221,7 +2361,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.0  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.1  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6'
     '</div>',
     unsafe_allow_html=True,
