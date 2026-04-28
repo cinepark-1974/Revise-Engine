@@ -1634,33 +1634,20 @@ def show_step_0_input():
     with tab_genre:
         st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
 
-        # 라이브러리 — JSON 업로드 (이전에 추출한 DNA 재사용)
-        with st.expander("💾 장르 DNA 라이브러리 (이전에 추출한 JSON 재사용)"):
-            st.caption("이전에 추출해 다운로드해둔 장르 DNA JSON이 있으면 바로 로드할 수 있습니다.")
-            dna_json_file = st.file_uploader(
-                "장르 DNA JSON 업로드",
-                type=["json"],
-                key="genre_dna_json_uploader"
-            )
-            if dna_json_file:
-                try:
-                    import json as _json
-                    raw = dna_json_file.read().decode("utf-8")
-                    loaded = _json.loads(raw)
-                    st.session_state.genre_dna = loaded
-                    summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
-                    st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
-                except Exception as e:
-                    st.error(f"JSON 로드 실패: {e}")
+        # ─────────────────────────────────────────
+        # STEP 1. 참고작 업로드 (메인 동선)
+        # ─────────────────────────────────────────
+        st.markdown('<div style="background:#FFF8DD; padding:8px 12px; border-radius:6px; '
+                    'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
+                    '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → 진단 시 장르 DNA 자동 추출'
+                    '</div>', unsafe_allow_html=True)
 
-        # 참고작 업로드 (새로 추출)
-        st.markdown("**또는 참고작 업로드해서 즉석 추출:**")
         genre_files = st.file_uploader(
-            "참고작 시나리오 DOCX (1~3편)",
+            "참고작 시나리오 DOCX (1~3편 · 같은 장르)",
             type=["docx"],
             key="genre_ref_uploader",
             accept_multiple_files=True,
-            help="같은 장르의 명작 1~3편 (예: 로코 → 「조별과제」, 「프로듀스 101」)"
+            help="예: 로코 → 「조별과제」+「프로듀스 101」 / 느와르 → 「달콤한 인생」+「올드보이」"
         )
         if genre_files:
             try:
@@ -1678,32 +1665,63 @@ def show_step_0_input():
                 if st.session_state.genre_dna:
                     st.info("✓ 장르 DNA 추출 완료. 진단 시 자동 적용됩니다.")
                 else:
-                    st.caption("→ 진단(Stage 1) 시 장르 DNA 자동 추출.")
+                    st.caption("→ 진단(Stage 1) 시 장르 DNA 자동 추출됩니다.")
             except Exception as e:
                 st.error(f"파일 읽기 실패: {e}")
         elif st.session_state.genre_ref_filenames:
             st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
 
-        # 추출된 DNA 다운로드 (라이브러리 저장용)
+        # ─────────────────────────────────────────
+        # STEP 2. 추출된 DNA 다운로드 (라이브러리 보관)
+        # ─────────────────────────────────────────
         if st.session_state.genre_dna:
+            st.markdown('<div style="background:#EAF3DE; padding:8px 12px; border-radius:6px; '
+                        'border-left:3px solid #2EC484; margin:14px 0 8px; font-size:0.88rem;">'
+                        '<b>② 추출 완료 — 다음 작품에서 재사용하려면 JSON으로 보관하세요</b>'
+                        '</div>', unsafe_allow_html=True)
             import json as _json
             dna_json = _json.dumps(st.session_state.genre_dna, ensure_ascii=False, indent=2)
-            st.download_button(
-                "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
-                data=dna_json.encode("utf-8"),
-                file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
-                mime="application/json",
-                key="dl_genre_dna",
-                help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요"
+            cdl1, cdl2 = st.columns([3, 1])
+            with cdl1:
+                st.download_button(
+                    "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
+                    data=dna_json.encode("utf-8"),
+                    file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
+                    mime="application/json",
+                    key="dl_genre_dna",
+                    help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요",
+                    use_container_width=True,
+                )
+            with cdl2:
+                if st.button("🗑️ 제거", key="btn_clear_genre_dna", use_container_width=True):
+                    st.session_state.genre_ref_texts = []
+                    st.session_state.genre_ref_filenames = []
+                    st.session_state.genre_dna = None
+                    st.rerun()
+
+        # ─────────────────────────────────────────
+        # STEP 3. 라이브러리 — 이전에 보관한 JSON 재사용 (반복 사용자)
+        # ─────────────────────────────────────────
+        st.markdown("---")
+        with st.expander("📚 장르 DNA 라이브러리 — 이전에 추출해둔 JSON 불러오기"):
+            st.caption("같은 장르로 작업한 적이 있다면, 이전에 다운로드해둔 JSON을 업로드해서 "
+                       "참고작 다시 안 올리고 바로 적용할 수 있습니다.")
+            dna_json_file = st.file_uploader(
+                "장르 DNA JSON 업로드",
+                type=["json"],
+                key="genre_dna_json_uploader"
             )
+            if dna_json_file:
+                try:
+                    import json as _json
+                    raw = dna_json_file.read().decode("utf-8")
+                    loaded = _json.loads(raw)
+                    st.session_state.genre_dna = loaded
+                    summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
+                    st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
+                except Exception as e:
+                    st.error(f"JSON 로드 실패: {e}")
 
-            if st.button("🗑️ 장르 DNA 제거", key="btn_clear_genre_dna"):
-                st.session_state.genre_ref_texts = []
-                st.session_state.genre_ref_filenames = []
-                st.session_state.genre_dna = None
-                st.rerun()
-
-    # ── 실행 버튼 ──
     # ── 실행 버튼 ──
     st.markdown("---")
 
