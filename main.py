@@ -44,6 +44,10 @@ from prompt import (
     absorb_rewrite_engine_metadata,
     # v2.1 신규
     build_genre_dna_extraction_prompt,
+    # v2.2 신규
+    build_section_detection_prompt,
+    build_boundary_smoothness_block,
+    build_cascade_analysis_prompt,
 )
 
 # =================================================================
@@ -262,6 +266,14 @@ INIT_STATE = {
     "genre_dna": None,          # 추출된 장르 DNA
     # v2.1 — Diff 모드: Before로 원본을 자동 사용할지 옵션
     "diff_use_main_as_before": True,
+    # v2.2 — 구간 지정 모드 (이어쓰기 + 부분 수정 통합)
+    "section_mode": False,           # 구간 모드 활성화
+    "section_input_method": "auto",  # auto (자동 감지) / manual (수동 지정) / hybrid
+    "section_detection": None,       # 자동 감지 결과
+    "protected_ranges": [],          # [{"from":"S#1","to":"S#25","reason":"..."}, ...]
+    "revision_ranges": [],           # [{"from":"S#26","to":"S#71","reason":"..."}, ...]
+    "cascade_analysis": None,        # 연쇄 영향 분석 결과
+    "boundary_info": "",             # 경계 매끄러움 정보 (자동 계산)
 }
 
 for k, v in INIT_STATE.items():
@@ -659,7 +671,7 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
              align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x8E, 0x8E, 0x99))
     rr = revise_result.get("revision_result", {})
     scenes = rr.get("revised_scenes", [])
-    add_text(f"Revise Engine v2.1  ·  {len(scenes)}개 씬 수정",
+    add_text(f"Revise Engine v2.2  ·  {len(scenes)}개 씬 수정",
              size=Pt(9), align=WD_ALIGN_PARAGRAPH.CENTER,
              color=RGBColor(0x8E, 0x8E, 0x99))
     doc.add_page_break()
@@ -1115,26 +1127,29 @@ def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
 def run_v2_pre_analyses(client) -> dict:
     """v2.0/v2.1 자동 분석을 실행하고 결과를 세션에 저장.
 
-    실행 항목:
-    1. 톤 DNA 추출 (tone_ref_text 있을 때)
-    2. Diff 학습 (After 있고 Before는 자동/수동 선택)
-    3. 분포 진단 (항상 실행)
-    4. Rewrite 메타 흡수 (rewrite_json_text 있을 때)
-    5. 장르 DNA 추출 (genre_ref_texts 있을 때) [v2.1]
+    실행 항목 (각각 독립적으로 캐시 체크):
+    1. 톤 DNA 추출 (tone_ref_text 있고 캐시 없을 때)
+    2. Diff 학습 (After 있고 캐시 없을 때)
+    3. 분포 진단 (항상 실행, 캐시 없을 때)
+    4. Rewrite 메타 흡수 (rewrite_json_text 있고 캐시 없을 때)
+    5. 장르 DNA 추출 (genre_ref_texts 있고 캐시 없을 때) [v2.1]
+
+    각 항목은 독립적으로 캐시되므로, 일부만 추가 업로드해도 정확히 그 부분만 재추출됨.
 
     Returns:
         {tone_dna, diff_analysis, distribution_diagnostic, rewrite_metadata, genre_dna}
     """
     results = {
-        "tone_dna": None,
-        "diff_analysis": None,
-        "distribution_diagnostic": None,
-        "rewrite_metadata": None,
-        "genre_dna": None,
+        "tone_dna": st.session_state.tone_dna,
+        "diff_analysis": st.session_state.diff_analysis,
+        "distribution_diagnostic": st.session_state.distribution_diagnostic,
+        "rewrite_metadata": st.session_state.rewrite_metadata,
+        "genre_dna": st.session_state.genre_dna,
     }
 
-    # 1. 톤 DNA 추출
-    if st.session_state.tone_ref_text and st.session_state.tone_ref_text.strip():
+    # 1. 톤 DNA 추출 (캐시 없을 때만)
+    if (st.session_state.tone_ref_text and st.session_state.tone_ref_text.strip()
+            and not st.session_state.tone_dna):
         with st.spinner("📐 톤 DNA 자동 추출 중... (Sonnet 4.6)"):
             prompt_text = build_tone_dna_extraction_prompt(st.session_state.tone_ref_text)
             raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
@@ -1214,23 +1229,82 @@ def run_v2_pre_analyses(client) -> dict:
                     summary = gd.get("genre_dna", {}).get("summary", "장르 DNA 추출 완료")
                     st.success(f"✅ 장르 DNA 추출 완료: {summary[:120]}")
 
+    # 6. 구간 자동 감지 (v2.2 — 구간 모드 + auto/hybrid + 캐시 없을 때만)
+    if (st.session_state.section_mode
+            and st.session_state.section_input_method in ("auto", "hybrid")
+            and st.session_state.diff_refined_text
+            and not st.session_state.section_detection):
+        with st.spinner("🔍 구간 자동 감지 중... 손본본과 원본 의미 매칭 (Sonnet 4.6)"):
+            prompt_text = build_section_detection_prompt(
+                refined_text=st.session_state.diff_refined_text,
+                original_text=st.session_state.raw_text,
+            )
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=10000)
+            if raw:
+                sd = parse_json(raw)
+                if sd:
+                    st.session_state.section_detection = sd
+                    detection = sd.get("section_detection", {})
+                    rec_prot = detection.get("recommended_protected_range", [])
+                    rec_rev = detection.get("recommended_revision_range", [])
+
+                    # auto 모드면 권장값을 자동 적용
+                    if st.session_state.section_input_method == "auto":
+                        if rec_prot and not st.session_state.protected_ranges:
+                            st.session_state.protected_ranges = rec_prot
+                        if rec_rev and not st.session_state.revision_ranges:
+                            st.session_state.revision_ranges = rec_rev
+
+                    cp = detection.get("continuation_point", {})
+                    if cp.get("detected") in (True, "true"):
+                        st.success(f"✅ 이어쓰기 시작점 감지: {cp.get('explanation', '')[:200]}")
+                    else:
+                        st.success("✅ 구간 감지 완료. 권장 보호/재집필 영역이 적용되었습니다.")
+
+    # 7. 연쇄 영향 분석 (v2.2 — 보호/재집필 영역 모두 있을 때)
+    if (st.session_state.section_mode
+            and st.session_state.protected_ranges
+            and st.session_state.revision_ranges
+            and not st.session_state.cascade_analysis):
+        with st.spinner("🔬 연쇄 영향 분석 중... 보호 구간과의 모순 점검 (Sonnet 4.6)"):
+            prompt_text = build_cascade_analysis_prompt(
+                revision_ranges=st.session_state.revision_ranges,
+                protected_ranges=st.session_state.protected_ranges,
+                raw_text=st.session_state.raw_text,
+            )
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            if raw:
+                ca = parse_json(raw)
+                if ca:
+                    st.session_state.cascade_analysis = ca
+                    summary = ca.get("cascade_analysis", {}).get("summary", "연쇄 분석 완료")
+                    must_preserve_count = len(ca.get("cascade_analysis", {}).get("must_preserve", []))
+                    conflict_count = len(ca.get("cascade_analysis", {}).get("potential_conflicts", []))
+                    st.success(
+                        f"✅ 연쇄 영향 분석 완료: 보존 요소 {must_preserve_count}개 / 잠재 모순 {conflict_count}개"
+                    )
+
+    # 8. 경계 매끄러움 정보 자동 계산 (v2.2)
+    if (st.session_state.section_mode
+            and st.session_state.protected_ranges
+            and st.session_state.revision_ranges
+            and not st.session_state.boundary_info):
+        boundary = build_boundary_smoothness_block(
+            protected_ranges=st.session_state.protected_ranges,
+            revision_ranges=st.session_state.revision_ranges,
+            raw_text=st.session_state.raw_text,
+        )
+        if boundary:
+            st.session_state.boundary_info = boundary
+
     return results
 
 
 def run_diagnose(client):
-    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0/v2.1 자동 분석 사전 실행."""
+    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0/v2.1/v2.2 자동 분석 사전 실행."""
 
-    # v2.0/v2.1 — 사전 분석 자동 실행 (이미 캐시된 결과 있으면 재사용)
-    pre_results = {
-        "tone_dna": st.session_state.tone_dna,
-        "diff_analysis": st.session_state.diff_analysis,
-        "distribution_diagnostic": st.session_state.distribution_diagnostic,
-        "rewrite_metadata": st.session_state.rewrite_metadata,
-        "genre_dna": st.session_state.genre_dna,
-    }
-    # 어느 것도 없으면 사전 분석 실행
-    if not any(pre_results.values()):
-        pre_results = run_v2_pre_analyses(client)
+    # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱이라 안전)
+    pre_results = run_v2_pre_analyses(client)
 
     prompt_text = build_diagnose_prompt(
         raw_text=st.session_state.raw_text,
@@ -1247,6 +1321,11 @@ def run_diagnose(client):
         distribution_diagnostic=pre_results.get("distribution_diagnostic"),
         rewrite_metadata=pre_results.get("rewrite_metadata"),
         genre_dna=pre_results.get("genre_dna"),
+        section_mode=st.session_state.section_mode,
+        protected_ranges=st.session_state.protected_ranges,
+        revision_ranges=st.session_state.revision_ranges,
+        cascade_analysis=st.session_state.cascade_analysis,
+        boundary_info=st.session_state.boundary_info,
     )
     raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
     if not raw:
@@ -1279,6 +1358,11 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
         tone_dna=st.session_state.tone_dna,
         diff_analysis=st.session_state.diff_analysis,
         genre_dna=st.session_state.genre_dna,
+        section_mode=st.session_state.section_mode,
+        protected_ranges=st.session_state.protected_ranges,
+        revision_ranges=st.session_state.revision_ranges,
+        cascade_analysis=st.session_state.cascade_analysis,
+        boundary_info=st.session_state.boundary_info,
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
@@ -1603,9 +1687,9 @@ def show_step_0_input():
                 st.session_state.tone_ref_filename = ref_file.name
                 st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
                 if st.session_state.tone_dna:
-                    st.info("✓ 톤 DNA가 이미 추출되어 있습니다.")
+                    st.info("✓ 톤 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 톤이 시나리오 분석·집필에 자동 적용됩니다.")
                 else:
-                    st.caption("→ 진단(Stage 1) 시 톤 DNA 자동 추출.")
+                    st.caption("→ Stage 1 진단 시작 시 톤 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
         elif st.session_state.tone_ref_filename:
             st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
             if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
@@ -1657,9 +1741,9 @@ def show_step_0_input():
 
         if st.session_state.diff_refined_text:
             if st.session_state.diff_analysis:
-                st.success("✓ Diff 분석 완료. 진단 시 자동 적용됩니다.")
+                st.info("✓ Diff 학습 완료. **Stage 1 진단 시작** 버튼을 누르면 학습된 편집 패턴이 시나리오 분석·집필에 자동 적용됩니다.")
             else:
-                st.caption("→ 진단(Stage 1) 시 자동으로 편집 패턴 학습.")
+                st.caption("→ Stage 1 진단 시작 시 편집 패턴이 자동으로 먼저 학습되고, 그 결과로 시나리오를 진단합니다.")
             if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
                 st.session_state.diff_refined_text = ""
                 st.session_state.diff_refined_filename = ""
@@ -1678,7 +1762,8 @@ def show_step_0_input():
         # ─────────────────────────────────────────
         st.markdown('<div style="background:#FFF8DD; padding:8px 12px; border-radius:6px; '
                     'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
-                    '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → 진단 시 장르 DNA 자동 추출'
+                    '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → '
+                    'Stage 1 진단 시작 시 장르 DNA 자동 추출 → 그 DNA로 시나리오 진단'
                     '</div>', unsafe_allow_html=True)
 
         genre_files = st.file_uploader(
@@ -1704,9 +1789,9 @@ def show_step_0_input():
                 total_chars = sum(len(t) for t in texts)
                 st.success(f"✅ 참고작 {len(texts)}편 로드 (총 {total_chars:,}자): {', '.join(names)}")
                 if st.session_state.genre_dna:
-                    st.info("✓ 장르 DNA 추출 완료. 진단 시 자동 적용됩니다.")
+                    st.info("✓ 장르 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 DNA가 시나리오 분석·집필에 자동 적용됩니다.")
                 else:
-                    st.caption("→ 진단(Stage 1) 시 장르 DNA 자동 추출됩니다.")
+                    st.caption("→ Stage 1 진단 시작 시 장르 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
         elif st.session_state.genre_ref_filenames:
             st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
 
@@ -1761,6 +1846,151 @@ def show_step_0_input():
                 except Exception as e:
                     st.error(f"JSON 로드 실패: {e}")
 
+    # ── v2.2 신규 — 7. 처리 모드 (구간 지정) ──
+    st.markdown('<div class="rev-card-title">7. 처리 모드 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(v2.2 신규 · 선택사항)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">기본은 전체 각색입니다. 일부 구간만 보호하거나 재집필하고 싶을 때 구간 모드를 켜세요.</div>',
+                unsafe_allow_html=True)
+
+    mode_choice = st.radio(
+        "처리 방식",
+        options=["전체 각색", "구간 지정 (보호 + 재집필)"],
+        index=1 if st.session_state.section_mode else 0,
+        horizontal=True,
+        key="mode_radio",
+        help="전체 각색: 시나리오 전체를 다시 씀. 구간 지정: 일부는 보호, 일부만 재집필."
+    )
+    st.session_state.section_mode = (mode_choice == "구간 지정 (보호 + 재집필)")
+
+    if st.session_state.section_mode:
+        st.markdown(
+            '<div style="background:#FFF8DD; padding:10px 14px; border-radius:6px; '
+            'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
+            '<b>📌 구간 지정 모드 — 사용 케이스</b><br>'
+            '① <b>이어쓰기:</b> 일부분(예: 1막)은 손본 상태, 나머지를 v2_3 톤으로 이어쓰기<br>'
+            '② <b>부분 수정:</b> 2막 엔딩만 약해서 그 부분만 다시 쓰기<br>'
+            '③ <b>여러 구간 동시 수정:</b> 모니터 의견 반영해 여러 부분 한꺼번에 손보기'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        method_choice = st.radio(
+            "구간 지정 방법",
+            options=[
+                "🤖 자동 감지 (이어쓰기 — 손본본이 있을 때)",
+                "✋ 수동 지정 (부분 수정 — 직접 구간 입력)",
+                "🔀 하이브리드 (자동 감지 + 수동 추가)"
+            ],
+            index={"auto": 0, "manual": 1, "hybrid": 2}.get(st.session_state.section_input_method, 0),
+            key="method_radio",
+        )
+        st.session_state.section_input_method = {
+            "🤖 자동 감지 (이어쓰기 — 손본본이 있을 때)": "auto",
+            "✋ 수동 지정 (부분 수정 — 직접 구간 입력)": "manual",
+            "🔀 하이브리드 (자동 감지 + 수동 추가)": "hybrid",
+        }[method_choice]
+
+        # 자동 감지 결과 표시
+        if st.session_state.section_input_method in ("auto", "hybrid"):
+            if not st.session_state.diff_refined_text:
+                st.warning("⚠️ 자동 감지를 위해 6번 'Diff 학습' 탭에서 손본본을 먼저 업로드하세요.")
+            else:
+                st.info(f"📎 손본본 등록됨: {st.session_state.diff_refined_filename}. "
+                        f"Stage 1 진단 시 자동으로 보호/재집필 영역이 감지됩니다.")
+                if st.session_state.section_detection:
+                    detection = st.session_state.section_detection.get("section_detection", {})
+                    cp = detection.get("continuation_point", {})
+                    if cp.get("detected") in (True, "true"):
+                        st.success(f"✓ 이어쓰기 시작점 감지됨")
+                        with st.expander("감지 결과 상세"):
+                            st.markdown(f"**설명:** {cp.get('explanation', '')}")
+                            prot_list = [
+                                f"{r.get('from','')}~{r.get('to','')}"
+                                for r in detection.get('recommended_protected_range', [])
+                            ]
+                            rev_list = [
+                                f"{r.get('from','')}~{r.get('to','')}"
+                                for r in detection.get('recommended_revision_range', [])
+                            ]
+                            st.markdown(f"**권장 보호 구간:** {prot_list}")
+                            st.markdown(f"**권장 재집필 구간:** {rev_list}")
+
+        # 수동 지정 + 하이브리드 — 구간 직접 입력
+        if st.session_state.section_input_method in ("manual", "hybrid"):
+            st.markdown("**재집필할 구간을 입력하세요** (나머지는 자동으로 보호됩니다):")
+            st.caption("형식: `S#41-S#55, S#67-S#67` (단일 씬은 같은 번호 두 번)")
+
+            # 현재 재집필 구간을 텍스트로 변환
+            current_rev_str = ", ".join(
+                f"{r.get('from','')}-{r.get('to','')}"
+                for r in st.session_state.revision_ranges
+            ) if st.session_state.revision_ranges else ""
+
+            rev_input = st.text_input(
+                "재집필 구간",
+                value=current_rev_str,
+                placeholder="예: S#41-S#55, S#67-S#67",
+                key="manual_rev_ranges",
+                label_visibility="collapsed"
+            )
+
+            if rev_input.strip() and rev_input != current_rev_str:
+                # 파싱
+                try:
+                    import re as _re
+                    new_ranges = []
+                    for piece in rev_input.split(","):
+                        piece = piece.strip()
+                        m = _re.match(r'(S#\d+)\s*[-~]\s*(S#\d+)', piece)
+                        if m:
+                            new_ranges.append({
+                                "from": m.group(1),
+                                "to": m.group(2),
+                                "reason": "수동 지정"
+                            })
+                    if new_ranges:
+                        st.session_state.revision_ranges = new_ranges
+                        # 보호 구간 자동 계산은 진단 시 처리
+                        st.success(f"✅ 재집필 구간 {len(new_ranges)}개 등록됨")
+                except Exception as e:
+                    st.error(f"구간 파싱 실패: {e}")
+
+        # 현재 등록된 구간 표시
+        if st.session_state.protected_ranges or st.session_state.revision_ranges:
+            with st.expander("📋 현재 등록된 구간"):
+                if st.session_state.protected_ranges:
+                    st.markdown("**🔒 보호 구간 (절대 안 건드림):**")
+                    for r in st.session_state.protected_ranges:
+                        st.markdown(f"  - {r.get('from','')} ~ {r.get('to','')}  *({r.get('reason','')})*")
+                if st.session_state.revision_ranges:
+                    st.markdown("**✏️ 재집필 구간 (다시 쓸 부분):**")
+                    for r in st.session_state.revision_ranges:
+                        st.markdown(f"  - {r.get('from','')} ~ {r.get('to','')}  *({r.get('reason','')})*")
+
+                if st.button("🗑️ 구간 초기화", key="btn_clear_sections"):
+                    st.session_state.protected_ranges = []
+                    st.session_state.revision_ranges = []
+                    st.session_state.section_detection = None
+                    st.session_state.cascade_analysis = None
+                    st.session_state.boundary_info = ""
+                    st.rerun()
+
+        # 연쇄 분석 결과 표시
+        if st.session_state.cascade_analysis:
+            with st.expander("🔬 연쇄 영향 분석 결과"):
+                ca = st.session_state.cascade_analysis.get("cascade_analysis", {})
+                st.markdown(f"**요약:** {ca.get('summary', '')}")
+                mp = ca.get("must_preserve", [])
+                if mp:
+                    st.markdown("**반드시 유지할 요소:**")
+                    for p in mp[:5]:
+                        st.markdown(f"  - [{p.get('category','')}] {p.get('item','')} ({p.get('where_in_protected','')})")
+                conflicts = ca.get("potential_conflicts", [])
+                if conflicts:
+                    st.markdown("**⚠️ 잠재 모순:**")
+                    for c in conflicts[:3]:
+                        st.markdown(f"  - {c.get('issue','')}")
+
     # ── 실행 버튼 ──
     st.markdown("---")
 
@@ -1788,7 +2018,42 @@ def show_step_0_input():
         if st.session_state.rewrite_json_text.strip(): active.append("🔗 Rewrite JSON")
         if st.session_state.tone_ref_text: active.append("📐 톤 레퍼런스")
         if st.session_state.genre_dna or st.session_state.genre_ref_texts: active.append("🎬 장르 DNA")
+        if st.session_state.section_mode: active.append("✂️ 구간 모드")
         st.caption(f"등록된 자료: {' · '.join(active)}")
+
+    # 진단 버튼 직전 — 무슨 일이 일어날지 미리 안내
+    if ready:
+        pending = []
+        if st.session_state.tone_ref_text and not st.session_state.tone_dna:
+            pending.append("톤 DNA 추출")
+        if st.session_state.diff_refined_text and not st.session_state.diff_analysis:
+            pending.append("Diff 학습")
+        if st.session_state.genre_ref_texts and not st.session_state.genre_dna:
+            pending.append("장르 DNA 추출")
+        if not st.session_state.distribution_diagnostic:
+            pending.append("분포 진단")
+        if st.session_state.rewrite_json_text.strip() and not st.session_state.rewrite_metadata:
+            pending.append("Rewrite 메타 흡수")
+
+        if pending:
+            st.markdown(
+                f'<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
+                f'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
+                f'<b>🔬 Stage 1 진단 시작 시 자동 진행:</b><br>'
+                f'1단계 사전 분석 ({", ".join(pending)}) → '
+                f'2단계 시나리오 진단 (수정 플랜 생성)'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
+                'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
+                '<b>🔬 Stage 1 진단 시작 시 자동 진행:</b><br>'
+                '캐시된 사전 분석 결과를 활용해 바로 시나리오 진단(수정 플랜 생성)을 시작합니다.'
+                '</div>',
+                unsafe_allow_html=True
+            )
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -1796,7 +2061,7 @@ def show_step_0_input():
                      disabled=not ready, use_container_width=True):
             client = get_client()
             if client:
-                with st.spinner("🔬 수정 지시를 분석하고 수정 플랜을 생성 중... (Sonnet 4.6)"):
+                with st.spinner("🔬 사전 분석 + 수정 플랜 생성 중... (Sonnet 4.6)"):
                     result = run_diagnose(client)
                     if result:
                         st.session_state.diagnose_result = result
@@ -2312,11 +2577,18 @@ def show_step_4_complete():
     with c1:
         try:
             is_historical = (st.session_state.period_key != "(현대)")
+            # v2.2 — 구간 모드 + 손본본 있으면 손본본을 베이스로 사용
+            base_text = st.session_state.raw_text
+            if (st.session_state.section_mode
+                    and st.session_state.diff_refined_text
+                    and st.session_state.section_input_method in ("auto", "hybrid")):
+                base_text = st.session_state.diff_refined_text
+
             docx_bytes = create_revised_docx(
                 st.session_state.revise_result,
                 title=title,
                 genre=genre,
-                original_text=st.session_state.raw_text,
+                original_text=base_text,
                 fact_based=st.session_state.fact_based,
                 historical=is_historical,
                 historical_type=st.session_state.historical_type if is_historical else "",
@@ -2361,7 +2633,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.1",
+                "engine": "BLUE JEANS REVISE ENGINE v2.2",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -2418,7 +2690,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.1  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.2  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6'
     '</div>',
     unsafe_allow_html=True,

@@ -1095,15 +1095,260 @@ JSON만 출력하라. 설명·주석·마크다운 금지.
 """.strip()
 
 
+# =================================================================
+# [4-D] v2.2 — 구간 지정 모드 (Section Mode)
+# =================================================================
+def build_section_detection_prompt(refined_text: str, original_text: str) -> str:
+    """손본본과 원본을 비교해 보호/재집필 영역을 자동 감지하는 프롬프트.
+    Sonnet 4.6으로 호출 권장.
+
+    이어쓰기 케이스 처리:
+    - 손본본 앞부분(예: S#1~S#25)은 새로 쓴 부분 → 보호
+    - 손본본 뒷부분이 원본 후반부와 매칭됨 → 그 시작점이 이어쓰기 지점
+
+    부분 수정 케이스도 동일 함수로 처리:
+    - 손본본 전체가 원본과 거의 일치하면 보호 영역 = 전체
+    - 사용자가 따로 재집필 구간을 수동 지정해서 보충
+    """
+    refined_sample = refined_text[:30000] if refined_text else ""
+    original_sample = original_text[:30000] if original_text else ""
+    return f"""
+[TASK — SECTION DETECTION]
+다음은 두 시나리오다.
+(A) 작가가 일부분을 새로 쓴 손본본
+(B) 원본 시나리오 (각색 대상의 원본 또는 이전 통합본)
+
+손본본의 각 씬을 원본의 씬과 의미적으로 매칭해, 다음을 식별하라:
+1. 손본본에만 있는 씬 (= 작가가 새로 쓴 부분, 보호 대상)
+2. 손본본과 원본이 매칭되는 씬 (= 원본을 그대로 가져온 부분 또는 살짝 다듬은 부분)
+3. 원본에만 있는 씬 (= 손본본에서 빠진 부분, 재집필 또는 삭제 대상)
+
+[손본본]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{refined_sample}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[원본]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{original_sample}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[매칭 기준]
+- 같은 장소·시간·인물·핵심 사건 → 매칭
+- 씬 번호가 달라도 OK (예: 손본 S#26 = 원본 S#38)
+- 살짝 다듬은 정도(평균 20% 미만 변경)는 매칭으로 간주
+- 30% 이상 다르면 "새로 쓴 것"으로 간주
+
+[출력 형식 — JSON 단일 객체]
+{{
+  "section_detection": {{
+    "summary": "전체 결과 한 문단 요약",
+    "refined_only_scenes": [
+      {{
+        "refined_scene_id": "S#1",
+        "header": "S#1 INT. 한남시장 — 이른 아침",
+        "reason": "원본에 매칭 안 됨 (작가가 새로 쓴 도입부)"
+      }}
+    ],
+    "matched_scenes": [
+      {{
+        "refined_scene_id": "S#26",
+        "original_scene_id": "S#38",
+        "header_refined": "S#26 INT. 강회장 사무실",
+        "header_original": "S#38 INT. 강회장 사무실",
+        "similarity": "high | medium | low",
+        "diff_summary": "거의 동일 / 일부 대사만 다름 / 등"
+      }}
+    ],
+    "original_only_scenes": [
+      {{
+        "original_scene_id": "S#10",
+        "header": "S#10 EXT. 골목",
+        "reason": "손본본에서 삭제된 씬"
+      }}
+    ],
+    "continuation_point": {{
+      "detected": "true | false",
+      "refined_last_new_scene": "손본본의 마지막 '새로 쓴' 씬 ID (예: S#25)",
+      "original_continuation_start": "원본에서 이어쓰기 시작점 씬 ID (예: S#38)",
+      "explanation": "이 작품의 패턴: 손본본 S#1~S#25는 새로 쓴 새 1막, S#26부터는 원본 S#38과 매칭됨. 따라서 손본본 S#26 이후를 재집필 대상으로 권장."
+    }},
+    "recommended_protected_range": [
+      {{"from": "S#1", "to": "S#25", "reason": "작가가 새로 쓴 부분"}}
+    ],
+    "recommended_revision_range": [
+      {{"from": "S#26", "to": "S#71", "reason": "원본의 후반부, 손본본 톤으로 다시 쓸 부분"}}
+    ]
+  }}
+}}
+
+JSON만 출력하라. 설명·주석·마크다운 금지.
+""".strip()
+
+
+def build_boundary_smoothness_block(
+    protected_ranges: list,
+    revision_ranges: list,
+    raw_text: str
+) -> str:
+    """경계 매끄러움 정보를 추출 — 재집필 구간이 보호 구간과 자연스럽게 이어지도록.
+
+    Args:
+        protected_ranges: [{"from": "S#1", "to": "S#25"}, ...]
+        revision_ranges: [{"from": "S#26", "to": "S#71"}, ...]
+        raw_text: 원본 시나리오 전문
+
+    Returns:
+        프롬프트에 주입할 경계 정보 블록
+    """
+    import re as _re
+
+    if not revision_ranges:
+        return ""
+
+    # 씬 헤더로 본문을 인덱싱
+    scene_pattern = _re.compile(r'^S#?(\d+)[\.\s]', _re.MULTILINE)
+    lines = raw_text.split('\n')
+    scene_starts = {}  # {scene_num: line_index}
+    for i, line in enumerate(lines):
+        m = scene_pattern.match(line.strip())
+        if m:
+            scene_starts[int(m.group(1))] = i
+
+    def _scene_num(s):
+        m = _re.search(r'\d+', s or "")
+        return int(m.group()) if m else None
+
+    def _scene_excerpt(scene_num: int, max_lines: int = 8) -> str:
+        if scene_num not in scene_starts:
+            return ""
+        start = scene_starts[scene_num]
+        # 다음 씬 시작 직전까지
+        next_starts = [n for n in scene_starts.values() if n > start]
+        end = min(next_starts) if next_starts else len(lines)
+        excerpt_lines = lines[start:min(end, start + max_lines)]
+        return "\n".join(excerpt_lines)
+
+    boundary_parts = []
+    for rev_range in revision_ranges:
+        rev_from = _scene_num(rev_range.get("from", ""))
+        rev_to = _scene_num(rev_range.get("to", ""))
+        if rev_from is None or rev_to is None:
+            continue
+
+        # 재집필 시작 직전 씬 (보호 영역의 마지막 씬)
+        prev_scene = rev_from - 1
+        if prev_scene > 0 and prev_scene in scene_starts:
+            prev_excerpt = _scene_excerpt(prev_scene, max_lines=6)
+            boundary_parts.append(
+                f"[재집필 S#{rev_from} 시작 직전 (보호 씬 S#{prev_scene} 끝부분)]\n{prev_excerpt}\n"
+                f"→ S#{rev_from}은 위 상태에서 자연스럽게 이어져야 한다."
+            )
+
+        # 재집필 끝 직후 씬 (보호 영역의 시작 씬)
+        next_scene = rev_to + 1
+        if next_scene in scene_starts:
+            next_excerpt = _scene_excerpt(next_scene, max_lines=6)
+            boundary_parts.append(
+                f"[재집필 S#{rev_to} 끝 직후 (보호 씬 S#{next_scene} 시작부분)]\n{next_excerpt}\n"
+                f"→ S#{rev_to}은 위 씬으로 자연스럽게 이어지도록 끝나야 한다."
+            )
+
+    if not boundary_parts:
+        return ""
+
+    return "\n\n".join(boundary_parts)
+
+
+def build_cascade_analysis_prompt(
+    revision_ranges: list,
+    protected_ranges: list,
+    raw_text: str
+) -> str:
+    """재집필 구간이 보호 구간의 복선·설정과 모순되는지 사전 분석하는 프롬프트.
+    Sonnet 4.6으로 호출 권장.
+    """
+    sample = raw_text[:50000] if raw_text else ""
+
+    rev_str = ", ".join(f"S#{r.get('from','')}~S#{r.get('to','')}" for r in revision_ranges)
+    prot_str = ", ".join(f"S#{r.get('from','')}~S#{r.get('to','')}" for r in protected_ranges)
+
+    return f"""
+[TASK — CASCADE IMPACT ANALYSIS]
+다음 시나리오에서 일부 구간을 재집필하려 한다.
+보호 구간(절대 안 건드림)과 재집필 구간(다시 씀)의 관계를 분석해, 재집필 시 발생할 수 있는 모순·충돌을 사전에 식별하라.
+
+[시나리오 전문]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{sample}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[보호 구간 — 절대 변경 금지]
+{prot_str}
+
+[재집필 구간 — 다시 쓸 부분]
+{rev_str}
+
+[분석 항목]
+1. 재집필 구간에 등장하는 캐릭터·설정·소품이 보호 구간과 충돌할 위험
+2. 재집필 시 깰 수 없는 약속 (보호 구간의 복선·설정)
+3. 재집필 구간 끝의 상태가 보호 구간 시작과 일치해야 하는 조건
+4. 캐릭터 정체성·관계·동기 변경 금지 사항
+
+[출력 형식 — JSON 단일 객체]
+{{
+  "cascade_analysis": {{
+    "summary": "한 문단 요약",
+    "must_preserve": [
+      {{
+        "category": "설정 | 캐릭터 | 복선 | 관계 | 소품",
+        "item": "구체적 요소 (예: '진호의 직업이 변호사라는 사실')",
+        "where_in_protected": "보호 구간 어디에서 등장하는지 (예: S#62)",
+        "constraint_for_revision": "재집필 시 어떻게 다뤄야 하는지"
+      }}
+    ],
+    "potential_conflicts": [
+      {{
+        "issue": "잠재 모순 설명",
+        "where": "어느 씬에서 발생 가능한지",
+        "fix_direction": "회피하는 방법"
+      }}
+    ],
+    "boundary_constraints": [
+      {{
+        "revision_scene": "재집필 씬 ID",
+        "must_end_with": "이 씬이 어떤 상태로 끝나야 하는지 (다음 보호 씬과 연결)",
+        "must_start_with": "이 씬이 어떤 상태로 시작해야 하는지 (이전 보호 씬과 연결)"
+      }}
+    ],
+    "character_locks": [
+      {{
+        "character": "캐릭터명",
+        "locked_traits": ["보호 구간에서 확정된 특성들"],
+        "locked_relationships": ["관계 상태"]
+      }}
+    ]
+  }}
+}}
+
+JSON만 출력하라. 설명·주석·마크다운 금지.
+""".strip()
+
+
 def build_v2_diagnose_context_block(
     tone_dna: dict = None,
     diff_analysis: dict = None,
     distribution_diagnostic: dict = None,
     rewrite_metadata: dict = None,
     genre_dna: dict = None,
-    feedback_text: str = ""
+    feedback_text: str = "",
+    section_mode: bool = False,
+    protected_ranges: list = None,
+    revision_ranges: list = None,
+    cascade_analysis: dict = None,
+    boundary_info: str = ""
 ) -> str:
-    """v2.0/v2.1 자동 분석 결과들을 DIAGNOSE 프롬프트에 주입할 단일 블록으로 통합.
+    """v2.0/v2.1/v2.2 자동 분석 결과들을 DIAGNOSE 프롬프트에 주입할 단일 블록으로 통합.
 
     Args:
         tone_dna: 작가 개인 톤 DNA (build_tone_dna_extraction_prompt 결과)
@@ -1116,7 +1361,76 @@ def build_v2_diagnose_context_block(
     import json as _json
     parts = []
 
-    # ── v2.1 — 장르 DNA (가장 위에 배치 — 강제력 최상) ──
+    # ── v2.2 — 구간 지정 모드 (최상위 강제 룰) ──
+    if section_mode and (protected_ranges or revision_ranges):
+        prot_str = ", ".join(
+            f"S#{r.get('from','')}~S#{r.get('to','')}"
+            for r in (protected_ranges or [])
+        )
+        rev_str = ", ".join(
+            f"S#{r.get('from','')}~S#{r.get('to','')}"
+            for r in (revision_ranges or [])
+        )
+
+        cascade_block = ""
+        if cascade_analysis:
+            ca = cascade_analysis.get("cascade_analysis", cascade_analysis)
+            must_preserve = ca.get("must_preserve", [])
+            conflicts = ca.get("potential_conflicts", [])
+            char_locks = ca.get("character_locks", [])
+
+            preserve_str = "\n".join(
+                f"  ▸ [{p.get('category','')}] {p.get('item','')} "
+                f"({p.get('where_in_protected','')}) — {p.get('constraint_for_revision','')}"
+                for p in must_preserve[:10]
+            )
+            conflict_str = "\n".join(
+                f"  ⚠ {c.get('issue','')} — 회피: {c.get('fix_direction','')}"
+                for c in conflicts[:5]
+            )
+            char_str = "\n".join(
+                f"  ▸ {cl.get('character','')}: {cl.get('locked_traits',[])} / 관계: {cl.get('locked_relationships',[])}"
+                for cl in char_locks[:5]
+            )
+
+            cascade_block = f"""
+[연쇄 영향 분석 — 모순 회피 필수]
+보호 구간에서 확정된 요소 (반드시 유지):
+{preserve_str if preserve_str else '  (분석 결과 없음)'}
+
+잠재 모순 (재집필 시 회피):
+{conflict_str if conflict_str else '  (분석 결과 없음)'}
+
+캐릭터 잠금:
+{char_str if char_str else '  (분석 결과 없음)'}"""
+
+        boundary_block = ""
+        if boundary_info:
+            boundary_block = f"""
+[경계 매끄러움 — 자연스러운 연결 필수]
+{boundary_info}"""
+
+        parts.append(f"""
+[★★★ v2.2 — 구간 지정 모드 (최우선 강제 룰) ★★★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+보호 구간 (절대 변경 금지): {prot_str if prot_str else '(없음)'}
+재집필 구간 (수정 대상):    {rev_str if rev_str else '(없음)'}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[원칙 — 최우선 적용]
+1. 보호 구간의 씬은 한 글자도 건드리지 마라. target_scenes에 포함 금지.
+2. 재집필 구간 안의 씬만 target_scenes에 포함하라.
+3. 보호 구간 씬의 캐릭터 정체성·관계·설정·소품을 그대로 유지하라.
+4. 재집필 구간 첫 씬은 보호 구간 마지막 씬과 자연스럽게 이어져야 한다.
+5. 재집필 구간 끝 씬은 다음 보호 구간 첫 씬으로 자연 연결되어야 한다.
+6. 씬 번호는 절대 변경하지 마라 — 분할·통합 금지.
+{cascade_block}
+{boundary_block}
+
+※ 이 구간 룰은 다른 모든 룰보다 우선한다.
+※ 보호 구간을 건드리는 것은 SEVERE VIOLATION이다.""")
+
+    # ── v2.1 — 장르 DNA (위에 배치 — 강제력 상위) ──
     if genre_dna:
         gd = genre_dna.get("genre_dna", genre_dna)
         gd_brief = {
@@ -1228,7 +1542,12 @@ def build_diagnose_prompt(
     diff_analysis: dict = None,
     distribution_diagnostic: dict = None,
     rewrite_metadata: dict = None,
-    genre_dna: dict = None
+    genre_dna: dict = None,
+    section_mode: bool = False,
+    protected_ranges: list = None,
+    revision_ranges: list = None,
+    cascade_analysis: dict = None,
+    boundary_info: str = ""
 ) -> str:
     """Stage 1: 원본 + 자료(들)을 분석해 수정 플랜(JSON)을 생성.
     Sonnet 4.6 사용 권장 (구조 분석).
@@ -1317,7 +1636,7 @@ def build_diagnose_prompt(
 
 ※ 진단 시 실명 사용·특정 가능 디테일·실존 공인 악역화 등 리스크를 식별하라."""
 
-    # v2.0/v2.1 자동 분석 결과 통합 블록
+    # v2.0/v2.1/v2.2 자동 분석 결과 통합 블록
     v2_context_section = build_v2_diagnose_context_block(
         tone_dna=tone_dna,
         diff_analysis=diff_analysis,
@@ -1325,6 +1644,11 @@ def build_diagnose_prompt(
         rewrite_metadata=rewrite_metadata,
         genre_dna=genre_dna,
         feedback_text=instruction,
+        section_mode=section_mode,
+        protected_ranges=protected_ranges,
+        revision_ranges=revision_ranges,
+        cascade_analysis=cascade_analysis,
+        boundary_info=boundary_info,
     )
 
     return f"""
@@ -1454,7 +1778,12 @@ def build_revise_prompt(
     total_batches: int = 0,
     tone_dna: dict = None,
     diff_analysis: dict = None,
-    genre_dna: dict = None
+    genre_dna: dict = None,
+    section_mode: bool = False,
+    protected_ranges: list = None,
+    revision_ranges: list = None,
+    cascade_analysis: dict = None,
+    boundary_info: str = ""
 ) -> str:
     """Stage 2: Stage 1의 수정 플랜에 따라 실제 수정본을 집필.
     Opus 4.6 사용 필수 (집필).
@@ -1638,6 +1967,60 @@ def build_revise_prompt(
 ※ 편집 철학을 모든 씬에 일관되게 적용하라."""
 
         v2_tone_section = td_block + df_block
+
+    # v2.2 — 구간 지정 모드 (가장 강력한 강제 룰 — 다른 모든 룰보다 우선)
+    if section_mode and (protected_ranges or revision_ranges):
+        prot_str = ", ".join(
+            f"S#{r.get('from','')}~S#{r.get('to','')}"
+            for r in (protected_ranges or [])
+        )
+        rev_str = ", ".join(
+            f"S#{r.get('from','')}~S#{r.get('to','')}"
+            for r in (revision_ranges or [])
+        )
+
+        cascade_str = ""
+        if cascade_analysis:
+            ca = cascade_analysis.get("cascade_analysis", cascade_analysis)
+            mp = ca.get("must_preserve", [])
+            cl = ca.get("character_locks", [])
+            mp_lines = "\n".join(
+                f"   ▸ {p.get('item','')} ({p.get('where_in_protected','')})"
+                for p in mp[:8]
+            )
+            cl_lines = "\n".join(
+                f"   ▸ {c.get('character','')}: {c.get('locked_traits',[])}"
+                for c in cl[:5]
+            )
+            cascade_str = f"""
+
+[보호 구간에서 확정된 요소 (반드시 유지)]
+{mp_lines if mp_lines else '   (없음)'}
+
+[캐릭터 잠금]
+{cl_lines if cl_lines else '   (없음)'}"""
+
+        boundary_str = f"\n\n[경계 매끄러움 정보]\n{boundary_info}" if boundary_info else ""
+
+        section_block = f"""
+
+[★★★ v2.2 — 구간 지정 모드 (집필 시 절대 준수) ★★★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+보호 구간: {prot_str if prot_str else '(없음)'}
+재집필 구간: {rev_str if rev_str else '(없음)'}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[필수 원칙]
+1. 보호 구간의 씬은 출력에 포함하지 마라. 원본 그대로 사용된다.
+2. revised_scenes에는 재집필 구간의 씬만 포함하라.
+3. 보호 구간에 있는 캐릭터·설정·소품·관계를 그대로 유지하라.
+4. 재집필 첫 씬은 직전 보호 씬과 자연스럽게 연결되어야 한다.
+5. 재집필 끝 씬은 다음 보호 씬으로 자연스럽게 이어져야 한다.
+6. 씬 번호 변경 절대 금지. 분할·통합 시도 금지.{cascade_str}{boundary_str}
+
+※ 위 원칙을 어기면 SEVERE VIOLATION이다.
+※ 다른 모든 룰(장르 DNA, 톤 DNA 등)보다 이 구간 룰이 우선이다."""
+        v2_tone_section += section_block
 
     # v2.1 — 장르 DNA (강제 룰)
     if genre_dna:
