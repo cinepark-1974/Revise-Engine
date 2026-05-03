@@ -1,248 +1,211 @@
-# 👖 BLUE JEANS · REVISE ENGINE v2.7
+# 👖 BLUE JEANS · REVISE ENGINE v2.8
 
 영화 시나리오 각색(Revision) 전용 엔진.
-Writer Engine에서 출력한 초고를 입력받아, 수정 지시문과 LOCKED 요소에 따라 실제 수정본을 생성한다.
 
 ---
 
-## 🆕 v2.7 — 자동 배치 분할 시스템 (2026-05-03)
+## 🆕 v2.8 — Beat-Aware Diagnose (2026-05-03)
 
-### 결함 해결
-v2.6에서 71씬 같은 대형 시나리오를 진단할 때 출력 토큰이 max_tokens(32K) 한도를 넘어 결과가 잘리던 문제를 근본적으로 해결.
+### 신규 기능: 시나리오 확장 자동화
 
-**v2.6의 문제**
-- 71씬 시나리오 → 단일 LLM 호출 → 출력 토큰 초과 → 잘림
-- A25~A28 헐리우드 작법 룰 추가 후 진단 분량이 늘어 잘림이 더 심해짐
-- 사용자가 직접 배치를 잘라 입력하는 우회 방식 사용 중
+71씬 → 100씬 같은 **대규모 분량 확장 작업**을 위한 비트 인식 진단 시스템.
 
-**v2.7의 해결**
-- '진단 시작' 버튼 한 번만 누르면 엔진이 자동으로 N씬 단위로 분할
-- 각 배치를 별도 LLM 호출로 진단 → 결과 자동 병합
-- 진행률 progress bar 실시간 표시
-- 한 배치 실패 시 최대 3회 자동 재시도
+#### 핵심 동작
 
-### 신규 기능
-
-#### 1. 다형식 씬 헤더 자동 인식
-3가지 시나리오 형식을 자동 인식·분할.
-- **S#숫자 형식**: 한국 시나리오 표준 (`S#1.`, `S#1`, `S# 1` 등)
-- **EXT./INT. 형식**: 헐리우드 표준 (`EXT. 한남시장 — DAY` 등) — 「테이스티 러브 v3.2」가 사용
-- **씬/Scene 형식**: 폴백
-
-#### 2. 자동 배치 분할 미리보기
-원본 시나리오 입력 즉시 UI에 자동 안내:
-> 📦 **v2.7 자동 배치 분할:** 감지된 씬 수 **71씬** → 진단 시 **6배치**로 자동 분할 처리됩니다.
-
-#### 3. 배치 사이즈 조절 슬라이더
-고급 옵션 expander 안에 8~15 범위 슬라이더 제공 (기본 12).
-- 헐리우드 작법 + 직업 Pack + 시대 Pack 동시 사용 시 → 10 권장
-- 기본 작품 → 12 권장
-- 매우 안전하게 → 8
-
-#### 4. 진단 진행률 실시간 표시
 ```
-🔬 배치 1/6 진단 중... (S#1~S#12)
-🔬 배치 2/6 진단 중... (S#13~S#24)
-...
-✅ 자동 배치 진단 완료 — 6배치 → 수정 대상 24개 씬 식별
+[Phase 1] 시나리오 전체 → 15-Beat 매핑 (Sonnet 4.6, 단일 호출)
+            ↓
+        beat_map JSON 생성
+            ↓
+[Phase 2] 추가 씬 수(예: +29) → 약점 비트별 자동 분배
+            ↓
+        distribution = {
+          "fun_and_games": +7,
+          "bad_guys_close_in": +9,
+          "all_is_lost": +4,
+          "finale": +9,
+          ...
+        }
+            ↓
+[Phase 3] 71씬 → 6배치 자동 분할 (v2.7)
+            ↓
+[Phase 4] 각 배치별 비트 인식 진단
+          - 배치 내 씬이 어느 비트에 속하는지 인식
+          - 그 비트가 약점이면 ADD 위치 제안
+          - 누락 필수 요소(Cost of Choice 등) 보강
+            ↓
+        통합 diagnose_result + ADD 29씬 + REWRITE N씬
 ```
 
-### 검증 결과 — 「테이스티 러브 v3.2」 (71씬, 46,296자)
+#### 15-Beat 마스터 (Save the Cat)
 
-| 항목 | 결과 |
+| 비트 | 권장 분량 | 기능 |
+|------|----------|------|
+| Opening Image | 0~1% | 작품 첫 인상 |
+| Setup | 1~10% | 일상 + 결핍 |
+| Theme Stated | 5% | 주제 대사 |
+| Catalyst | 10% | Inciting Incident |
+| Debate | 10~20% | 망설임 |
+| Break into Two | 20~25% | 1막→2막 |
+| B Story | 22% | 서브플롯 시작 |
+| Fun and Games | 25~50% | **포스터 비트, 가장 두꺼움** |
+| Midpoint | 50% | 판 뒤집힘 |
+| Bad Guys Close In | 50~75% | 압박 고조 |
+| All Is Lost | 75% | 최저점 |
+| Dark Night | 75~80% | 정적 |
+| Break into Three | 80% | A+B 통합 |
+| Finale | 80~99% | 5단계 클라이맥스 |
+| Final Image | 99~100% | Opening의 거울 |
+
+#### 약점 비트 자동 진단
+
+각 비트별로 4단계 강도 평가:
+- 🟢 **STRONG**: 기능 충실 + 분량 충분
+- 🟡 **ADEQUATE**: 기능은 있으나 분량 부족
+- 🟠 **WEAK**: 기능 약함 또는 분량 부족
+- 🔴 **MISSING**: 비트 자체 없음
+
+#### 누락 필수 요소 자동 검출 (장르별)
+
+로맨틱 코미디:
+- Yearning Accumulation (갈망의 축적)
+- Emotional Delay (감정의 지연)
+- Obstacle to Union (만남의 장벽)
+- **Cost of Choice (선택의 대가)** — 보고서가 「테이스티 러브」에서 누락 진단했던 필수 요소
+- **Punch Beat (펀치 비트)** — 동일
+
+#### 자동 분배 알고리즘
+
+1. weak_beats의 deficit 합계 산출
+2. deficit 큰 비트부터 비례 분배
+3. missing_essentials의 CRITICAL 항목은 무조건 +1씬 보장
+4. 잔여분은 가장 큰 분배 비트에서 보정
+
+검증 결과 (테이스티 러브 시뮬레이션, 71→100):
+
+| 비트 | 분배 |
 |------|------|
-| 씬 헤더 형식 | EXT./INT. (헐리우드) |
-| 감지된 씬 수 | 71씬 ✅ |
-| 분할 결과 (batch_size=12) | 6배치 |
-| 본문 보존율 | 99.8% |
-| 최대 배치 입력 토큰 | ~5,696 토큰 (안전) |
-| 토큰 잘림 발생 | **없음** |
+| Fun and Games | +7씬 |
+| Bad Guys Close In | +9씬 |
+| All Is Lost | +4씬 (Punch Beat 보강) |
+| Finale | +9씬 (Cost of Choice 보강) |
+| **합계** | **+29씬** ✅ |
 
-### 신규 함수 (main.py)
+---
 
+## 🎬 71→100씬 확장 워크플로
+
+### Step 1: 시나리오 입력
+- 원본 시나리오 DOCX 업로드 (테이스티 러브 v3.2)
+- 자동으로 71씬 감지 (헐리우드 EXT./INT. 형식 인식)
+
+### Step 2: 작업 모드 선택
+- 작업 모드: **이어쓰기 (continuation)**
+- 보호 영역: S#1~S#25 LOCKED
+- 작업 영역: S#26~S#71
+
+### Step 3: v2.8 Beat-Aware Diagnose 활성화
+- `🎯 추가할 씬 수` 입력란에 **29** 입력
+- 즉시 UI에 "확장 목표: 71씬 → 100씬" 표시
+
+### Step 4: 진단 시작
+- Phase 1: 비트 매핑 (약 1~2분)
+- 비트별 강도 + 약점 + 누락 요소 자동 표시
+- Phase 2: 6배치 비트 인식 진단 (약 5~7분)
+- 각 배치마다 ADD 위치 자동 제안
+
+### Step 5: 진단 결과 검토
+- ADD 29씬의 비트별 분포 확인
+- REWRITE 씬 검토
+- 필요 시 일부 ADD 제거/이동
+
+### Step 6: Stage 2 집필 시작
+- v2.7 자동 배치 분할 시스템이 ADD 29 + REWRITE N개를 4~5씬 단위로 분할
+- Opus 4.6이 배치별 집필
+- 통합 DOCX 출력 (총 100씬)
+
+---
+
+## 신규 함수 (v2.8)
+
+### prompt.py
 ```python
-_detect_scene_count(scenario_text) -> int
-    """씬 헤더 패턴 카운트 (3종 형식 지원)"""
+build_beat_mapping_prompt(scenario_text, genre)
+    """전체 시나리오 → 15-Beat 매핑 프롬프트"""
 
-_split_scenario_by_scenes(scenario_text, batch_size=12) -> list
-    """N씬 단위로 시나리오 분할"""
+distribute_added_scenes_across_beats(beat_map, target_added)
+    """약점 비트에 추가 씬 자동 분배"""
 
-run_diagnose_with_auto_batch(client, batch_size=12) -> dict
-    """자동 배치 분할 진단 + 결과 병합"""
+build_beat_aware_diagnose_block(beat_map, distribution, target_added)
+    """build_diagnose_prompt에 주입할 비트 인식 블록"""
 
-_run_diagnose_single(client, raw_text, pre_results,
-                     batch_info=None, retry_count=1) -> dict
-    """단일 진단 호출 + 재시도"""
+SAVE_THE_CAT_15_BEATS  # 15-Beat 마스터 정의
 ```
 
-### 신규 매개변수 (prompt.py)
-
+### main.py
 ```python
-build_diagnose_prompt(..., batch_info=None)
-    """
-    batch_info = {
-        "batch_index": 1,
-        "total_batches": 6,
-        "scene_range": "S#1~S#12",
-        "first_scene": 1,
-        "last_scene": 12,
-        "scene_format": "S#" | "EXT/INT" | "FALLBACK"
-    }
-    """
+_run_pre_diagnose_beat_map(client, scenario_text, genre)
+    """Phase 1: 비트 매핑 (단일 Sonnet 호출)"""
+
+run_diagnose_with_beat_aware_batch(client, batch_size, target_added_scenes)
+    """Phase 2~4: 비트 인식 배치 진단 + 결과 통합"""
 ```
 
-### 보존된 자산 (변경 없음)
+### build_diagnose_prompt 신규 매개변수
+```python
+build_diagnose_prompt(
+    ...,
+    beat_map: dict = None,           # v2.8 비트 매핑 결과
+    beat_distribution: dict = None,  # v2.8 분배 결과
+    target_added_scenes: int = 0     # v2.8 목표 추가 씬 수
+)
+```
 
-- 5종 작업 모드 (전체 각색 / 이어쓰기 / 부분 수정 / Rewrite Engine 흡수 / 구간 모드)
-- DOCX 빌더 (씬번호·대사·대사연속·지문·인서트헤더·인서트본문·인서트라벨)
-- AI ESCAPE A1~A28 룰셋 (헐리우드 작법 A25~A28 포함)
-- Writer Engine 자산 (`_split_action_paragraph`, `_strip_prop_state_memos`, `_parse_insert_blocks` 등)
-- `_validate_and_fix_revised_format` 검증 함수
-- `_split_dialog_action_fusion` 대사·지문 융합 분리
-- `_normalize_scene_time_marker` DAY/NIGHT 정규화
+---
+
+## 라우팅 우선순위 (v2.8 업데이트)
+
+```
+run_diagnose(client)
+  ├── Fast Path 1: 구간 모드(이어쓰기/부분수정) → 코드 자동 생성
+  ├── Fast Path 2: Rewrite Engine JSON 흡수 → 코드 자동 생성
+  └── Fast Path 3: 일반 진단
+        ├── target_added_scenes > 0
+        │     → run_diagnose_with_beat_aware_batch (v2.8)
+        └── target_added_scenes == 0
+              → run_diagnose_with_auto_batch (v2.7)
+```
+
+---
+
+## 보존된 자산 (v2.7 → v2.8 변경 없음)
+
+- 5종 작업 모드
+- DOCX 빌더
+- AI ESCAPE A1~A28
+- Writer Engine 자산
+- v2.7 자동 배치 분할 시스템
 - LOCKED 우선 원칙
-- 디자인 시스템 (navy #191970 / yellow #FFCB05 / Pretendard·Playfair)
+- 디자인 시스템
 
 ---
 
-## 핵심 특징
+## Streamlit Cloud 배포
 
-- **3-Stage 파이프라인**: DIAGNOSE (지시 해석) → REVISE (실제 집필) → VERIFY (검증 보고서)
-- **자동 배치 분할** (v2.7 신규): 시나리오 크기와 무관하게 안전 처리
-- **듀얼 모델 정책**: Opus 4.6 (집필) / Sonnet 4.6 (분석)
-- **LOCKED 우선 원칙**: 지시문과 LOCKED가 충돌하면 LOCKED 우선
-- **수정 강도 3단계**: CONSERVATIVE / BALANCED / AGGRESSIVE
-- **AI ESCAPE A1~A28 내장**: 헐리우드 작법 4대 원칙 포함
-- **Profession Pack**: 19개 직업 카테고리 전문성 블록
-- **Period Pack**: 10개 시대대 고증 블록 (조선 전기~민주화기)
-- **Historical Film Rules**: 정통/팩션/퓨전 3유형 분기
-- **Fact-Based Rules**: 실화 기반 작품 명예훼손·인격권 가이드
-- **Rewrite Engine 연동**: CHRIS/SHIHO 진단·처방 JSON 자동 변환
-- **2종 DOCX 출력**: 수정본 + 검증 보고서
-
----
-
-## 입력 → 출력
-
-### 입력
-1. **원본 시나리오** — DOCX (한국 표준 S# 또는 헐리우드 EXT./INT. 형식 모두 지원)
-2. **수정 지시문** — 자유 텍스트 / 모니터 보고서 / 투자사 피드백 / Rewrite JSON
-3. **LOCKED** — 절대 건드리지 말 요소 (자유 텍스트)
-4. **주요 캐릭터 직업** (선택)
-5. **시대 · 실화 정보** (선택)
-6. **장르 + 수정 강도** — 11장르 + 3단계
-7. **DIAGNOSE 배치 사이즈** (v2.7 신규, 기본 12)
-
-### 출력
-1. **수정본 DOCX** — 한국 시나리오 표준 서식, 수정된 씬 전문 + 변경 노트
-2. **검증 보고서 DOCX** — 4축 검증
-3. **JSON 전체 백업** (옵션)
-
----
-
-## 3-Stage 파이프라인
-
-### Stage 1: DIAGNOSE (지시 해석)
-- 모델: Sonnet 4.6
-- **v2.7: 시나리오를 자동으로 N씬 단위로 분할 → 배치별 진단 → 결과 병합**
-- 출력: 수정 대상 씬 목록, 씬별 수정 방향, LOCKED 충돌 지점
-
-### Stage 2: REVISE (실제 집필)
-- 모델: Opus 4.6
-- 진단 결과의 revision_items를 6씬 단위로 배치 분할 → 배치별 집필
-- 출력: 수정된 씬 전문 + 변경 노트
-
-### Stage 3: VERIFY (검증 보고서)
-- 모델: Sonnet 4.6
-- 4축 검증 (지시 반영 / LOCKED 보존 / AI ESCAPE / 장르 준수도)
-
----
-
-## Streamlit Cloud 배포 가이드
-
-### 1) GitHub 저장소 (`cinepark-1974/revise-engine`)
-
-기존 v2.6 저장소에서 다음 두 파일만 교체하면 됩니다.
+기존 v2.7 저장소에서 **`main.py`와 `prompt.py` 두 파일만 교체**.
 
 ```
 revise-engine/
-├── main.py                 ← v2.7로 교체
-├── prompt.py               ← v2.7로 교체
+├── main.py                 ← v2.8로 교체
+├── prompt.py               ← v2.8로 교체
 ├── profession_pack.py      (변경 없음)
 ├── period_pack.py          (변경 없음)
 ├── writer_modules.py       (변경 없음)
 ├── requirements.txt        (변경 없음)
-├── README.md               ← v2.7로 교체 (선택)
-└── .streamlit/
-    └── config.toml         (변경 없음)
+└── .streamlit/config.toml  (변경 없음)
 ```
 
-### 2) 푸시 → Streamlit Cloud 자동 재배포
-
-GitHub 푸시 시 Streamlit Cloud가 자동으로 재배포합니다.
-재배포 완료 후 사이드바에 **REVISE ENGINE v2.7** 배지가 표시되는지 확인하세요.
-
-### 3) 동작 검증
-
-「테이스티 러브 v3.2」(71씬) 업로드 → 다음 메시지 자동 표시되는지 확인:
-
-> 📦 **v2.7 자동 배치 분할:** 감지된 씬 수 **71씬** → 진단 시 **6배치**로 자동 분할 처리됩니다.
-
-진단 시작 → progress bar로 6배치 순차 진행 → 완료 메시지 표시.
-
-### 4) 로컬 실행
-
-```bash
-streamlit run main.py
-```
-
----
-
-## 사용 워크플로 (v2.7 변경점만)
-
-### Before (v2.6)
-1. 71씬 시나리오 업로드
-2. 진단 시작 → ❌ 토큰 초과 잘림
-3. 사용자가 시나리오를 직접 12씬씩 잘라 별도 진단
-4. 진단 결과 6개를 사용자가 수동으로 합침
-5. → 시간 낭비 + 누락 위험
-
-### After (v2.7)
-1. 71씬 시나리오 업로드
-2. UI에 즉시 안내: "71씬 → 6배치 자동 분할 예정"
-3. 진단 시작 (버튼 1회 클릭)
-4. progress bar로 진행 상황 자동 표시
-5. → 완료 ✅
-
----
-
-## 토큰 안전 마진 (v2.7 기준)
-
-| batch_size | 평균 입력 토큰 | 출력 토큰 마진 | 권장 케이스 |
-|------------|--------------|--------------|-----------|
-| 8          | ~3,800       | 충분         | 가장 안전 |
-| 10         | ~4,800       | 매우 안전    | 헐리우드+직업+시대 동시 |
-| **12** (기본) | **~5,700** | **안전**    | **일반 작품** |
-| 15         | ~7,200       | 보통         | 짧은 작품 |
-
-(테이스티 러브 v3.2 기준 측정값. 시나리오 길이에 따라 달라질 수 있음.)
-
----
-
-## 파일 구조
-
-```
-revise-engine/
-├── main.py                 # Streamlit App + 3-Stage 파이프라인 + ★ 자동 배치 분할 (v2.7)
-├── prompt.py               # System Prompt + AI ESCAPE + Genre Rules + ★ batch_info (v2.7)
-├── profession_pack.py      # 19개 직업 카테고리
-├── period_pack.py          # 10개 시대대 고증
-├── writer_modules.py       # Fact-Based + Historical + Genre Override/Enforcement
-├── requirements.txt
-├── README.md
-└── .streamlit/
-    └── config.toml
-```
+GitHub 푸시 → Streamlit Cloud 자동 재배포.
 
 ---
 
@@ -250,19 +213,11 @@ revise-engine/
 
 | 버전 | 날짜 | 주요 변경 |
 |------|------|----------|
-| v1.0 | 2026-04-21 | 초기 릴리스 — 3-Stage 파이프라인, AI ESCAPE A1~A20, Profession Pack 19개 |
-| v2.2 | 2026-04-25 | 구간 지정 모드 (이어쓰기 + 부분 수정), Period Pack 10개, Historical Rules |
-| v2.6 | 2026-04-30 | 헐리우드 작법 4대 원칙 (A25~A28) 추가 |
-| **v2.7** | **2026-05-03** | **★ 자동 배치 분할 시스템 — 토큰 잘림 결함 해결, 헐리우드 형식 자동 인식** |
-
----
-
-## 다음 작업 (v2.7 정상 작동 확인 후)
-
-「테이스티 러브 v3.2」 → 헐리우드 작법 일괄 적용 → v3.3 생성
-- 1~25씬: LOCKED (보호 영역)
-- 26~71씬: 전체 재집필
-- 분량: 71씬 그대로 유지
+| v1.0 | 2026-04-21 | 초기 릴리스 |
+| v2.2 | 2026-04-25 | 구간 지정 모드, Period Pack |
+| v2.6 | 2026-04-30 | 헐리우드 작법 A25~A28 |
+| v2.7 | 2026-05-03 | 자동 배치 분할 시스템 |
+| **v2.8** | **2026-05-03** | **★ Beat-Aware Diagnose — 시나리오 확장 자동화** |
 
 ---
 

@@ -2002,7 +2002,10 @@ def build_diagnose_prompt(
     revision_ranges: list = None,
     cascade_analysis: dict = None,
     boundary_info: str = "",
-    batch_info: dict = None
+    batch_info: dict = None,
+    beat_map: dict = None,
+    beat_distribution: dict = None,
+    target_added_scenes: int = 0
 ) -> str:
     """Stage 1: 원본 + 자료(들)을 분석해 수정 플랜(JSON)을 생성.
     Sonnet 4.6 사용 권장 (구조 분석).
@@ -2079,6 +2082,17 @@ def build_diagnose_prompt(
 6. recommended_batches는 1로 설정하라 (이미 분할된 상태).
 ━━━━━━━━━━━━━━━━━━━━━━━━
 """
+
+    # ─────────────────────────────────────────────────
+    # v2.8 비트 인식 진단 — beat_map + distribution이 있으면 블록 주입
+    # ─────────────────────────────────────────────────
+    beat_aware_section = ""
+    if beat_map and beat_distribution and target_added_scenes > 0:
+        beat_aware_section = build_beat_aware_diagnose_block(
+            beat_map=beat_map,
+            distribution=beat_distribution,
+            target_added=target_added_scenes,
+        )
 
     # 입력 토큰 폭주 방지 — 시나리오가 너무 크면 자름
     # 시나리오 50,000자 = 약 25,000~30,000 토큰 (한국어 기준)
@@ -2175,7 +2189,7 @@ def build_diagnose_prompt(
 [TASK — Stage 1: DIAGNOSE]
 원본 시나리오와 수정 지시문을 분석하여, 실제 수정 작업을 위한 "수정 플랜(Revision Plan)"을 JSON으로 생성하라.
 이 단계는 집필이 아니다. 어디를, 왜, 어떻게 수정할 것인지의 "지도"를 그리는 단계다.
-{batch_section}
+{batch_section}{beat_aware_section}
 [원본 시나리오]
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {raw_text}
@@ -3087,6 +3101,332 @@ def parse_rewrite_engine_json(json_data) -> str:
     parts.append("\n[수정 지시] 위 진단·처방을 모두 반영하여 원고를 수정하라.")
 
     return "\n".join(parts).strip()
+
+
+# =================================================================
+# ★★★ v2.8 — BEAT-AWARE DIAGNOSE ★★★
+# 71씬 전체를 15-Beat 구조로 매핑 → 비트별 약점 + 추가 씬 분포 산출
+# =================================================================
+
+# 15-Beat 마스터 정의 (Save the Cat + Hollywood Standard 통합)
+SAVE_THE_CAT_15_BEATS = [
+    ("opening_image", "Opening Image", "0~1%", "작품의 첫 인상. 세계와 주인공의 결핍을 시각적으로 제시."),
+    ("setup", "Setup", "1~10%", "주인공 일상, 결핍, 욕망. A Story 세계관 셋업."),
+    ("theme_stated", "Theme Stated", "5%", "작품의 주제를 누군가 대사로 던진다. 주인공은 아직 못 알아챈다."),
+    ("catalyst", "Catalyst", "10%", "주인공의 일상을 흔드는 사건. Inciting Incident."),
+    ("debate", "Debate", "10~20%", "주인공이 변화를 거부·망설이는 구간. '갈까 말까'."),
+    ("break_into_two", "Break into Two", "20~25%", "주인공이 새 세계로 진입하는 결단. 1막 → 2막."),
+    ("b_story", "B Story", "22%", "서브플롯 시작. 보통 러브 스토리 또는 멘토 관계."),
+    ("fun_and_games", "Fun and Games", "25~50%", "포스터 비트. 작품의 약속을 가장 즐겁게 보여주는 구간."),
+    ("midpoint", "Midpoint", "50%", "False Victory 또는 False Defeat. 판이 뒤집히는 순간."),
+    ("bad_guys_close_in", "Bad Guys Close In", "50~75%", "외부 압박과 내부 균열이 동시에 조여온다."),
+    ("all_is_lost", "All Is Lost", "75%", "최저점. 죽음의 향기. 멘토·러브·꿈 중 하나가 무너진다."),
+    ("dark_night_of_soul", "Dark Night of the Soul", "75~80%", "주인공이 바닥에서 무엇을 잃었는지 깨닫는 정적."),
+    ("break_into_three", "Break into Three", "80%", "A+B Story 통합. 주인공이 새 답을 들고 일어난다."),
+    ("finale", "Finale", "80~99%", "5단계 클라이맥스. 빌런 격파 + 세계 회복."),
+    ("final_image", "Final Image", "99~100%", "Opening Image의 거울. 변화한 주인공의 새 일상."),
+]
+
+
+def build_beat_mapping_prompt(scenario_text: str, genre: str = "로맨틱 코미디") -> str:
+    """전체 시나리오를 15-Beat 구조에 매핑하는 진단 프롬프트.
+
+    출력은 매우 작다 (씬 ID 리스트 + 짧은 진단). 토큰 안전.
+    Sonnet 4.6 사용 권장.
+
+    Returns:
+        JSON 출력 프롬프트. 결과 구조:
+        {
+          "beat_mapping": {
+              "opening_image": {"scene_ids": ["S#1"], "scene_count": 1, "strength": "STRONG"},
+              "setup": {"scene_ids": ["S#2", "S#3", "S#4", "S#5"], "scene_count": 4, "strength": "STRONG"},
+              ...
+          },
+          "weak_beats": [
+              {"beat": "fun_and_games", "current_scenes": 6, "target_scenes": 12, "deficit": 6, "reason": "..."},
+              ...
+          ],
+          "missing_essentials": [
+              {"essential": "Cost of Choice", "located_in_beat": "finale", "severity": "CRITICAL", "fix_direction": "..."}
+          ],
+          "total_scenes": 71,
+          "genre_compliance_score": 6,
+          "genre_diagnosis": "..."
+        }
+    """
+    import json as _json
+
+    # 비트 정의 블록 생성
+    beat_defs_lines = []
+    for key, name, pct, desc in SAVE_THE_CAT_15_BEATS:
+        beat_defs_lines.append(f"  • {name} ({key}, {pct}): {desc}")
+    beat_defs_text = "\n".join(beat_defs_lines)
+
+    return f"""[TASK — v2.8 PRE-DIAGNOSE: 15-Beat 매핑]
+원본 시나리오 전체를 Save the Cat 15-Beat 구조에 매핑하라.
+이것은 진단의 출발점이다. 매핑이 부정확하면 이후 모든 진단·집필이 흐트러진다.
+
+[원본 시나리오 — 전체]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{scenario_text}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[15-Beat 정의]
+{beat_defs_text}
+
+[장르]
+{genre}
+
+[매핑 원칙]
+1. 모든 씬을 정확히 하나의 비트에 할당하라 (중복 금지, 누락 금지).
+2. 비트별 권장 분량을 인식하라:
+   - Setup: 작품 전체의 9~10%
+   - Fun and Games: 작품 전체의 25~30% (포스터 비트, 가장 두꺼움)
+   - Bad Guys Close In: 작품 전체의 25%
+   - Finale: 작품 전체의 19%
+   - 나머지 비트들: 1~5% 정도
+3. 각 비트의 강도(strength)를 평가하라:
+   - STRONG: 비트 기능이 충실하고 분량이 충분함
+   - ADEQUATE: 기능은 하나 분량이 살짝 부족
+   - WEAK: 기능이 약하거나 분량이 부족
+   - MISSING: 비트 자체가 없거나 거의 없음
+4. 장르(로맨틱 코미디)의 필수 요소가 어느 비트에 있어야 하는지 검토:
+   - Yearning Accumulation (갈망의 축적): Fun and Games
+   - Emotional Delay (감정의 지연): Bad Guys Close In
+   - Obstacle to Union (만남의 장벽): All Is Lost
+   - Cost of Choice (선택의 대가): Break into Three / Finale
+   - Punch Beat (펀치 비트): All Is Lost ~ Dark Night
+5. 씬 ID는 시나리오에 표기된 형식 그대로 사용하라:
+   - "S#숫자" 형식이면 그대로
+   - "EXT./INT." 헐리우드 형식이면 출현 순서대로 "S#1", "S#2"... 부여
+
+[출력 — JSON만, 마크다운/주석 금지]
+
+{{
+  "beat_mapping": {{
+    "opening_image": {{"scene_ids": ["..."], "scene_count": 0, "strength": "STRONG|ADEQUATE|WEAK|MISSING", "function_check": "이 비트의 기능 충족 여부 1줄"}},
+    "setup": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "theme_stated": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "catalyst": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "debate": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "break_into_two": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "b_story": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "fun_and_games": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "midpoint": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "bad_guys_close_in": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "all_is_lost": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "dark_night_of_soul": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "break_into_three": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "finale": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}},
+    "final_image": {{"scene_ids": [...], "scene_count": 0, "strength": "...", "function_check": "..."}}
+  }},
+  "weak_beats": [
+    {{
+      "beat": "비트 키 (예: fun_and_games)",
+      "beat_name": "비트 이름",
+      "current_scenes": 현재 씬 수,
+      "recommended_min_scenes": 권장 최소 씬 수,
+      "deficit": 부족 씬 수,
+      "weakness_reason": "왜 약한지 1~2줄",
+      "add_direction": "어떤 종류의 씬을 추가하면 좋은지 1~2줄"
+    }}
+  ],
+  "missing_essentials": [
+    {{
+      "essential": "장르 필수 요소 이름",
+      "located_in_beat": "어느 비트에 들어가야 하는지",
+      "severity": "CRITICAL|HIGH|MEDIUM",
+      "fix_direction": "보강 방향 1~2줄"
+    }}
+  ],
+  "total_scenes": 시나리오 총 씬 수 (정수),
+  "genre_compliance_score": "0~10 정수",
+  "genre_diagnosis": "장르 준수도 진단 2~3줄"
+}}
+
+JSON만 출력하라.
+""".strip()
+
+
+def distribute_added_scenes_across_beats(beat_map: dict, target_added: int) -> dict:
+    """비트 매핑 결과를 토대로 추가할 N씬을 비트별로 자동 분배.
+
+    분배 알고리즘:
+    1. weak_beats의 deficit 합계 산출
+    2. deficit이 큰 비트부터 우선 배정
+    3. missing_essentials의 CRITICAL 항목은 무조건 +1씬 보장
+    4. 잔여분은 deficit 비율에 따라 비례 분배
+
+    Args:
+        beat_map: build_beat_mapping_prompt 결과 dict
+        target_added: 추가할 총 씬 수 (예: 29). 0 이하면 빈 결과 반환.
+
+    Returns:
+        {
+            "distribution": {"fun_and_games": 6, "bad_guys_close_in": 8, ...},
+            "rationale": "분배 근거 텍스트",
+            "target_added": 29,
+            "actual_total": 29
+        }
+    """
+    # target_added가 0 이하면 분배 자체를 건너뛴다 (비트 인식 OFF)
+    if target_added <= 0:
+        return {
+            "distribution": {},
+            "rationale": "추가 씬 목표가 0 — 분배 건너뜀.",
+            "target_added": 0,
+            "actual_total": 0,
+        }
+
+    weak_beats = beat_map.get("weak_beats", []) or []
+    missing = beat_map.get("missing_essentials", []) or []
+
+    distribution = {}
+    rationale_lines = []
+
+    # 1차: deficit 합계
+    total_deficit = sum(int(wb.get("deficit", 0) or 0) for wb in weak_beats)
+
+    if total_deficit > 0:
+        # 비례 분배
+        accumulated = 0
+        sorted_weak = sorted(weak_beats, key=lambda x: -int(x.get("deficit", 0) or 0))
+        for i, wb in enumerate(sorted_weak):
+            beat_key = wb.get("beat", "")
+            deficit = int(wb.get("deficit", 0) or 0)
+            if not beat_key or deficit <= 0:
+                continue
+            if i == len(sorted_weak) - 1:
+                # 마지막 비트는 잔여분 모두 가져감
+                share = target_added - accumulated
+            else:
+                share = round(target_added * (deficit / total_deficit))
+            share = max(0, share)
+            distribution[beat_key] = distribution.get(beat_key, 0) + share
+            accumulated += share
+            rationale_lines.append(
+                f"  • {wb.get('beat_name', beat_key)}: +{share}씬 "
+                f"(deficit {deficit}, {wb.get('weakness_reason', '')[:50]})"
+            )
+
+    # 2차: missing_essentials CRITICAL 보강 (이미 분배된 비트는 +1만 추가)
+    for me in missing:
+        if me.get("severity") != "CRITICAL":
+            continue
+        beat_key = me.get("located_in_beat", "")
+        if not beat_key:
+            continue
+        distribution[beat_key] = distribution.get(beat_key, 0) + 1
+        rationale_lines.append(
+            f"  • {beat_key}: +1씬 추가 (CRITICAL 누락 — {me.get('essential', '')})"
+        )
+
+    # 3차: 잔여분/초과분 보정
+    actual_total = sum(distribution.values())
+    if actual_total != target_added and distribution:
+        diff = target_added - actual_total
+        # 가장 큰 분배 비트에 잔여 적용
+        top_beat = max(distribution, key=lambda k: distribution[k])
+        distribution[top_beat] = max(0, distribution[top_beat] + diff)
+        rationale_lines.append(
+            f"  • {top_beat}: 잔여분 {diff:+d}씬 보정 (총 합 {target_added}씬 맞춤)"
+        )
+
+    rationale = (
+        f"총 추가 목표: {target_added}씬. 비트별 분배:\n" +
+        "\n".join(rationale_lines)
+    ) if rationale_lines else "추가 분배 데이터 부족."
+
+    return {
+        "distribution": distribution,
+        "rationale": rationale,
+        "target_added": target_added,
+        "actual_total": sum(distribution.values()),
+    }
+
+
+def build_beat_aware_diagnose_block(beat_map: dict, distribution: dict, target_added: int) -> str:
+    """build_diagnose_prompt의 batch_section 다음에 주입될 비트 인식 진단 블록.
+
+    Args:
+        beat_map: 비트 매핑 결과
+        distribution: distribute_added_scenes_across_beats 결과
+        target_added: 추가할 총 씬 수
+
+    Returns:
+        프롬프트에 삽입할 텍스트 블록
+    """
+    if not beat_map or not distribution:
+        return ""
+
+    dist_dict = distribution.get("distribution", {})
+    rationale = distribution.get("rationale", "")
+
+    # 이번 배치에 해당하는 비트만 필터링하지 않고 전체 분배 정책을 LLM에 전달
+    # (LLM이 배치 내 씬이 어느 비트에 속하는지 보고 ADD 위치를 판단)
+    dist_lines = []
+    for beat_key, count in dist_dict.items():
+        if count <= 0:
+            continue
+        # 비트 한국어 이름 찾기
+        beat_kr = beat_key
+        for k, name, pct, desc in SAVE_THE_CAT_15_BEATS:
+            if k == beat_key:
+                beat_kr = name
+                break
+        dist_lines.append(f"  • {beat_kr} ({beat_key}): +{count}씬 추가")
+
+    dist_text = "\n".join(dist_lines) if dist_lines else "(분배 데이터 없음)"
+
+    # 약점 비트 요약
+    weak_beats = beat_map.get("weak_beats", []) or []
+    weak_lines = []
+    for wb in weak_beats[:8]:
+        weak_lines.append(
+            f"  • {wb.get('beat_name', '')}: 현재 {wb.get('current_scenes', 0)}씬 → "
+            f"권장 {wb.get('recommended_min_scenes', 0)}씬 / "
+            f"{wb.get('add_direction', '')[:80]}"
+        )
+    weak_text = "\n".join(weak_lines) if weak_lines else "(약점 비트 없음)"
+
+    # 누락 필수 요소
+    missing = beat_map.get("missing_essentials", []) or []
+    missing_lines = []
+    for me in missing:
+        missing_lines.append(
+            f"  • {me.get('essential', '')} (비트: {me.get('located_in_beat', '')}, "
+            f"{me.get('severity', '')}): {me.get('fix_direction', '')[:80]}"
+        )
+    missing_text = "\n".join(missing_lines) if missing_lines else "(누락 필수 요소 없음)"
+
+    return f"""
+
+[★★★ v2.8 비트 인식 진단 모드 ★★★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+이 진단은 단순 씬 결함 점검이 아니다. **15-Beat 구조 보강**이 목표다.
+사전에 시나리오 전체를 비트 매핑한 결과와, 약한 비트에 추가할 씬 분배 계획이 아래와 같이 정해져 있다.
+
+▣ 비트별 추가 씬 분배 정책 (총 +{target_added}씬):
+{dist_text}
+
+▣ 약점 비트 진단:
+{weak_text}
+
+▣ 누락 필수 요소 (보강 우선):
+{missing_text}
+
+▣ 진단 규칙 (반드시 준수):
+1. 이번 배치 범위 내 씬들이 어느 비트에 속하는지 확인하라.
+2. 그 비트가 위 [추가 분배 정책]에 포함되어 있다면, 해당 비트 영역에 ADD 씬을 제안하라.
+   - target_scenes에 type="ADD"로 등록
+   - insert_after에 "이 추가씬을 어느 기존 씬 뒤에 넣을지" 명시
+   - context_before, context_after에 앞뒤 씬 요약
+   - revision_items에 "어느 비트의 어떤 약점을 보강하는지" 명시
+3. 그 비트가 분배 정책에 없는 비트(STRONG)라면 ADD 제안 금지. REWRITE만 가능.
+4. 누락 필수 요소가 이번 배치 비트에 해당하면 반드시 보강 ADD 또는 REWRITE 제안.
+5. 추가 씬 1개당 분량 가이드: 1~2페이지 (대사 6~12 라인 + 지문). 작품 평균 분량과 맞춰라.
+━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 
 
 # =================================================================

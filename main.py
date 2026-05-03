@@ -7,9 +7,8 @@
 # v1.0 (2026-04-21)  초기 릴리스
 # v2.6 (2026-04-30)  헐리우드 작법 A25~A28 추가
 # v2.7 (2026-05-03)  ★ 자동 배치 분할 시스템 — 토큰 잘림 결함 해결
-#                    71씬 같은 대형 시나리오를 자동으로 N씬 단위 배치 분할 →
-#                    배치별 별도 LLM 호출 → 결과 병합 → 통합 DOCX 출력.
-#                    헐리우드 형식(EXT./INT.)도 자동 인식.
+# v2.8 (2026-05-03)  ★ Beat-Aware Diagnose — 15-Beat 구조 인식 + 약점 비트 보강 ADD 자동 분배.
+#                    71→100씬 확장 같은 대규모 작업 지원.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -55,6 +54,10 @@ from prompt import (
     derive_section_ranges_from_step1,
     build_boundary_smoothness_block,
     build_cascade_analysis_prompt,
+    # v2.8 신규 — Beat-Aware Diagnose
+    build_beat_mapping_prompt,
+    distribute_added_scenes_across_beats,
+    SAVE_THE_CAT_15_BEATS,
 )
 
 # =================================================================
@@ -254,6 +257,10 @@ INIT_STATE = {
     "current_batch": 0,         # 현재 처리 중인 배치 (1부터)
     "batch_size": 6,            # 한 배치당 씬 개수 (REVISE 단계, 수정 대상 씬 기준)
     "diagnose_batch_size": 12,  # ★ v2.7 — DIAGNOSE 자동 분할 배치 사이즈 (시나리오 씬 기준)
+    # v2.8 — Beat-Aware Diagnose
+    "target_added_scenes": 0,    # 추가할 총 씬 수 (0이면 비트 인식 OFF, 양수면 ON)
+    "beat_map": None,            # Pre-Diagnose 비트 매핑 결과
+    "beat_distribution": None,   # 비트별 추가 씬 분배 결과
     "revise_result": None,      # Stage 2 통합 결과
     "verify_result": None,      # Stage 3 JSON 결과
     # v2.0 — 톤 레퍼런스 + Diff 학습 + Rewrite 메타
@@ -2144,6 +2151,331 @@ def _run_diagnose_single(client, raw_text: str, pre_results: dict,
     return None
 
 
+# =================================================================
+# ★★★ v2.8 BEAT-AWARE DIAGNOSE 시스템 ★★★
+# 71→100씬 같은 대규모 확장 시 비트별 약점 진단 + 자동 분배
+# =================================================================
+
+def _run_pre_diagnose_beat_map(client, scenario_text: str, genre: str = "로맨틱 코미디",
+                                retry_count: int = 2):
+    """v2.8 Pre-Diagnose: 시나리오 전체를 15-Beat 구조에 매핑.
+
+    출력은 작다 (씬 ID 리스트 + 짧은 진단 = 약 3~5K 토큰).
+    토큰 잘림 위험 없음 — 단일 호출로 처리.
+
+    Args:
+        client: Anthropic 클라이언트
+        scenario_text: 전체 시나리오 텍스트
+        genre: 작품 장르
+        retry_count: 재시도 횟수
+
+    Returns:
+        beat_map dict 또는 None
+    """
+    if not scenario_text or not client:
+        return None
+
+    prompt_text = build_beat_mapping_prompt(
+        scenario_text=scenario_text,
+        genre=genre,
+    )
+
+    for attempt in range(retry_count):
+        # 비트 매핑은 출력이 작으므로 max_tokens=8000으로 충분
+        raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+        if not raw:
+            continue
+        parsed = parse_json(raw)
+        if parsed and parsed.get("beat_mapping"):
+            return parsed
+        if attempt < retry_count - 1:
+            import time as _t
+            _t.sleep(1.5)
+
+    return None
+
+
+def run_diagnose_with_beat_aware_batch(client, batch_size: int = 12,
+                                        target_added_scenes: int = 0):
+    """v2.8 — 비트 인식 자동 배치 분할 진단.
+
+    호출 흐름:
+    1. Pre-Diagnose: 시나리오 전체를 15-Beat 매핑 (단일 호출)
+    2. distribute_added_scenes_across_beats: target_added_scenes를 비트별 분배
+    3. 시나리오를 N씬 단위로 분할 (v2.7 로직)
+    4. 각 배치마다 build_diagnose_prompt(batch_info, beat_map, beat_distribution, target_added_scenes) 호출
+    5. 결과 병합 → 통합 diagnose_result + beat_map + distribution 반환
+
+    Args:
+        client: Anthropic 클라이언트
+        batch_size: DIAGNOSE 배치당 씬 개수 (기본 12)
+        target_added_scenes: 추가할 총 씬 수 (예: 29)
+
+    Returns:
+        통합된 diagnose_result dict (beat_map, beat_distribution 포함)
+    """
+    pre_results = run_v2_pre_analyses(client)
+
+    raw_text = st.session_state.raw_text
+    if not raw_text:
+        st.error("원본 시나리오가 비어 있습니다.")
+        return None
+
+    scene_count = _detect_scene_count(raw_text)
+    if scene_count == 0:
+        st.error("씬 인식 실패. 씬 헤더 형식을 확인해주세요.")
+        return None
+
+    # ─────────────────────────────────────────────────
+    # Phase 1: Pre-Diagnose 비트 매핑
+    # ─────────────────────────────────────────────────
+    st.info(
+        f"🎯 **v2.8 Beat-Aware Diagnose 시작** — "
+        f"시나리오 {scene_count}씬 → {target_added_scenes}씬 추가 목표"
+    )
+
+    with st.spinner("🎬 Phase 1: 시나리오 전체를 15-Beat 구조에 매핑 중... (Sonnet 4.6)"):
+        beat_map = _run_pre_diagnose_beat_map(
+            client=client,
+            scenario_text=raw_text,
+            genre=st.session_state.genre,
+        )
+
+    if not beat_map:
+        st.error("❌ 비트 매핑 실패. v2.7 모드로 폴백합니다.")
+        return run_diagnose_with_auto_batch(client, batch_size=batch_size)
+
+    # 비트 매핑 결과 캐싱
+    st.session_state.beat_map = beat_map
+
+    # 분배 산출
+    beat_distribution = distribute_added_scenes_across_beats(
+        beat_map=beat_map,
+        target_added=target_added_scenes,
+    )
+    st.session_state.beat_distribution = beat_distribution
+
+    # 비트 매핑 결과 표시
+    bm = beat_map.get("beat_mapping", {})
+    weak = beat_map.get("weak_beats", [])
+    missing = beat_map.get("missing_essentials", [])
+
+    st.success(
+        f"✅ Phase 1 완료 — 비트 매핑 (총 {beat_map.get('total_scenes', scene_count)}씬, "
+        f"장르 준수도 {beat_map.get('genre_compliance_score', 'N/A')}/10)"
+    )
+
+    with st.expander("📊 비트 매핑 결과 보기 (15-Beat)", expanded=False):
+        for k, name, pct, desc in SAVE_THE_CAT_15_BEATS:
+            beat_info = bm.get(k, {})
+            sids = beat_info.get("scene_ids", [])
+            sc = beat_info.get("scene_count", 0)
+            strength = beat_info.get("strength", "")
+            strength_emoji = {
+                "STRONG": "🟢", "ADEQUATE": "🟡",
+                "WEAK": "🟠", "MISSING": "🔴"
+            }.get(strength, "⚪")
+            sids_text = ", ".join(sids[:6]) + (f"... (+{len(sids)-6})" if len(sids) > 6 else "")
+            st.markdown(
+                f"**{strength_emoji} {name}** ({pct}) — {sc}씬 / {strength}  \n"
+                f"<span style='color:#666; font-size:0.85em;'>{sids_text}</span>  \n"
+                f"<span style='color:#999; font-size:0.85em;'>{beat_info.get('function_check', '')}</span>",
+                unsafe_allow_html=True
+            )
+
+        if weak:
+            st.markdown("---\n**🔴 약점 비트:**")
+            for wb in weak:
+                st.markdown(
+                    f"- **{wb.get('beat_name', '')}**: {wb.get('current_scenes', 0)}씬 → "
+                    f"권장 {wb.get('recommended_min_scenes', 0)}씬 (deficit {wb.get('deficit', 0)}) — "
+                    f"{wb.get('weakness_reason', '')}"
+                )
+
+        if missing:
+            st.markdown("---\n**❌ 누락 필수 요소:**")
+            for me in missing:
+                st.markdown(
+                    f"- **{me.get('essential', '')}** ({me.get('severity', '')}, "
+                    f"위치: {me.get('located_in_beat', '')}): {me.get('fix_direction', '')}"
+                )
+
+    # 분배 결과 표시
+    st.markdown("---")
+    st.markdown(f"**🎯 추가 씬 분배 정책 — 총 +{target_added_scenes}씬**")
+    dist = beat_distribution.get("distribution", {})
+    if dist:
+        cols = st.columns(min(len(dist), 4))
+        for i, (beat_key, count) in enumerate(sorted(dist.items(), key=lambda x: -x[1])):
+            beat_kr = beat_key
+            for k, name, pct, desc in SAVE_THE_CAT_15_BEATS:
+                if k == beat_key:
+                    beat_kr = name
+                    break
+            with cols[i % len(cols)]:
+                st.metric(beat_kr, f"+{count}씬")
+
+    # ─────────────────────────────────────────────────
+    # Phase 2: 비트 인식 배치 진단
+    # ─────────────────────────────────────────────────
+    batches = _split_scenario_by_scenes(raw_text, batch_size=batch_size)
+    n_batches = len(batches)
+
+    st.info(
+        f"🔬 **Phase 2: 비트 인식 배치 진단 시작** — "
+        f"{n_batches}배치로 분할, 각 배치마다 비트 분배 정책에 따라 ADD 위치 제안"
+    )
+
+    progress_bar = st.progress(0.0, text="비트 인식 진단 준비 중...")
+    merged_target_scenes = []
+    summaries = []
+    out_of_scope_all = []
+    confidences = []
+    locked_summaries = []
+    conflicts_all = []
+
+    for i, batch in enumerate(batches, start=1):
+        progress_bar.progress(
+            (i - 1) / n_batches,
+            text=f"🔬 배치 {i}/{n_batches} 비트 인식 진단 중... ({batch['scene_range']})"
+        )
+
+        batch_info = {
+            "batch_index": i,
+            "total_batches": n_batches,
+            "scene_range": batch["scene_range"],
+            "first_scene": batch["first_scene"],
+            "last_scene": batch["last_scene"],
+            "scene_format": batch.get("scene_format", "S#"),
+        }
+
+        prompt_text = build_diagnose_prompt(
+            raw_text=batch["scenario_chunk"],
+            instruction=st.session_state.instruction,
+            locked=st.session_state.locked,
+            genre=st.session_state.genre,
+            intensity=st.session_state.intensity,
+            profession_input=st.session_state.profession_input,
+            period_key=st.session_state.period_key,
+            historical_type=st.session_state.historical_type,
+            fact_based=st.session_state.fact_based,
+            tone_dna=pre_results.get("tone_dna"),
+            diff_analysis=pre_results.get("diff_analysis"),
+            distribution_diagnostic=pre_results.get("distribution_diagnostic"),
+            rewrite_metadata=pre_results.get("rewrite_metadata"),
+            genre_dna=pre_results.get("genre_dna"),
+            section_mode=st.session_state.section_mode,
+            protected_ranges=st.session_state.protected_ranges,
+            revision_ranges=st.session_state.revision_ranges,
+            cascade_analysis=st.session_state.cascade_analysis,
+            boundary_info=st.session_state.boundary_info,
+            batch_info=batch_info,
+            beat_map=beat_map,
+            beat_distribution=beat_distribution,
+            target_added_scenes=target_added_scenes,
+        )
+
+        result = None
+        for attempt in range(3):
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
+            if not raw:
+                continue
+            parsed = parse_json(raw)
+            if parsed:
+                result = parsed
+                break
+            if attempt < 2:
+                import time as _t
+                _t.sleep(1.5)
+
+        if not result:
+            st.warning(f"⚠️ 배치 {i}/{n_batches} 진단 실패. 빈 결과로 처리.")
+            continue
+
+        rp = result.get("revision_plan", {})
+        merged_target_scenes.extend(rp.get("target_scenes", []))
+        s = rp.get("summary", "").strip()
+        if s:
+            summaries.append(f"[{batch['scene_range']}] {s}")
+        oos = rp.get("out_of_scope", [])
+        if oos:
+            out_of_scope_all.extend(oos)
+        c = rp.get("confidence")
+        if isinstance(c, (int, float)):
+            confidences.append(c)
+        ls = rp.get("locked_summary", "").strip()
+        if ls:
+            locked_summaries.append(ls)
+        confs = rp.get("conflicts", [])
+        if confs:
+            conflicts_all.extend(confs)
+
+    progress_bar.progress(1.0, text="✅ 모든 배치 진단 완료. 결과 통합 중...")
+
+    # 통합 결과
+    avg_confidence = round(sum(confidences) / len(confidences), 1) if confidences else 7.0
+
+    # 추가 씬(ADD) vs 수정 씬(REWRITE) 카운트
+    add_count = sum(1 for s in merged_target_scenes if s.get("type") == "ADD")
+    rewrite_count = sum(1 for s in merged_target_scenes if s.get("type") == "REWRITE")
+    other_count = len(merged_target_scenes) - add_count - rewrite_count
+
+    merged_result = {
+        "revision_plan": {
+            "summary": "\n\n".join(summaries) if summaries else "v2.8 비트 인식 진단 완료.",
+            "locked_summary": "\n".join(locked_summaries) if locked_summaries else "",
+            "conflicts": conflicts_all,
+            "target_scenes": merged_target_scenes,
+            "out_of_scope": out_of_scope_all,
+            "confidence": avg_confidence,
+            "estimated_scene_count": str(len(merged_target_scenes)),
+            "total_scenes": len(merged_target_scenes),
+            "recommended_batches": max(1, (len(merged_target_scenes) + 4) // 5),
+            "batch_strategy": (
+                f"v2.8 Beat-Aware 진단: 총 {n_batches}개 배치 → "
+                f"ADD {add_count}개 + REWRITE {rewrite_count}개 + 기타 {other_count}개"
+            ),
+            "auto_batch_diagnose": {
+                "diagnose_batch_count": n_batches,
+                "diagnose_batch_size": batch_size,
+                "total_scenes_detected": scene_count,
+            },
+            # v2.8 추가 메타
+            "beat_aware": {
+                "beat_map": beat_map,
+                "beat_distribution": beat_distribution,
+                "target_added_scenes": target_added_scenes,
+                "actual_add_count": add_count,
+                "actual_rewrite_count": rewrite_count,
+                "deficit_or_surplus": add_count - target_added_scenes,
+            }
+        }
+    }
+
+    progress_bar.empty()
+
+    # 최종 결과 표시
+    if add_count == target_added_scenes:
+        st.success(
+            f"✅ v2.8 Beat-Aware 진단 완료 — ADD **{add_count}씬** (목표 {target_added_scenes}씬 정확 일치) "
+            f"+ REWRITE {rewrite_count}씬"
+        )
+    elif abs(add_count - target_added_scenes) <= 3:
+        st.success(
+            f"✅ v2.8 Beat-Aware 진단 완료 — ADD **{add_count}씬** "
+            f"(목표 {target_added_scenes}씬, 차이 {add_count - target_added_scenes:+d}) "
+            f"+ REWRITE {rewrite_count}씬"
+        )
+    else:
+        st.warning(
+            f"⚠️ v2.8 Beat-Aware 진단 완료 — ADD **{add_count}씬** "
+            f"(목표 {target_added_scenes}씬, 차이 {add_count - target_added_scenes:+d}) "
+            f"+ REWRITE {rewrite_count}씬. 수정 지시문 또는 배치 사이즈 조정 권장."
+        )
+
+    return merged_result
+
+
 def run_diagnose(client):
     """Stage 1: 진단 + 수정 플랜 생성.
 
@@ -2185,9 +2517,20 @@ def run_diagnose(client):
             return _build_auto_diagnose_from_rewrite_metadata(rewrite_meta)
 
     # ★ Fast Path 3 — 일반 전체 각색
-    # v2.7: 자동 배치 분할로 라우팅 (단일 배치면 자동으로 단일 호출 모드로 동작)
+    # v2.8: target_added_scenes > 0이면 비트 인식 진단, 아니면 v2.7 자동 배치
     batch_size = st.session_state.get("diagnose_batch_size", 12)
-    return run_diagnose_with_auto_batch(client, batch_size=batch_size)
+    target_added = st.session_state.get("target_added_scenes", 0)
+
+    if target_added > 0:
+        # v2.8 Beat-Aware Diagnose 모드
+        return run_diagnose_with_beat_aware_batch(
+            client,
+            batch_size=batch_size,
+            target_added_scenes=target_added,
+        )
+    else:
+        # v2.7 자동 배치 분할 모드
+        return run_diagnose_with_auto_batch(client, batch_size=batch_size)
 
 
 def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches: int):
@@ -2861,7 +3204,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.7</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.8</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -3707,6 +4050,49 @@ def show_step_0_input():
                     f"71씬 시나리오 → {(_detected_scene_count + new_bs - 1) // new_bs}배치 (예상)."
                 )
 
+            # ★ v2.8 Beat-Aware Diagnose 입력 박스
+            _current_target = st.session_state.get("target_added_scenes", 0)
+            st.markdown(
+                f'<div style="background:#FEF3C7; padding:10px 14px; border-radius:6px; '
+                f'border-left:3px solid #F59E0B; margin:8px 0; font-size:0.88rem;">'
+                f'<b>🎯 v2.8 Beat-Aware Diagnose:</b> '
+                f'시나리오 확장(예: 71씬 → 100씬) 시 사용. '
+                f'15-Beat 구조 매핑 → 약점 비트 진단 → 자동 분배.<br>'
+                f'<span style="color:#666; font-size:0.82rem;">'
+                f'추가할 씬 수를 0보다 크게 설정하면 비트 인식 모드가 활성화됩니다. '
+                f'0이면 v2.7 일반 진단 모드.</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            new_target = st.number_input(
+                "🎯 추가할 씬 수 (Target Added Scenes)",
+                min_value=0,
+                max_value=200,
+                value=_current_target,
+                step=1,
+                help=(
+                    "0: 일반 진단 (v2.7 모드)\n"
+                    "1~200: Beat-Aware Diagnose 활성화 — 15-Beat 구조 진단 후 약점 비트에 ADD 자동 분배.\n\n"
+                    "예시: 71씬 → 100씬 확장 시 29 입력."
+                ),
+                key="target_added_scenes_input"
+            )
+            if new_target != _current_target:
+                st.session_state.target_added_scenes = new_target
+                st.rerun()
+
+            if new_target > 0:
+                _expected_total = _detected_scene_count + new_target
+                st.caption(
+                    f"📈 확장 목표: {_detected_scene_count}씬 → **{_expected_total}씬** "
+                    f"(+{new_target}씬 추가). "
+                    f"진단 시 Phase 1(비트 매핑) → Phase 2(비트 인식 배치 진단) 순으로 진행됩니다."
+                )
+            else:
+                st.caption(
+                    f"💡 추가 씬 0 = 일반 진단 모드 (v2.7). 비트 매핑 단계 생략."
+                )
+
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("🔬 Stage 1: 진단 시작 (DIAGNOSE)",
@@ -4415,7 +4801,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.7",
+                "engine": "BLUE JEANS REVISE ENGINE v2.8",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -4472,9 +4858,10 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.7  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.8  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
-    '<span style="color:#10B981;">Auto Batch Split System</span>'
+    '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
+    '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>'
     '</div>',
     unsafe_allow_html=True,
 )
