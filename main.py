@@ -1,3457 +1,3058 @@
-# =================================================================
-# 👖 BLUE JEANS REVISE ENGINE
-# main.py — Streamlit App (3-Stage Pipeline)
-# =================================================================
-# © 2026 BLUE JEANS PICTURES. All rights reserved.
-#
-# v1.0 (2026-04-21)
-# Pipeline: DIAGNOSE → REVISE → VERIFY
-# Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
-# =================================================================
-
-import os
-import re
-import json
-import io
-from datetime import datetime
-
 import streamlit as st
 import anthropic
+from PyPDF2 import PdfReader
+import json, re, html, io
+import plotly.express as px
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_ALIGN_VERTICAL
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
 from prompt import (
-    SYSTEM_PROMPT,
-    GENRE_RULES,
-    INTENSITY_RULES,
-    build_diagnose_prompt,
-    build_revise_prompt,
-    build_verify_prompt,
-    get_report_filename,
-    get_period_keys_for_ui,
-    get_period_labels_for_ui,
-    parse_rewrite_engine_json,
-    split_into_batches,
-    merge_batch_results,
-    # v2.0 신규
-    build_tone_dna_extraction_prompt,
-    build_diff_analysis_prompt,
-    build_distribution_diagnostic_prompt,
-    absorb_rewrite_engine_metadata,
-    # v2.1 신규
-    build_genre_dna_extraction_prompt,
-    # v2.2 신규
-    build_section_detection_prompt,
-    build_section_detect_step1_prompt,
-    derive_section_ranges_from_step1,
-    build_boundary_smoothness_block,
-    build_cascade_analysis_prompt,
+    SYSTEM_PROMPT, GENRE_RULES,
+    build_analysis_prompt, build_doctoring_prompt, build_rewrite_prompt,
+    get_report_filename
 )
 
 # =================================================================
-# [0] 모델 설정 & 페이지 설정
+# [0] 페이지 설정 & 세션 초기화
 # =================================================================
-MODEL_WRITE   = "claude-opus-4-6"      # Stage 2: 실제 집필
-MODEL_ANALYZE = "claude-sonnet-4-6"    # Stage 1 & 3: 분석
+st.set_page_config(page_title="BLUE JEANS REWRITE ENGINE", layout="wide", page_icon="👖")
 
-st.set_page_config(
-    page_title="BLUE JEANS · Revise Engine",
-    page_icon="👖",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# =================================================================
-# [1] 디자인 시스템 (Writer/Rewrite Engine과 동일 톤)
-# =================================================================
-st.markdown("""
-<style>
-@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
-@import url('https://cdn.jsdelivr.net/gh/projectnoonnu/2408-3@latest/Paperlogy.css');
-@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap');
-
-:root {
-    --navy: #191970; --y: #FFCB05; --bg: #F7F7F5;
-    --card: #FFFFFF; --card-border: #E2E2E0; --t: #1A1A2E;
-    --g: #2EC484; --r: #E14444; --dim: #8E8E99; --light-bg: #EEEEF6;
-    --serif: 'Paperlogy', 'Noto Serif KR', 'Georgia', serif;
-    --display: 'Playfair Display', 'Paperlogy', 'Georgia', serif;
-    --body: 'Pretendard', -apple-system, sans-serif;
-    --heading: 'Paperlogy', 'Pretendard', sans-serif;
-}
-
-html, body, [class*="css"] {
-    font-family: var(--body); color: var(--t); -webkit-font-smoothing: antialiased;
-}
-.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"],
-[data-testid="stMainBlockContainer"], [data-testid="stHeader"],
-[data-testid="stBottom"] {
-    background-color: var(--bg) !important; color: var(--t) !important;
-}
-.stMarkdown, .stText, .stCode { color: var(--t) !important; }
-h1, h2, h3, h4, h5, h6 { color: var(--navy) !important; font-family: var(--heading) !important; }
-p, span, label, div, li { color: inherit; }
-section[data-testid="stSidebar"] { display: none; }
-
-.stTextInput input, .stTextArea textarea,
-[data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea {
-    background-color: var(--card) !important; color: var(--t) !important;
-    border: 1.5px solid var(--card-border) !important; border-radius: 8px !important;
-    font-family: var(--body) !important; font-size: 0.92rem !important;
-    padding: 0.65rem 0.85rem !important;
-}
-.stTextInput input:focus, .stTextArea textarea:focus {
-    border-color: var(--navy) !important;
-    box-shadow: 0 0 0 2px rgba(25,25,112,0.08) !important;
-}
-
-[data-testid="stSelectbox"] > div > div,
-[data-testid="stSelectbox"] [data-baseweb="select"] > div {
-    background-color: var(--card) !important; color: var(--t) !important;
-    border: 1.5px solid var(--card-border) !important; border-radius: 8px !important;
-}
-
-.stButton > button {
-    background-color: var(--navy) !important; color: #FFFFFF !important;
-    border: none !important; border-radius: 8px !important;
-    font-family: var(--heading) !important; font-weight: 700 !important;
-    padding: 0.7rem 1.4rem !important; letter-spacing: 0.02em !important;
-    transition: all 0.2s ease !important;
-}
-.stButton > button:hover {
-    background-color: var(--y) !important; color: var(--navy) !important;
-    transform: translateY(-1px);
-}
-
-[data-testid="stDownloadButton"] button {
-    background-color: var(--y) !important; color: var(--navy) !important;
-    border: none !important; border-radius: 8px !important;
-    font-family: var(--heading) !important; font-weight: 800 !important;
-    padding: 0.75rem 1.4rem !important;
-}
-[data-testid="stDownloadButton"] button:hover {
-    background-color: var(--navy) !important; color: var(--y) !important;
-}
-
-[data-testid="stFileUploader"] {
-    background-color: var(--card) !important;
-    border: 2px dashed var(--card-border) !important;
-    border-radius: 10px !important; padding: 1rem !important;
-}
-
-.rev-hero {
-    text-align: center;
-    padding: 52px 0 28px;
-    border-bottom: 1px solid var(--card-border);
-    margin-bottom: 40px;
-}
-.rev-hero .brand {
-    font-size: 0.85rem; font-weight: 700;
-    color: var(--navy); letter-spacing: 0.15em;
-    font-family: var(--heading);
-}
-.rev-hero .title {
-    font-size: 2.6rem; font-weight: 900; color: var(--navy);
-    font-family: var(--display); letter-spacing: -0.02em;
-    position: relative; display: inline-block;
-    line-height: 1; margin: 14px 0 0 0;
-}
-.rev-hero .title::after {
-    content: ''; position: absolute; bottom: 2px; left: 0;
-    width: 100%; height: 4px; background: var(--y); border-radius: 2px;
-}
-.rev-hero .tag {
-    font-size: 0.7rem; color: var(--dim);
-    letter-spacing: 0.15em;
-    margin-top: 0.6rem;
-}
-
-.rev-stepbar {
-    display: flex; justify-content: space-between;
-    background: var(--card); border: 1px solid var(--card-border);
-    border-radius: 12px; padding: 16px 24px; margin-bottom: 32px;
-}
-.rev-step {
-    flex: 1; text-align: center;
-    font-family: var(--heading); font-weight: 700;
-    color: var(--dim); font-size: 0.88rem;
-    position: relative;
-}
-.rev-step.active { color: var(--navy); }
-.rev-step.done { color: var(--g); }
-.rev-step .num {
-    display: inline-block; width: 28px; height: 28px;
-    line-height: 28px; border-radius: 50%;
-    background: var(--light-bg); color: var(--dim);
-    font-weight: 900; margin-right: 8px;
-}
-.rev-step.active .num { background: var(--navy); color: var(--y); }
-.rev-step.done .num { background: var(--g); color: #FFFFFF; }
-
-.rev-card {
-    background: var(--card); border: 1px solid var(--card-border);
-    border-radius: 12px; padding: 24px; margin-bottom: 20px;
-}
-.rev-card-title {
-    font-family: var(--heading); font-weight: 800;
-    color: var(--navy); font-size: 1.15rem;
-    margin-bottom: 12px; letter-spacing: -0.01em;
-}
-.rev-caption {
-    color: var(--dim); font-size: 0.85rem;
-    margin-top: 4px; margin-bottom: 16px;
-}
-
-.rev-badge {
-    display: inline-block; padding: 4px 10px;
-    background: var(--light-bg); color: var(--navy);
-    border-radius: 6px; font-size: 0.78rem; font-weight: 700;
-    font-family: var(--heading); margin-right: 6px;
-}
-.rev-badge.y { background: var(--y); color: var(--navy); }
-.rev-badge.g { background: var(--g); color: #FFFFFF; }
-.rev-badge.r { background: var(--r); color: #FFFFFF; }
-
-.rev-verdict {
-    display: inline-block; padding: 10px 20px;
-    border-radius: 8px; font-family: var(--heading);
-    font-weight: 900; font-size: 1rem; letter-spacing: 0.05em;
-}
-.rev-verdict.approved { background: var(--g); color: #FFFFFF; }
-.rev-verdict.needs    { background: var(--y); color: var(--navy); }
-.rev-verdict.rejected { background: var(--r); color: #FFFFFF; }
-</style>
-""", unsafe_allow_html=True)
-
-# =================================================================
-# [2] 세션 상태 초기화
-# =================================================================
-INIT_STATE = {
-    "step": 0,                  # 0:입력 / 1:DIAGNOSE / 2:REVISE / 3:VERIFY / 4:완료
-    "title": "",
-    "raw_text": "",             # 원본 시나리오 (DOCX에서 추출)
-    "raw_filename": "",
-    "instruction": "",          # 수정 지시문
-    "locked": "",               # LOCKED 요소
-    "profession_input": "",     # 주요 캐릭터 직업 (선택사항)
-    "period_key": "(현대)",     # 시대 (사극·시대극)
-    "historical_type": "정통",  # 역사영화 유형 (정통/팩션/퓨전)
-    "fact_based": False,        # 실화 기반 작품 여부
-    "genre": "드라마",
-    "intensity": "BALANCED",
-    "diagnose_result": None,    # Stage 1 JSON 결과
-    "revise_batches": None,     # 배치 분할 결과 (list)
-    "batch_results": {},        # {batch_index: revise_result, ...}
-    "current_batch": 0,         # 현재 처리 중인 배치 (1부터)
-    "batch_size": 6,            # 한 배치당 씬 개수
-    "revise_result": None,      # Stage 2 통합 결과
-    "verify_result": None,      # Stage 3 JSON 결과
-    # v2.0 — 톤 레퍼런스 + Diff 학습 + Rewrite 메타
-    "tone_ref_text": "",        # 톤 레퍼런스 DOCX의 전문
-    "tone_ref_filename": "",
-    "diff_orig_text": "",       # Diff 모드 — 원본 (이전 버전)
-    "diff_orig_filename": "",
-    "diff_refined_text": "",    # Diff 모드 — 손본본 (최신 버전)
-    "diff_refined_filename": "",
-    "rewrite_json_text": "",    # Rewrite Engine JSON 원문 (변환 + 흡수)
-    "tone_dna": None,           # 추출된 톤 DNA (DIAGNOSE 자동 실행)
-    "diff_analysis": None,      # Diff 학습 결과
-    "distribution_diagnostic": None,  # 분포 진단
-    "rewrite_metadata": None,   # Rewrite 메타 흡수
-    # v2.1 — 장르 DNA (참고작 1~3편에서 추출)
-    "genre_ref_texts": [],      # [참고작1 텍스트, 참고작2, ...] 최대 3편
-    "genre_ref_filenames": [],  # 파일명 리스트
-    "genre_dna": None,          # 추출된 장르 DNA
-    # v2.1 — Diff 모드: Before로 원본을 자동 사용할지 옵션
-    "diff_use_main_as_before": True,
-    # v2.2 — 구간 지정 모드 (이어쓰기 + 부분 수정 통합)
-    "work_mode": None,               # "full" / "continuation" / "partial" (카드로 선택)
-    "section_mode": False,           # 내부 호환 (continuation/partial일 때 자동 True)
-    "section_input_method": "auto",  # auto (자동 감지) / manual (수동 지정) / hybrid
-    "section_detection": None,       # 자동 감지 결과
-    "protected_ranges": [],          # [{"from":"S#1","to":"S#25","reason":"..."}, ...]
-    "revision_ranges": [],           # [{"from":"S#26","to":"S#71","reason":"..."}, ...]
-    "cascade_analysis": None,        # 연쇄 영향 분석 결과
-    "boundary_info": "",             # 경계 매끄러움 정보 (자동 계산)
-    "show_advanced": False,          # 고급 옵션 펼치기
-}
-
-for k, v in INIT_STATE.items():
+for k, v in {
+    "page": "index",
+    "db": [],
+    "selected_item": None,
+    "step": 0,
+    "raw_text": None,
+    "analysis": None,
+    "washing": None,
+    "rewriting": None,
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-
-def reset_workflow():
-    """전체 워크플로우 리셋."""
-    for k, v in INIT_STATE.items():
-        st.session_state[k] = v
-
-
 # =================================================================
-# [2-B] 통합 파일 추출 헬퍼 — DOCX + PDF
+# [1] 디자인 시스템
 # =================================================================
-def extract_text_from_uploaded_file(uploaded_file) -> str:
-    """업로드된 파일(DOCX 또는 PDF)에서 텍스트 추출.
-
-    Args:
-        uploaded_file: st.file_uploader가 반환한 파일 객체
-
-    Returns:
-        추출된 전체 텍스트. 실패 시 빈 문자열.
-    """
-    if uploaded_file is None:
-        return ""
-
-    name = uploaded_file.name.lower()
-
-    # DOCX
-    if name.endswith(".docx"):
-        try:
-            from docx import Document as _Doc
-            _doc = _Doc(uploaded_file)
-            return "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
-        except Exception as e:
-            st.error(f"DOCX 읽기 실패 ({uploaded_file.name}): {e}")
-            return ""
-
-    # PDF
-    elif name.endswith(".pdf"):
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(uploaded_file)
-            text_parts = []
-            for page in reader.pages:
-                t = page.extract_text() or ""
-                if t.strip():
-                    text_parts.append(t)
-            full_text = "\n".join(text_parts)
-            if not full_text.strip():
-                st.warning(f"⚠️ PDF에서 텍스트를 추출하지 못했습니다. 스캔본/이미지 PDF는 지원되지 않습니다 ({uploaded_file.name})")
-            return full_text
-        except Exception as e:
-            st.error(f"PDF 읽기 실패 ({uploaded_file.name}): {e}")
-            return ""
-
+# ── 장르별 Unsplash 이미지 URL 생성 ──
+def get_genre_img_url(item):
+    """장르별 Picsum Photos 이미지 (CORS 제한 없음, 완전 무료)"""
+    genre_raw = item.get('genre', {})
+    if isinstance(genre_raw, dict):
+        genre_str = genre_raw.get('primary', '') + ' ' + ' '.join(genre_raw.get('tags', []))
     else:
-        st.error(f"지원하지 않는 파일 형식: {uploaded_file.name} (DOCX 또는 PDF만 가능)")
-        return ""
-
-
-# =================================================================
-# [3] API 클라이언트 & 호출
-# =================================================================
-def get_client():
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY"))
-    if not api_key:
-        st.error("❌ ANTHROPIC_API_KEY가 secrets에 없습니다. "
-                 ".streamlit/secrets.toml 또는 환경변수에 추가해주세요.")
-        return None
-    return anthropic.Anthropic(api_key=api_key)
-
-
-def call_claude(client, prompt_text: str, model: str, max_tokens: int = 32000, retries: int = 1):
-    """Claude API 스트리밍 호출 + max_tokens 잘림 시 1회만 자동 증량 재시도.
-
-    재시도 제한: 기본 1회 (토큰 낭비 방지).
-    잘림이 반복되면 사용자에게 알리고 중단하여 결과를 그대로 반환.
-
-    모델별 한도:
-    - Sonnet 4.6: 최대 64,000 토큰
-    - Opus 4.6:   최대 32,000 토큰
-    """
-    # 모델별 상한
-    if "opus" in model.lower():
-        absolute_cap = 32000
-    else:  # sonnet, haiku 등
-        absolute_cap = 64000
-
-    current_tokens = min(max_tokens, absolute_cap)
-
-    for attempt in range(1 + retries):
-        try:
-            collected = ""
-            stop_reason = None
-            with client.messages.stream(
-                model=model,
-                max_tokens=current_tokens,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt_text}],
-            ) as stream:
-                for text in stream.text_stream:
-                    collected += text
-                final_msg = stream.get_final_message()
-                stop_reason = final_msg.stop_reason
-
-            if stop_reason == "max_tokens":
-                if attempt < retries and current_tokens < absolute_cap:
-                    next_tokens = min(int(current_tokens * 1.5), absolute_cap)
-                    if next_tokens == current_tokens:
-                        # 이미 한도에 도달 — 즉시 중단
-                        st.warning(f"⚠️ 모델 한도({absolute_cap:,} 토큰)에서 응답이 잘렸습니다. "
-                                   "지금 결과로 진행합니다. 이상하면 시나리오를 더 짧게 분할하거나 "
-                                   "지시문을 간소화하세요.")
-                        return collected
-                    st.info(f"🔄 응답이 {current_tokens:,} 토큰에서 잘렸습니다. "
-                            f"{next_tokens:,} 토큰으로 1회만 재시도합니다.")
-                    current_tokens = next_tokens
-                    continue
-                else:
-                    # 1회 재시도 후에도 잘렸으면 그대로 진행 (추가 재시도 안 함)
-                    st.warning(f"⚠️ 재시도 후에도 응답이 잘렸습니다 ({current_tokens:,} 토큰). "
-                               "지금 결과로 진행합니다 — 추가 재시도는 토큰 낭비입니다. "
-                               "결과가 불완전하면 입력을 간소화하세요.")
-            return collected
-        except Exception as e:
-            st.error(f"❌ API 오류: {type(e).__name__} — {e}")
-            return None
-    return None
-
-
-def parse_json(raw: str):
-    """JSON 파싱 (마크다운 코드블록 제거 + 양끝 트리밍 + 잘린 JSON 복구 시도)."""
-    if not raw:
-        return None
-    txt = raw.strip()
-    # 코드블록 제거
-    txt = re.sub(r'^```(?:json)?\s*\n', '', txt)
-    txt = re.sub(r'\n```\s*$', '', txt)
-    # 첫 { 부터 시작
-    s = txt.find('{')
-    if s == -1:
-        return None
-
-    # 1. 정상 파싱 시도 — 마지막 } 까지
-    e = txt.rfind('}')
-    if e > s:
-        try:
-            return json.loads(txt[s:e+1])
-        except json.JSONDecodeError:
-            pass  # 복구 시도로 진행
-
-    # 2. 잘린 JSON 복구 시도 — 괄호 균형 맞추기
-    candidate = txt[s:]
-    open_braces = 0
-    open_brackets = 0
-    in_string = False
-    escape_next = False
-    last_valid_pos = -1
-
-    for i, ch in enumerate(candidate):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == '{':
-            open_braces += 1
-        elif ch == '}':
-            open_braces -= 1
-            if open_braces == 0 and open_brackets == 0:
-                last_valid_pos = i
-        elif ch == '[':
-            open_brackets += 1
-        elif ch == ']':
-            open_brackets -= 1
-
-    # 마지막 유효 위치까지로 시도
-    if last_valid_pos > 0:
-        try:
-            return json.loads(candidate[:last_valid_pos+1])
-        except json.JSONDecodeError:
-            pass
-
-    # 3. 잘린 끝부분 강제 닫기 시도
-    truncated = candidate.rstrip().rstrip(',')
-    # 마지막에 미완성 문자열이 있으면 닫기
-    if truncated.count('"') % 2 == 1:
-        truncated += '"'
-    # 열린 배열/객체 닫기
-    truncated += ']' * max(0, open_brackets) + '}' * max(0, open_braces)
-
-    try:
-        result = json.loads(truncated)
-        st.warning("⚠️ 응답이 잘렸지만 부분 복구를 시도했습니다. 결과 일부가 누락될 수 있습니다.")
-        return result
-    except json.JSONDecodeError as err:
-        st.error(f"❌ JSON 파싱 실패: {err}")
-        st.caption("응답 끝부분 (디버깅용):")
-        st.code(candidate[-500:], language="json")
-        return None
-
-
-# =================================================================
-# [4] DOCX 입력: 원본 시나리오 파싱
-# =================================================================
-def extract_docx_text(uploaded_file) -> str:
-    """업로드된 DOCX에서 본문 텍스트를 추출."""
-    try:
-        doc = Document(uploaded_file)
-        paragraphs = []
-        for p in doc.paragraphs:
-            t = p.text.strip()
-            if t:
-                paragraphs.append(t)
-        # 표 안의 텍스트도 수집 (씬 헤더·대사 표로 정리된 경우 대비)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for p in cell.paragraphs:
-                        t = p.text.strip()
-                        if t:
-                            paragraphs.append(t)
-        return "\n".join(paragraphs)
-    except Exception as e:
-        st.error(f"DOCX 추출 실패: {e}")
-        return ""
-
-
-# =================================================================
-# [5] DOCX 출력: 수정본 & 검증 보고서
-# =================================================================
-def _set_font(run, font_name="맑은 고딕", size_pt=10.5, bold=False, color=None):
-    run.font.name = font_name
-    run.font.size = Pt(size_pt)
-    run.font.bold = bold
-    if color:
-        run.font.color.rgb = RGBColor(*color)
-    rPr = run._element.get_or_add_rPr()
-    rFonts = rPr.find(qn('w:rFonts'))
-    if rFonts is None:
-        rFonts = OxmlElement('w:rFonts')
-        rPr.append(rFonts)
-    rFonts.set(qn('w:eastAsia'), font_name)
-
-
-def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
-                        original_text: str = "",
-                        fact_based: bool = False,
-                        historical: bool = False,
-                        historical_type: str = "") -> bytes:
-    """Stage 2 결과를 한국 시나리오 표준 서식의 DOCX로 변환.
-
-    Writer Engine과 동일한 서식 사용:
-    - 함초롬바탕 10pt 기본
-    - 씬번호 / 대사 / 대사연속 / 지문 4가지 Word 스타일
-    - A4, 20mm 여백
-    - 캐릭터명\t\t대사 형식 자동 감지
-    - 메타데이터 자동 차단
-    """
-    from docx import Document as DocxDocument
-    from docx.shared import Pt, RGBColor, Mm, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.style import WD_STYLE_TYPE
-    from docx.oxml.ns import qn
-    from io import BytesIO
-
-    doc = DocxDocument()
-
-    # ── 페이지 설정 (A4, 20mm 마진) ──
-    section = doc.sections[0]
-    section.page_width = Mm(210)
-    section.page_height = Mm(297)
-    section.top_margin = Mm(20)
-    section.bottom_margin = Mm(20)
-    section.left_margin = Mm(20)
-    section.right_margin = Mm(20)
-
-    # ── 기본 스타일: 함초롬바탕 10pt ──
-    style_normal = doc.styles["Normal"]
-    style_normal.font.name = "함초롬바탕"
-    style_normal.font.size = Pt(10)
-    style_normal.paragraph_format.space_after = Pt(2)
-    style_normal.paragraph_format.space_before = Pt(0)
-    rpr = style_normal.element.rPr
-    if rpr is None:
-        rpr = style_normal.element.makeelement(qn('w:rPr'), {})
-        style_normal.element.append(rpr)
-    rfonts = rpr.find(qn('w:rFonts'))
-    if rfonts is None:
-        rfonts = rpr.makeelement(qn('w:rFonts'), {})
-        rpr.append(rfonts)
-    rfonts.set(qn('w:eastAsia'), '함초롬바탕')
-
-    def _set_eastasia_font(rpr_elem, font_name='함초롬바탕'):
-        rf = rpr_elem.find(qn('w:rFonts'))
-        if rf is None:
-            rf = rpr_elem.makeelement(qn('w:rFonts'), {})
-            rpr_elem.append(rf)
-        rf.set(qn('w:eastAsia'), font_name)
-
-    # ── 커스텀 스타일: 씬번호 / 대사 / 대사연속 / 지문 ──
-    style_scene = doc.styles.add_style('씬번호', WD_STYLE_TYPE.PARAGRAPH)
-    style_scene.base_style = doc.styles['Normal']
-    style_scene.font.name = '함초롬바탕'
-    style_scene.font.size = Pt(11)
-    style_scene.font.bold = True
-    style_scene.paragraph_format.space_before = Pt(24)
-    style_scene.paragraph_format.space_after = Pt(6)
-    style_scene.paragraph_format.line_spacing = 1.5
-    _set_eastasia_font(style_scene.element.get_or_add_rPr())
-
-    style_dialogue = doc.styles.add_style('대사', WD_STYLE_TYPE.PARAGRAPH)
-    style_dialogue.base_style = doc.styles['Normal']
-    style_dialogue.font.name = '함초롬바탕'
-    style_dialogue.font.size = Pt(10)
-    style_dialogue.font.bold = True
-    style_dialogue.paragraph_format.left_indent = Cm(1.25)
-    style_dialogue.paragraph_format.space_before = Pt(8)
-    style_dialogue.paragraph_format.space_after = Pt(2)
-    style_dialogue.paragraph_format.line_spacing = 1.5
-    _set_eastasia_font(style_dialogue.element.get_or_add_rPr())
-
-    style_dialogue_cont = doc.styles.add_style('대사연속', WD_STYLE_TYPE.PARAGRAPH)
-    style_dialogue_cont.base_style = style_dialogue
-    style_dialogue_cont.paragraph_format.space_before = Pt(0)
-    style_dialogue_cont.paragraph_format.space_after = Pt(0)
-
-    style_action = doc.styles.add_style('지문', WD_STYLE_TYPE.PARAGRAPH)
-    style_action.base_style = doc.styles['Normal']
-    style_action.font.name = '함초롬바탕'
-    style_action.font.size = Pt(10)
-    style_action.font.bold = False
-    style_action.paragraph_format.space_before = Pt(2)
-    style_action.paragraph_format.space_after = Pt(2)
-    _set_eastasia_font(style_action.element.get_or_add_rPr())
-
-    # ── 헬퍼 ──
-    def add_text(text, bold=False, size=None, color=None, align=None):
-        p = doc.add_paragraph()
-        if align:
-            p.alignment = align
-        r = p.add_run(text)
-        r.font.name = "함초롬바탕"
-        _set_eastasia_font(r._element.get_or_add_rPr())
-        if bold:
-            r.bold = True
-        if size:
-            r.font.size = size
-        if color:
-            r.font.color.rgb = color
-        return p
-
-    def add_scene_heading(text):
-        p = doc.add_paragraph(style='씬번호')
-        r = p.add_run(text)
-        r.font.name = "함초롬바탕"
-        _set_eastasia_font(r._element.get_or_add_rPr())
-        return p
-
-    def add_dialogue(char_name, parenthetical, line, continuation=False):
-        if continuation:
-            p = doc.add_paragraph(style='대사연속')
-            paren = f"({parenthetical}) " if parenthetical else ""
-            full = f"\t\t{paren}{line}"
-        else:
-            p = doc.add_paragraph(style='대사')
-            paren = f"({parenthetical}) " if parenthetical else ""
-            full = f"{char_name}\t\t{paren}{line}"
-        r = p.add_run(full)
-        r.font.name = "함초롬바탕"
-        _set_eastasia_font(r._element.get_or_add_rPr())
-        return p
-
-    def add_action(text):
-        p = doc.add_paragraph(style='지문')
-        r = p.add_run(text)
-        r.font.name = "함초롬바탕"
-        _set_eastasia_font(r._element.get_or_add_rPr())
-        return p
-
-    # ── 커버 페이지 ──
-    for _ in range(6):
-        doc.add_paragraph("")
-    add_text("시나리오 (수정본)", size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
-    doc.add_paragraph("")
-    proj_title = title or f"<{genre}>"
-    add_text(proj_title, bold=True, size=Pt(24), align=WD_ALIGN_PARAGRAPH.CENTER)
-    doc.add_paragraph("")
-    doc.add_paragraph("")
-    add_text("기획/제작 | 블루진픽처스", size=Pt(10),
-             align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x8E, 0x8E, 0x99))
-    rr = revise_result.get("revision_result", {})
-    scenes = rr.get("revised_scenes", [])
-    add_text(f"Revise Engine v2.2  ·  {len(scenes)}개 씬 수정",
-             size=Pt(9), align=WD_ALIGN_PARAGRAPH.CENTER,
-             color=RGBColor(0x8E, 0x8E, 0x99))
-    doc.add_page_break()
-
-    # ── 면책 자막 (실화/팩션·퓨전) ──
-    _need_disclaimer = fact_based or (
-        historical and ("팩션" in (historical_type or "") or "퓨전" in (historical_type or ""))
-    )
-    if _need_disclaimer:
-        for _ in range(10):
-            doc.add_paragraph("")
-        add_text("본 작품에 등장하는 인물, 단체, 지명, 상호, 사건은",
-                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
-        add_text("모두 허구이며, 실존하는 것과 관련이 있더라도",
-                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
-        add_text("극적 구성을 위해 각색되었습니다.",
-                 size=Pt(11), align=WD_ALIGN_PARAGRAPH.CENTER)
-        doc.add_page_break()
-
-    # ─────────────────────────────────────────────────────────
-    # 본문 파싱: 원본 + 수정본을 통합한 "최종 시나리오" 생성
-    # ─────────────────────────────────────────────────────────
-    # 1) 원본 시나리오를 씬 단위로 분할
-    # 2) 수정 대상 씬은 revised_content로 교체
-    # 3) ADD 타입은 insert_position에 따라 삽입
-    # 4) DELETE 타입은 제거
-    #
-    # 결과: 시나리오 처음부터 끝까지 자연스럽게 흐르는 통합본
-    # ─────────────────────────────────────────────────────────
-
-    import re as _re
-
-    # 씬 헤딩 패턴 (Writer Engine과 동일)
-    heading_re = _re.compile(r'^S?#?\d*\.?\s*(INT\.|EXT\.|INT\./EXT\.)\s*(.+)', _re.IGNORECASE)
-
-
-    def _merge_header_content(header: str, content: str) -> str:
-        """헤더와 본문이 중복되지 않도록 합친다.
-        본문 첫 줄에 이미 헤더 핵심부(S#번호 또는 INT./EXT.)가 있으면 헤더 생략."""
-        if not content.strip():
-            return header
-        first_line = content.strip().split('\n')[0].strip()
-        # S#번호 추출
-        import re as _re_inner
-        h_num = _re_inner.search(r'S#\d+', header or "")
-        c_num = _re_inner.search(r'S#\d+', first_line)
-        if h_num and c_num and h_num.group() == c_num.group():
-            return content  # 본문이 이미 헤더 포함
-        # INT./EXT. 매칭
-        if _re_inner.match(r'^(INT\.|EXT\.)', first_line, _re_inner.IGNORECASE):
-            # 첫 줄이 씬 헤더 형태 → 본문 그대로
-            return content
-        return f"{header}\n{content}"
-
-    def split_into_scenes(text: str):
-        """원본 텍스트를 [(scene_id, scene_body), ...] 리스트로 분할."""
-        if not text:
-            return []
-        lines = text.split('\n')
-        scenes_list = []
-        current_id = ""
-        current_body = []
-
-        for line in lines:
-            stripped = line.strip()
-            # S#숫자 또는 INT./EXT. 패턴이 씬 헤딩
-            if heading_re.match(stripped) or _re.match(r'^S#\d+', stripped):
-                # 이전 씬 저장
-                if current_id or current_body:
-                    scenes_list.append((current_id, '\n'.join(current_body)))
-                # 새 씬 시작
-                current_id = stripped
-                current_body = [line]
-            else:
-                current_body.append(line)
-
-        # 마지막 씬
-        if current_id or current_body:
-            scenes_list.append((current_id, '\n'.join(current_body)))
-
-        return scenes_list
-
-    def extract_scene_number(scene_id_str: str) -> str:
-        """씬 식별자에서 'S#숫자' 패턴만 추출 (매칭용)."""
-        m = _re.search(r'S#(\d+)', scene_id_str)
-        return f"S#{m.group(1)}" if m else scene_id_str.strip()[:20]
-
-    # 수정본 씬을 scene_number로 인덱싱
-    revised_by_id = {}     # {"S#1": revised_content}
-    deleted_ids = set()    # {"S#5", ...}
-    add_after = {}         # {"S#42": [{header, content}, ...]}  ADD 타입
-
-    for sc in scenes:
-        sid = sc.get("scene_id", "")
-        s_type = sc.get("type", "REWRITE")
-        s_header = sc.get("scene_header", sid)
-        s_content = sc.get("revised_content", "")
-        s_num = extract_scene_number(sid)
-
-        if s_type == "DELETE":
-            deleted_ids.add(s_num)
-        elif s_type == "ADD":
-            insert_after = sc.get("insert_position", "") or sid
-            insert_num = extract_scene_number(insert_after)
-            if insert_num not in add_after:
-                add_after[insert_num] = []
-            # ADD 씬은 헤더가 본문에 없을 수 있으니 합쳐서
-            full_text = _merge_header_content(s_header, s_content)
-            add_after[insert_num].append(full_text)
-        else:
-            # REWRITE / MERGE / SPLIT: 단순 교체
-            full_text = _merge_header_content(s_header, s_content)
-            revised_by_id[s_num] = full_text
-
-    # 원본을 씬 단위로 분할 후 통합 시나리오 구성
-    final_scenes = []
-    if original_text:
-        original_scenes = split_into_scenes(original_text)
-        for orig_id, orig_body in original_scenes:
-            orig_num = extract_scene_number(orig_id)
-            if orig_num in deleted_ids:
-                continue  # 삭제
-            if orig_num in revised_by_id:
-                final_scenes.append(revised_by_id[orig_num])  # 교체
-            else:
-                final_scenes.append(orig_body)  # 원본 유지
-            # ADD 처리
-            if orig_num in add_after:
-                for added in add_after[orig_num]:
-                    final_scenes.append(added)
-    else:
-        # 원본이 없으면 수정본만 출력 (배치 부분만)
-        for sc in scenes:
-            s_type = sc.get("type", "REWRITE")
-            if s_type == "DELETE":
-                continue
-            s_header = sc.get("scene_header", "")
-            s_content = sc.get("revised_content", "")
-            full_text = _merge_header_content(s_header, s_content)
-            final_scenes.append(full_text)
-
-    full_text = '\n\n'.join(final_scenes)
-
-    # ─────────────────────────────────────────────────────────
-    # 본문 라인 단위 파싱 (Writer Engine 동일 로직)
-    # ─────────────────────────────────────────────────────────
-    char_re = _re.compile(
-        r'^\s{2,}([가-힣a-zA-Z\s]{1,15}?)\s*'
-        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*$',
-        _re.IGNORECASE
-    )
-    inline_dialogue_re = _re.compile(
-        r'^([가-힣a-zA-Z\s]{1,15}?)\s*'
-        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*'
-        r'\t{1,}\s*(?:\(([^)]*)\)\s*)?(.+)',
-        _re.IGNORECASE
-    )
-    paren_re = _re.compile(r'^\s{2,}\((.+?)\)\s*$')
-
-    # 문자열 그대로의 \n이 들어온 경우(JSON 이스케이프 잔존) 안전 처리
-    full_text = full_text.replace('\\n', '\n').replace('\\t', '\t')
-
-    # ═══════════════════════════════════════════════════════════
-    # 대사 형식 붕괴 자동 복구 (Writer Engine v3.4 이식)
-    # 버그: 긴 컨텍스트에서 AI가 대사 포맷 규칙을 잊고
-    #       "캐릭터\n\n대사" 형식으로 출력
-    # 복구: "캐릭터" 단독 라인 + 빈 라인 + 대사 라인 → "캐릭터\t\t대사"
-    # ═══════════════════════════════════════════════════════════
-    _CHAR_NAMES = {
-        '유진', '진호', '세웅', '다은', '강회장', '민준', '박지영', '오현수',
-        '이진호', '반세웅', '김사장', '비서', '편집자', '기사', '배달 기사',
-        '사장', '민준 엄마', '박씨', '엄마', '아빠', '형', '누나', '아들', '딸',
-        '김 여사', '지우', '여름', '최여름', '안경 아이', '동생', '아내',
-        '집배원', '중개인', '최상진', '조민준', '강유진',
-    }
-    _broken_lines = full_text.split("\n")
-    _fixed_lines = []
-    _j = 0
-    while _j < len(_broken_lines):
-        _cur = _broken_lines[_j].strip()
-        # 패턴 A: "캐릭터명" 단독 + 빈줄 + 대사 → "캐릭터\t\t대사"
-        if (_cur in _CHAR_NAMES and
-            _j + 2 < len(_broken_lines) and
-            _broken_lines[_j + 1].strip() == "" and
-            _broken_lines[_j + 2].strip() and
-            not _broken_lines[_j + 2].strip().startswith("S#") and
-            _broken_lines[_j + 2].strip() not in _CHAR_NAMES):
-            _next_content = _broken_lines[_j + 2].strip()
-            # 괄호 지시(예: "(잠깐 생각하고)")가 있으면 다음 줄이 진짜 대사
-            if _next_content.startswith("(") and _next_content.endswith(")") and \
-               _j + 4 < len(_broken_lines) and _broken_lines[_j + 3].strip() == "" and \
-               _broken_lines[_j + 4].strip():
-                _fixed_lines.append(f"{_cur}\t\t{_next_content} {_broken_lines[_j + 4].strip()}")
-                _j += 5
-                continue
-            _fixed_lines.append(f"{_cur}\t\t{_next_content}")
-            _j += 3
-            continue
-        _fixed_lines.append(_broken_lines[_j])
-        _j += 1
-    lines = _fixed_lines
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if not stripped:
-            i += 1
-            continue
-
-        # 마크다운 강조 기호 제거 (** ** 등)
-        if stripped.startswith('**') and stripped.endswith('**'):
-            stripped = stripped[2:-2].strip()
-            line = stripped
-
-        # 메타 라인 차단 (간단 버전 — 메타 마커가 들어오면 스킵)
-        if stripped.startswith('▸') or stripped.startswith('━━━'):
-            i += 1
-            continue
-        if '내부 메모' in stripped or 'WRITER_NOTES' in stripped:
-            i += 1
-            continue
-
-        # 씬 헤딩
-        m = heading_re.match(stripped)
-        if m or _re.match(r'^S#\d+', stripped):
-            add_scene_heading(stripped)
-            i += 1
-            continue
-
-        # 인라인 대사
-        im = inline_dialogue_re.match(stripped)
-        if im:
-            char_name = im.group(1).strip()
-            vo_marker = im.group(2) or ""
-            inline_paren = im.group(3) or ""
-            inline_text = im.group(4).strip()
-            if vo_marker:
-                char_name = f"{char_name} ({vo_marker})"
-            add_dialogue(char_name, inline_paren, inline_text)
-            i += 1
-            continue
-
-        # 들여쓰기 캐릭터명 + 대사
-        cm = char_re.match(line)
-        if cm:
-            char_name = cm.group(1).strip()
-            vo_marker = cm.group(2) or ""
-            if vo_marker:
-                char_name = f"{char_name} ({vo_marker})"
-            parenthetical = ""
-            dialogue_lines = []
-            i += 1
-            if i < len(lines):
-                pm = paren_re.match(lines[i])
-                if pm:
-                    parenthetical = pm.group(1)
-                    i += 1
-            while i < len(lines):
-                dl = lines[i]
-                ds = dl.strip()
-                if not ds:
-                    break
-                if heading_re.match(ds) or _re.match(r'^S#\d+', ds):
-                    break
-                if char_re.match(dl):
-                    break
-                if inline_dialogue_re.match(ds):
-                    break
-                dialogue_lines.append(ds)
-                i += 1
-            if dialogue_lines:
-                merged = " ".join(dialogue_lines)
-                add_dialogue(char_name, parenthetical, merged)
-            continue
-
-        # 그 외: 지문
-        add_action(stripped)
-        i += 1
-
-    # ── 바이트 반환 ──
-    buf = BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
-    """Stage 3 검증 보고서 DOCX."""
-    doc = Document()
-
-    section = doc.sections[0]
-    section.top_margin = Cm(2.5)
-    section.bottom_margin = Cm(2.5)
-    section.left_margin = Cm(2.5)
-    section.right_margin = Cm(2.5)
-
-    # ── 표지 ──
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("BLUE JEANS PICTURES · REVISE ENGINE")
-    _set_font(r, size_pt=9, bold=True, color=(255, 203, 5))
-
-    doc.add_paragraph()
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(title if title else "검증 보고서")
-    _set_font(r, size_pt=20, bold=True, color=(25, 25, 112))
-
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("Verification Report")
-    _set_font(r, size_pt=11, color=(142, 142, 153))
-
-    doc.add_paragraph()
-
-    vr = verify_result.get("verify_report", {})
-
-    # ── 종합 판정 ──
-    verdict = vr.get("overall_verdict", "")
-    score = vr.get("overall_score", "")
-    reason = vr.get("verdict_reason", "")
-
-    verdict_color = (46, 196, 132) if verdict == "APPROVED" else \
-                    (255, 203, 5) if verdict == "NEEDS_REVISION" else \
-                    (225, 68, 68)
-
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(f"[ {verdict} ]")
-    _set_font(r, size_pt=16, bold=True, color=verdict_color)
-
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(f"종합 점수: {score} / 10.0")
-    _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-
-    if reason:
-        doc.add_paragraph()
-        p = doc.add_paragraph()
-        r = p.add_run(reason)
-        _set_font(r, size_pt=10.5)
-
-    doc.add_paragraph()
-
-    # ── 4축 검증 ──
-    def section_score(title_text, key):
-        block = vr.get(key, {})
-        sc = block.get("score", "")
-        p = doc.add_paragraph()
-        r = p.add_run(f"■ {title_text}  —  {sc}/10")
-        _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-        return block
-
-    # 1. 지시사항 반영도
-    block = section_score("1. 지시사항 반영도 (Instruction Compliance)", "instruction_compliance")
-    for item in block.get("items", []):
-        status = item.get("status", "")
-        inst = item.get("instruction_item", "")
-        ev = item.get("evidence", "")
-        mark = "✓" if status == "Y" else ("△" if status == "Partial" else "✗")
-        p = doc.add_paragraph()
-        r = p.add_run(f"  {mark} [{status}] {inst}")
-        color = (46, 196, 132) if status == "Y" else (255, 140, 0) if status == "Partial" else (225, 68, 68)
-        _set_font(r, size_pt=10, bold=True, color=color)
-        if ev:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Cm(0.8)
-            r = p.add_run(f"    → {ev}")
-            _set_font(r, size_pt=9.5, color=(80, 80, 90))
-
-    doc.add_paragraph()
-
-    # 2. LOCKED 보존도
-    block = section_score("2. LOCKED 보존도 (Locked Preservation)", "locked_preservation")
-    for item in block.get("items", []):
-        status = item.get("status", "")
-        locked_item = item.get("locked_item", "")
-        ev = item.get("evidence", "")
-        mark = "✓" if status == "Preserved" else ("—" if status == "N/A" else "✗")
-        p = doc.add_paragraph()
-        r = p.add_run(f"  {mark} [{status}] {locked_item}")
-        color = (46, 196, 132) if status == "Preserved" else (142, 142, 153) if status == "N/A" else (225, 68, 68)
-        _set_font(r, size_pt=10, bold=True, color=color)
-        if ev:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Cm(0.8)
-            r = p.add_run(f"    → {ev}")
-            _set_font(r, size_pt=9.5, color=(80, 80, 90))
-
-    doc.add_paragraph()
-
-    # 3. AI ESCAPE
-    block = section_score("3. AI SCREENPLAY ESCAPE 준수도", "ai_escape_check")
-    clean = block.get("clean_patterns", "")
-    if clean:
-        p = doc.add_paragraph()
-        r = p.add_run(f"  ✓ 위반 없는 패턴: {clean} / 20")
-        _set_font(r, size_pt=10, color=(46, 196, 132))
-    violations = block.get("violations", [])
-    if violations:
-        for v in violations:
-            pid = v.get("pattern_id", "")
-            pname = v.get("pattern_name", "")
-            scene = v.get("scene_id", "")
-            quote = v.get("quote", "")
-            sev = v.get("severity", "")
-            sev_color = (225, 68, 68) if sev == "High" else (255, 140, 0) if sev == "Medium" else (142, 142, 153)
-            p = doc.add_paragraph()
-            r = p.add_run(f"  ✗ [{pid}] {pname} — {scene} ({sev})")
-            _set_font(r, size_pt=10, bold=True, color=sev_color)
-            if quote:
-                p = doc.add_paragraph()
-                p.paragraph_format.left_indent = Cm(0.8)
-                r = p.add_run(f'    → "{quote}"')
-                _set_font(r, size_pt=9.5, color=(80, 80, 90))
-    else:
-        p = doc.add_paragraph()
-        r = p.add_run("  위반 사항 없음.")
-        _set_font(r, size_pt=10, color=(46, 196, 132))
-
-    doc.add_paragraph()
-
-    # 4. 장르 준수도
-    block = section_score("4. 장르 RULE PACK 준수도", "genre_compliance")
-    p = doc.add_paragraph()
-    r = p.add_run("  [Must Have]")
-    _set_font(r, size_pt=10.5, bold=True, color=(25, 25, 112))
-    for item in block.get("must_have_check", []):
-        st_val = item.get("status", "")
-        it = item.get("item", "")
-        nt = item.get("note", "")
-        mark = "✓" if st_val == "Met" else ("△" if st_val == "Partial" else "✗")
-        color = (46, 196, 132) if st_val == "Met" else (255, 140, 0) if st_val == "Partial" else (225, 68, 68)
-        p = doc.add_paragraph()
-        r = p.add_run(f"    {mark} [{st_val}] {it}  —  {nt}")
-        _set_font(r, size_pt=9.5, color=color)
-
-    p = doc.add_paragraph()
-    r = p.add_run("  [Fails to Avoid]")
-    _set_font(r, size_pt=10.5, bold=True, color=(25, 25, 112))
-    for item in block.get("fails_check", []):
-        st_val = item.get("status", "")
-        it = item.get("item", "")
-        nt = item.get("note", "")
-        mark = "✓" if st_val == "Avoided" else ("△" if st_val == "Improved" else "✗")
-        color = (46, 196, 132) if st_val == "Avoided" else (255, 140, 0) if st_val == "Improved" else (225, 68, 68)
-        p = doc.add_paragraph()
-        r = p.add_run(f"    {mark} [{st_val}] {it}  —  {nt}")
-        _set_font(r, size_pt=9.5, color=color)
-
-    doc.add_paragraph()
-
-    # ── 주요 변화 ──
-    highlights = vr.get("side_by_side_highlights", [])
-    if highlights:
-        p = doc.add_paragraph()
-        r = p.add_run("■ 핵심 변화 요약")
-        _set_font(r, size_pt=13, bold=True, color=(25, 25, 112))
-        for h in highlights:
-            sid = h.get("scene_id", "")
-            kc = h.get("key_change", "")
-            imp = h.get("improvement_note", "")
-            p = doc.add_paragraph()
-            r = p.add_run(f"  • {sid}: {kc}")
-            _set_font(r, size_pt=10, bold=True)
-            if imp:
-                p = doc.add_paragraph()
-                p.paragraph_format.left_indent = Cm(0.8)
-                r = p.add_run(f"    {imp}")
-                _set_font(r, size_pt=9.5, color=(80, 80, 90))
-
-    # ── 재수정 권고 ──
-    recs = vr.get("recommendations", [])
-    if recs:
-        doc.add_paragraph()
-        p = doc.add_paragraph()
-        r = p.add_run("■ 재수정 권고")
-        _set_font(r, size_pt=13, bold=True, color=(225, 68, 68))
-        for rec in recs:
-            p = doc.add_paragraph()
-            r = p.add_run(f"  • {rec}")
-            _set_font(r, size_pt=10)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-# =================================================================
-# [6] Stage 실행 함수
-# =================================================================
-def run_v2_pre_analyses(client) -> dict:
-    """v2.0/v2.1 자동 분석을 실행하고 결과를 세션에 저장.
-
-    실행 항목 (각각 독립적으로 캐시 체크):
-    1. 톤 DNA 추출 (tone_ref_text 있고 캐시 없을 때)
-    2. Diff 학습 (After 있고 캐시 없을 때)
-    3. 분포 진단 (항상 실행, 캐시 없을 때)
-    4. Rewrite 메타 흡수 (rewrite_json_text 있고 캐시 없을 때)
-    5. 장르 DNA 추출 (genre_ref_texts 있고 캐시 없을 때) [v2.1]
-
-    각 항목은 독립적으로 캐시되므로, 일부만 추가 업로드해도 정확히 그 부분만 재추출됨.
-
-    Returns:
-        {tone_dna, diff_analysis, distribution_diagnostic, rewrite_metadata, genre_dna}
-    """
-    results = {
-        "tone_dna": st.session_state.tone_dna,
-        "diff_analysis": st.session_state.diff_analysis,
-        "distribution_diagnostic": st.session_state.distribution_diagnostic,
-        "rewrite_metadata": st.session_state.rewrite_metadata,
-        "genre_dna": st.session_state.genre_dna,
+        genre_str = str(genre_raw)
+    genre_str = genre_str.lower()
+
+    # 장르별 Picsum 이미지 ID (영화적 분위기 큐레이션)
+    # https://picsum.photos/id/{id}/400/200 형태
+    genre_ids = {
+        'romance':  [1024, 488, 429, 543, 718],   # 따뜻한 색감, 커플, 자연
+        'action':   [1036, 373, 412, 365, 307],   # 어둡고 강렬한
+        'comedy':   [1082, 247, 669, 835, 593],   # 밝고 경쾌한
+        'horror':   [1067, 167, 202, 239, 376],   # 어둡고 미스터리
+        'fantasy':  [1019, 325, 462, 533, 672],   # 환상적, 하늘
+        'family':   [1060, 219, 342, 491, 610],   # 따뜻한 가족
+        'crime':    [1043, 110, 164, 288, 395],   # 도시, 밤
+        'history':  [1029, 145, 271, 390, 508],   # 고전적
+        'drama':    [1062, 232, 366, 487, 614],   # 감성적
     }
 
-    # 1. 톤 DNA 추출 (캐시 없을 때만)
-    if (st.session_state.tone_ref_text and st.session_state.tone_ref_text.strip()
-            and not st.session_state.tone_dna):
-        with st.spinner("📐 톤 DNA 자동 추출 중... (Sonnet 4.6)"):
-            prompt_text = build_tone_dna_extraction_prompt(st.session_state.tone_ref_text)
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
-            if raw:
-                tone_dna = parse_json(raw)
-                if tone_dna:
-                    results["tone_dna"] = tone_dna
-                    st.session_state.tone_dna = tone_dna
-                    summary = tone_dna.get("tone_dna", {}).get("summary", "톤 추출 완료")
-                    st.success(f"✅ 톤 DNA 추출 완료: {summary[:120]}")
-
-    # 2. Diff 학습 (Before는 옵션에 따라 main 시나리오 또는 별도 업로드)
-    diff_before = ""
-    diff_after = st.session_state.diff_refined_text.strip() if st.session_state.diff_refined_text else ""
-    if diff_after:
-        if st.session_state.diff_use_main_as_before:
-            diff_before = st.session_state.raw_text.strip() if st.session_state.raw_text else ""
-        else:
-            diff_before = st.session_state.diff_orig_text.strip() if st.session_state.diff_orig_text else ""
-
-    if diff_before and diff_after:
-        with st.spinner("🔬 작가 편집 패턴 학습 중... (Sonnet 4.6)"):
-            prompt_text = build_diff_analysis_prompt(diff_before, diff_after)
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
-            if raw:
-                diff = parse_json(raw)
-                if diff:
-                    results["diff_analysis"] = diff
-                    st.session_state.diff_analysis = diff
-                    summary = diff.get("diff_analysis", {}).get("summary", "편집 패턴 학습 완료")
-                    st.success(f"✅ Diff 학습 완료: {summary[:120]}")
-
-    # 3. 분포 진단 (전체 각색 모드에서만 실행 — 구간 모드는 보호 영역이 이미 OK라 불필요)
-    if (not st.session_state.section_mode
-            and not st.session_state.distribution_diagnostic):
-        with st.spinner("📊 장르 메트릭 + 캐릭터 분포 진단 중... (Sonnet 4.6)"):
-            prompt_text = build_distribution_diagnostic_prompt(
-                st.session_state.raw_text,
-                st.session_state.genre
-            )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
-            if raw:
-                dist = parse_json(raw)
-                if dist:
-                    results["distribution_diagnostic"] = dist
-                    st.session_state.distribution_diagnostic = dist
-                    summary = dist.get("distribution_diagnostic", {}).get("summary", "분포 진단 완료")
-                    upgrades = dist.get("distribution_diagnostic", {}).get("auto_priority_upgrades", [])
-                    st.success(f"✅ 분포 진단 완료: {summary[:100]}  (자동 격상 {len(upgrades)}개)")
-
-    # 4. Rewrite 메타 흡수
-    if st.session_state.rewrite_json_text and st.session_state.rewrite_json_text.strip():
-        meta = absorb_rewrite_engine_metadata(st.session_state.rewrite_json_text)
-        if meta and any([
-            meta.get("preserve_notes_by_seq"),
-            meta.get("weak_zone_scenes"),
-            meta.get("auto_priority_high"),
-        ]):
-            results["rewrite_metadata"] = meta
-            st.session_state.rewrite_metadata = meta
-            preserve_count = len(meta.get("preserve_notes_by_seq", {}))
-            weak_count = len(meta.get("weak_zone_scenes", []))
-            st.success(f"✅ Rewrite 메타 흡수: preserve_notes {preserve_count}개, weak_zones {weak_count}개")
-
-    # 5. 장르 DNA 추출 (v2.1)
-    if st.session_state.genre_ref_texts and any(t.strip() for t in st.session_state.genre_ref_texts):
-        ref_count = len(st.session_state.genre_ref_texts)
-        with st.spinner(f"🎬 장르 DNA 추출 중... 참고작 {ref_count}편 분석 (Sonnet 4.6)"):
-            prompt_text = build_genre_dna_extraction_prompt(
-                st.session_state.genre_ref_texts,
-                st.session_state.genre
-            )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
-            if raw:
-                gd = parse_json(raw)
-                if gd:
-                    results["genre_dna"] = gd
-                    st.session_state.genre_dna = gd
-                    summary = gd.get("genre_dna", {}).get("summary", "장르 DNA 추출 완료")
-                    st.success(f"✅ 장르 DNA 추출 완료: {summary[:120]}")
-
-    # 6. 구간 자동 감지 (v2.2 — step1 가벼운 호출 + 코드 계산)
-    if (st.session_state.section_mode
-            and st.session_state.section_input_method in ("auto", "hybrid")
-            and st.session_state.diff_refined_text
-            and not st.session_state.section_detection):
-        with st.spinner("🔍 구간 자동 감지 (1단계: 새로 쓴 부분 식별)..."):
-            prompt_text = build_section_detect_step1_prompt(
-                refined_text=st.session_state.diff_refined_text,
-                original_text=st.session_state.raw_text,
-            )
-            # step1은 출력이 매우 짧음 — 2000 토큰이면 충분
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=2000)
-            if raw:
-                step1 = parse_json(raw)
-                if step1:
-                    # 코드로 protected/revision 범위 자동 계산 (API 호출 불필요)
-                    derived = derive_section_ranges_from_step1(
-                        step1_result=step1,
-                        refined_text=st.session_state.diff_refined_text,
-                        original_text=st.session_state.raw_text,
-                    )
-                    rec_prot = derived.get("protected_ranges", [])
-                    rec_rev = derived.get("revision_ranges", [])
-
-                    # 캐시에 저장 (구버전 형식과 호환)
-                    st.session_state.section_detection = {
-                        "section_detection": {
-                            "summary": derived.get("continuation_point", {}).get("explanation", ""),
-                            "continuation_point": derived.get("continuation_point", {}),
-                            "recommended_protected_range": rec_prot,
-                            "recommended_revision_range": rec_rev,
-                        }
-                    }
-
-                    # auto + hybrid 모두 자동 적용
-                    if st.session_state.section_input_method in ("auto", "hybrid"):
-                        if rec_prot and not st.session_state.protected_ranges:
-                            st.session_state.protected_ranges = rec_prot
-                        if rec_rev and not st.session_state.revision_ranges:
-                            st.session_state.revision_ranges = rec_rev
-
-                    cp = derived.get("continuation_point", {})
-                    if cp.get("detected") == "true":
-                        prot_str_log = ", ".join(
-                            f"{r.get('from','')}~{r.get('to','')}" for r in rec_prot
-                        )
-                        rev_str_log = ", ".join(
-                            f"{r.get('from','')}~{r.get('to','')}" for r in rec_rev
-                        )
-                        st.success(
-                            f"✅ **이어쓰기 시작점 감지 완료**\n\n"
-                            f"🔒 보호 구간: `{prot_str_log}`\n\n"
-                            f"✏️ 재집필 구간: `{rev_str_log}`\n\n"
-                            f"→ {cp.get('explanation', '')[:200]}"
-                        )
-                    else:
-                        st.warning(
-                            "⚠️ 자동 감지 결과가 명확하지 않습니다. "
-                            "**부분 수정 모드 + 직접 지정**으로 재집필 구간을 입력하세요."
-                        )
-
-    # 7. 연쇄 영향 분석 (v2.2 — 보호/재집필 영역 모두 있을 때)
-    if (st.session_state.section_mode
-            and st.session_state.protected_ranges
-            and st.session_state.revision_ranges
-            and not st.session_state.cascade_analysis):
-        with st.spinner("🔬 연쇄 영향 분석 중... 보호 구간과의 모순 점검 (Sonnet 4.6)"):
-            prompt_text = build_cascade_analysis_prompt(
-                revision_ranges=st.session_state.revision_ranges,
-                protected_ranges=st.session_state.protected_ranges,
-                raw_text=st.session_state.raw_text,
-            )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
-            if raw:
-                ca = parse_json(raw)
-                if ca:
-                    st.session_state.cascade_analysis = ca
-                    summary = ca.get("cascade_analysis", {}).get("summary", "연쇄 분석 완료")
-                    must_preserve_count = len(ca.get("cascade_analysis", {}).get("must_preserve", []))
-                    conflict_count = len(ca.get("cascade_analysis", {}).get("potential_conflicts", []))
-                    st.success(
-                        f"✅ 연쇄 영향 분석 완료: 보존 요소 {must_preserve_count}개 / 잠재 모순 {conflict_count}개"
-                    )
-
-    # 8. 경계 매끄러움 정보 자동 계산 (v2.2)
-    if (st.session_state.section_mode
-            and st.session_state.protected_ranges
-            and st.session_state.revision_ranges
-            and not st.session_state.boundary_info):
-        boundary = build_boundary_smoothness_block(
-            protected_ranges=st.session_state.protected_ranges,
-            revision_ranges=st.session_state.revision_ranges,
-            raw_text=st.session_state.raw_text,
-        )
-        if boundary:
-            st.session_state.boundary_info = boundary
-
-    return results
-
-
-def _build_auto_diagnose_for_section_mode() -> dict:
-    """구간 모드일 때 Stage 1 진단을 코드로 자동 생성.
-
-    이어쓰기/부분수정에서는 어디를 다시 쓸지 이미 정해졌으므로,
-    AI에게 진단 시키는 대신 코드로 즉시 revision_plan을 만든다.
-    토큰 절약 + 잘림 방지 + 즉시 응답.
-    """
-    import re as _re
-
-    revision_ranges = st.session_state.revision_ranges or []
-    protected_ranges = st.session_state.protected_ranges or []
-
-    # 재집필 구간 안의 모든 씬을 target_scenes로 자동 등록
-    target_scenes = []
-    raw = st.session_state.raw_text or ""
-
-    # 원본에서 모든 씬 헤더 + 헤더 텍스트 추출
-    scene_pattern = _re.compile(r'^\s*\*?\*?S#?(\d+)[\.\s]([^\n]*)', _re.MULTILINE)
-    all_scenes = {int(m.group(1)): m.group(2).strip() for m in scene_pattern.finditer(raw)}
-
-    for rev_range in revision_ranges:
-        from_str = rev_range.get("from", "")
-        to_str = rev_range.get("to", "")
-        from_num = int(_re.search(r'\d+', from_str).group()) if from_str else 0
-        to_num = int(_re.search(r'\d+', to_str).group()) if to_str else 0
-
-        for scene_num in range(from_num, to_num + 1):
-            if scene_num in all_scenes:
-                target_scenes.append({
-                    "scene_id": f"S#{scene_num}",
-                    "header": f"S#{scene_num}. {all_scenes[scene_num][:80]}",
-                    "priority": "HIGH",
-                    "type": "REWRITE",
-                    "what_to_change": [
-                        "보호 구간의 톤·스타일을 그대로 따라 다시 쓴다",
-                        "원본 씬의 핵심 사건·인물·장소는 유지",
-                        "대사·지문은 작가 톤(절제된 현재형 단문, 미시 시간 표기)으로 재작성"
-                    ],
-                    "preservation_notes": [
-                        "원본 씬의 이벤트·정보 누락 금지",
-                        "캐릭터 정체성·관계 변경 금지"
-                    ],
-                })
-
-    # LOCKED 인식 (입력값 그대로)
-    locked_text = (st.session_state.locked or "").strip()
-    locked_recognition = []
-    if locked_text:
-        # LOCKED 텍스트를 줄 단위로 분리해 인식 항목으로
-        for line in locked_text.split("\n"):
-            line = line.strip()
-            if line:
-                locked_recognition.append({
-                    "category": "사용자 명시",
-                    "item": line,
-                    "scope": "전체"
-                })
-
-    # 자동 생성된 진단 결과
-    prot_str = ", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in protected_ranges)
-    rev_str = ", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in revision_ranges)
-
-    work_mode = st.session_state.work_mode or "continuation"
-    if work_mode == "continuation":
-        summary = (
-            f"이어쓰기 모드 — 작가가 직접 손본 보호 구간({prot_str})의 톤·스타일을 학습하여, "
-            f"재집필 구간({rev_str})을 같은 결로 다시 쓴다. "
-            f"보호 구간은 한 글자도 건드리지 않으며, 재집필 구간의 모든 씬은 priority HIGH로 처리된다. "
-            f"원본의 핵심 사건은 유지하되, 표현은 작가의 절제된 현재형 단문 + 미시 시간 표기 스타일로 재작성한다."
-        )
-    else:
-        summary = (
-            f"부분 수정 모드 — 사용자가 지정한 구간({rev_str})만 재집필한다. "
-            f"나머지 구간({prot_str})은 보호되어 변경되지 않는다. "
-            f"재집필 시 인접한 보호 구간과 자연스럽게 이어지도록 경계 조건을 따른다."
-        )
-
-    return {
-        "revision_plan": {
-            "summary": summary,
-            "estimated_scene_count": len(target_scenes),
-            "confidence": 9,
-            "auto_generated": True,
-            "auto_generation_reason": "구간 모드에서는 진단 대신 자동 플랜 생성 (토큰 절약·즉시 응답)",
-            "locked_recognition": locked_recognition,
-            "locked_conflicts": [],
-            "target_scenes": target_scenes,
-            "out_of_scope": [],
-            "section_mode_info": {
-                "mode": work_mode,
-                "protected_ranges": protected_ranges,
-                "revision_ranges": revision_ranges,
-            }
-        }
-    }
-
-
-def _build_auto_diagnose_from_rewrite_metadata(rewrite_metadata: dict) -> dict:
-    """Rewrite Engine JSON 메타데이터로부터 Stage 1 진단을 코드로 자동 생성.
-
-    REWRITE 제안 6개 + ADD 제안 4개 + MOON 의견을 받아
-    AI 호출 없이 즉시 revision_plan을 완성한다.
-
-    토큰 절감 + 잘림 방지 + 즉시 응답.
-    """
-    import re as _re
-
-    target_scenes = []
-    raw = st.session_state.raw_text or ""
-
-    # 원본 시나리오에서 모든 씬 헤더 추출 (insert_after 검증용)
-    scene_pattern = _re.compile(r'^\s*\*?\*?S#?(\d+)[\.\s]([^\n]*)', _re.MULTILINE)
-    all_scenes = {int(m.group(1)): m.group(2).strip() for m in scene_pattern.finditer(raw)}
-
-    # ── 1. REWRITE 제안 → priority HIGH로 자동 등록 ──
-    rewrite_suggestions = rewrite_metadata.get("rewrite_suggestions", [])
-    for item in rewrite_suggestions:
-        scene_id = item.get("scene_id", "")
-        what = item.get("what_to_change", "")
-        why = item.get("why", "")
-
-        # scene_id에서 숫자 추출
-        m = _re.search(r'\d+', scene_id)
-        if not m:
-            continue
-        scene_num = int(m.group())
-        header = f"S#{scene_num}. {all_scenes.get(scene_num, '')[:80]}"
-
-        target_scenes.append({
-            "scene_id": f"S#{scene_num}",
-            "header": header,
-            "priority": "HIGH",
-            "type": "REWRITE",
-            "what_to_change": [what] if what else ["Rewrite Engine 처방 적용"],
-            "preservation_notes": [
-                "원본 씬의 핵심 사건·인물·장소 유지",
-                "캐릭터 정체성·관계 변경 금지"
-            ],
-            "rewrite_engine_reason": why,
-            "rewrite_engine_source": "rewrite_suggestions",
-        })
-
-    # ── 2. ADD 제안 → type=ADD로 자동 등록 ──
-    add_suggestions = rewrite_metadata.get("add_suggestions", [])
-    add_counter = 0
-    for item in add_suggestions:
-        insert_after = item.get("insert_after", "")
-        scene_type = item.get("type", "추가 시퀀스")
-        content_plan = item.get("content_plan", "")
-        why = item.get("why", "")
-
-        m = _re.search(r'\d+', insert_after)
-        if not m:
-            continue
-        after_num = int(m.group())
-        add_counter += 1
-
-        target_scenes.append({
-            "scene_id": f"(NEW) ADD-{add_counter}",
-            "header": f"(NEW) S#{after_num}-{add_counter} [{scene_type}]",
-            "priority": "HIGH",
-            "type": "ADD",
-            "insert_after": f"S#{after_num}",
-            "what_to_change": [content_plan] if content_plan else [f"{scene_type} 추가"],
-            "preservation_notes": [
-                "기존 씬과 자연스럽게 연결",
-                "보호 구간의 톤·캐릭터 정체성 유지",
-                "헐리우드 작법 표준 시퀀스 구성"
-            ],
-            "context_before": f"S#{after_num} 직후",
-            "context_after": f"S#{after_num + 1}" if (after_num + 1) in all_scenes else "(다음 씬)",
-            "rewrite_engine_reason": why,
-            "rewrite_engine_source": "add_suggestions",
-        })
-
-    # ── 3. weak_zone 시퀀스 → priority HIGH로 추가 등록 ──
-    weak_zones = rewrite_metadata.get("weak_zone_scenes", [])
-    for zone in weak_zones:
-        seq_ref = zone.get("seq_ref", "")
-        m = _re.search(r'\d+', seq_ref)
-        if not m:
-            continue
-        scene_num = int(m.group())
-        # 이미 REWRITE에 있으면 스킵
-        if any(s.get("scene_id") == f"S#{scene_num}" for s in target_scenes):
-            continue
-
-        header = f"S#{scene_num}. {all_scenes.get(scene_num, '')[:80]}"
-        hook = zone.get("hook_suggestion", "")
-        punch = zone.get("punch_suggestion", "")
-
-        target_scenes.append({
-            "scene_id": f"S#{scene_num}",
-            "header": header,
-            "priority": "HIGH",
-            "type": "REWRITE",
-            "what_to_change": [
-                f"훅 강화: {hook[:80]}" if hook else "약점 영역 강화",
-                f"펀치 보강: {punch[:80]}" if punch else "장르 재미 회복"
-            ],
-            "preservation_notes": ["원본 핵심 보존", "캐릭터 일관성 유지"],
-            "rewrite_engine_source": "weak_zones",
-        })
-
-    # ── 4. MOON 의견 → summary에 통합 ──
-    moon_text = rewrite_metadata.get("moon_opinion_text", "")
-    moon_market = rewrite_metadata.get("moon_market_direction", "")
-    moon_genre = rewrite_metadata.get("moon_genre_strengthening", "")
-    moon_unique = rewrite_metadata.get("moon_unique_value", "")
-
-    moon_parts = []
-    if moon_text:
-        moon_parts.append(f"전체 방향: {moon_text}")
-    if moon_market:
-        moon_parts.append(f"시장: {moon_market}")
-    if moon_genre:
-        moon_parts.append(f"장르 강화: {moon_genre}")
-    if moon_unique:
-        moon_parts.append(f"차별성: {moon_unique}")
-    moon_summary = " / ".join(moon_parts) if moon_parts else ""
-
-    # ── 5. LOCKED 인식 ──
-    locked_text = (st.session_state.locked or "").strip()
-    locked_recognition = []
-    if locked_text:
-        for line in locked_text.split("\n"):
-            line = line.strip()
-            if line:
-                locked_recognition.append({
-                    "category": "사용자 명시",
-                    "item": line,
-                    "scope": "전체"
-                })
-
-    # ── 6. summary 생성 ──
-    rewrite_count = len([s for s in target_scenes if s.get("type") == "REWRITE"])
-    add_count = len([s for s in target_scenes if s.get("type") == "ADD"])
-
-    summary = (
-        f"Rewrite Engine 처방 자동 흡수 — REWRITE {rewrite_count}개 씬 수정 + ADD {add_count}개 씬 추가. "
-        f"AI 호출 없이 코드로 진단 즉시 생성. "
-        f"MOON 의견 → 전체 방향에 강제 반영. "
-        f"보호 구간(작가가 손본 부분)은 그대로 유지하며, 위 처방대로 정밀 수정·추가 진행."
-    )
-    if moon_summary:
-        summary += f"\n\n[MOON 처방] {moon_summary}"
-
-    return {
-        "revision_plan": {
-            "summary": summary,
-            "estimated_scene_count": len(target_scenes),
-            "confidence": 9,
-            "auto_generated": True,
-            "auto_generation_reason": "Rewrite Engine JSON 메타데이터로부터 코드로 즉시 생성 (토큰 절약·잘림 방지)",
-            "locked_recognition": locked_recognition,
-            "locked_conflicts": [],
-            "target_scenes": target_scenes,
-            "out_of_scope": [],
-            "moon_directives": {
-                "overall": moon_text,
-                "market": moon_market,
-                "genre": moon_genre,
-                "unique": moon_unique,
-            },
-            "rewrite_engine_absorbed": True,
-        }
-    }
-
-
-def run_diagnose(client):
-    """Stage 1: 진단 + 수정 플랜 생성.
-
-    Fast Path 우선순위:
-    1. 구간 모드(이어쓰기/부분수정) → 코드 자동 생성
-    2. Rewrite JSON 있음 (REWRITE/ADD 제안) → 코드 자동 생성
-    3. 그 외 (순수 전체 각색) → AI 진단
-    """
-
-    # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱)
-    pre_results = run_v2_pre_analyses(client)
-
-    # ★ Fast Path 1 — 구간 모드 (이어쓰기/부분수정)
-    if (st.session_state.section_mode
-            and st.session_state.revision_ranges):
-        st.success("⚡ 구간 모드 — 진단 자동 생성 (AI 호출 없이 즉시 완료)")
-        return _build_auto_diagnose_for_section_mode()
-
-    # ★ Fast Path 2 — Rewrite Engine JSON 흡수 시
-    rewrite_meta = pre_results.get("rewrite_metadata") or st.session_state.rewrite_metadata
-    if rewrite_meta and isinstance(rewrite_meta, dict):
-        has_rewrite = bool(rewrite_meta.get("rewrite_suggestions"))
-        has_add = bool(rewrite_meta.get("add_suggestions"))
-        has_weak = bool(rewrite_meta.get("weak_zone_scenes"))
-        has_moon = bool(rewrite_meta.get("moon_opinion_text"))
-
-        # REWRITE 제안 또는 ADD 제안 또는 weak_zone 중 하나라도 있으면 Fast Path 사용
-        if has_rewrite or has_add or has_weak:
-            r_count = len(rewrite_meta.get("rewrite_suggestions", []))
-            a_count = len(rewrite_meta.get("add_suggestions", []))
-            w_count = len(rewrite_meta.get("weak_zone_scenes", []))
-            st.success(
-                f"⚡ Rewrite Engine 처방 자동 흡수 — 진단 즉시 완료 (AI 호출 없이)\n\n"
-                f"  • REWRITE 제안 {r_count}개 → priority HIGH 자동 등록\n"
-                f"  • ADD 제안 {a_count}개 → type=ADD 자동 등록\n"
-                f"  • weak_zone {w_count}개 → priority HIGH 자동 격상\n"
-                f"  • MOON 의견 {'반영됨' if has_moon else '없음'}"
-            )
-            return _build_auto_diagnose_from_rewrite_metadata(rewrite_meta)
-
-    # ★ Fast Path 3 — 일반 전체 각색 (AI 진단)
-    prompt_text = build_diagnose_prompt(
-        raw_text=st.session_state.raw_text,
-        instruction=st.session_state.instruction,
-        locked=st.session_state.locked,
-        genre=st.session_state.genre,
-        intensity=st.session_state.intensity,
-        profession_input=st.session_state.profession_input,
-        period_key=st.session_state.period_key,
-        historical_type=st.session_state.historical_type,
-        fact_based=st.session_state.fact_based,
-        tone_dna=pre_results.get("tone_dna"),
-        diff_analysis=pre_results.get("diff_analysis"),
-        distribution_diagnostic=pre_results.get("distribution_diagnostic"),
-        rewrite_metadata=pre_results.get("rewrite_metadata"),
-        genre_dna=pre_results.get("genre_dna"),
-        section_mode=st.session_state.section_mode,
-        protected_ranges=st.session_state.protected_ranges,
-        revision_ranges=st.session_state.revision_ranges,
-        cascade_analysis=st.session_state.cascade_analysis,
-        boundary_info=st.session_state.boundary_info,
-    )
-    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
-    if not raw:
-        return None
-    return parse_json(raw)
-
-
-def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches: int):
-    """Stage 2: Opus로 특정 배치만 집필.
-
-    Args:
-        client: Anthropic 클라이언트
-        batch_index: 배치 번호 (1부터)
-        batch_scenes: 이번 배치에서 처리할 씬 리스트
-        total_batches: 전체 배치 수
-    """
-    prompt_text = build_revise_prompt(
-        raw_text=st.session_state.raw_text,
-        diagnose_result=st.session_state.diagnose_result,
-        genre=st.session_state.genre,
-        intensity=st.session_state.intensity,
-        locked=st.session_state.locked,
-        profession_input=st.session_state.profession_input,
-        period_key=st.session_state.period_key,
-        historical_type=st.session_state.historical_type,
-        fact_based=st.session_state.fact_based,
-        batch_scenes=batch_scenes,
-        batch_index=batch_index,
-        total_batches=total_batches,
-        tone_dna=st.session_state.tone_dna,
-        diff_analysis=st.session_state.diff_analysis,
-        genre_dna=st.session_state.genre_dna,
-        section_mode=st.session_state.section_mode,
-        protected_ranges=st.session_state.protected_ranges,
-        revision_ranges=st.session_state.revision_ranges,
-        cascade_analysis=st.session_state.cascade_analysis,
-        boundary_info=st.session_state.boundary_info,
-    )
-    raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
-    if not raw:
-        return None
-    parsed = parse_json(raw)
-    if not parsed:
-        return None
-
-    # ★ 포맷 검증 — revised_content가 통짜 출력인지 체크 + 자동 보강
-    parsed = _validate_and_fix_revised_format(parsed)
-
-    return parsed
-
-
-def _validate_and_fix_revised_format(revise_result: dict) -> dict:
-    """REVISE 결과의 revised_content 포맷을 검증하고 자동 보강.
-
-    AI가 한 줄 통짜로 출력한 경우를 감지해 자동 줄바꿈 삽입.
-    Writer Engine 표준에 맞춰 캐릭터명 + 탭2 + 대사 형식 강제.
-    """
-    if not isinstance(revise_result, dict):
-        return revise_result
-
-    rr = revise_result.get("revision_result", {})
-    if not isinstance(rr, dict):
-        return revise_result
-
-    revised_scenes = rr.get("revised_scenes", [])
-    if not isinstance(revised_scenes, list):
-        return revise_result
-
-    import re as _re
-
-    # 캐릭터명 패턴 (대표님 작품 + 일반)
-    char_names_pattern = (
-        '유진|진호|세웅|다은|강회장|김 여사|김여사|지우|여름|최여름|'
-        '안경 아이|동생|아내|집배원|중개인|최상진|조민준|강유진|이진호|반세웅|'
-        '편집자|엄마|아빠|손님|상인|남자|여자|수강생\\s*\\d?|아이|보호자'
-    )
-
-    fixed_count = 0
-    for scene in revised_scenes:
-        if not isinstance(scene, dict):
-            continue
-        content = scene.get("revised_content", "")
-        if not content or len(content) < 100:
-            continue
-
-        # 줄바꿈 비율 체크
-        line_count = content.count('\n')
-        char_count = len(content)
-
-        # 200자당 줄바꿈 1개 미만이면 통짜 출력 → 자동 보강
-        if char_count > 500 and line_count < char_count / 200:
-            # 1. 씬 헤더(S#XX) 다음 줄바꿈
-            content = _re.sub(
-                r'(S#\d+\.\s+(?:INT|EXT)\.\s+[^\n—]+—\s+[^\n]{2,30}?(?:아침|점심|저녁|밤|낮|오전|오후|새벽))\s+([가-힣A-Z\[])',
-                r'\1\n\n\2',
-                content
-            )
-            # 2. CUT TO / DISSOLVE TO / FADE 앞뒤 줄바꿈
-            content = _re.sub(r'(?<!\n)\s+(CUT TO:|DISSOLVE TO:|FADE\s)', r'\n\n\1', content)
-            content = _re.sub(r'(CUT TO:|DISSOLVE TO:|FADE\s\w+)\s+(?=[^\n])', r'\1\n', content)
-            # 3. [인서트] 앞뒤 줄바꿈
-            content = _re.sub(r'(?<!\n)\s+(\[인서트)', r'\n\n\1', content)
-            # 4. 문장 끝 + 캐릭터명 + (괄호) → 줄바꿈 + 탭2
-            content = _re.sub(
-                rf'([\.\?\!…])\s+({char_names_pattern})\s+(\([^)]+\))',
-                r'\1\n\n\2\t\t\3',
-                content
-            )
-            # 5. 문장 끝 + 캐릭터명 + 공백 2+ → 줄바꿈 + 탭2
-            content = _re.sub(
-                rf'(?<!^)([\.\?\!…])\s+({char_names_pattern})\s{{2,}}',
-                r'\1\n\n\2\t\t',
-                content
-            )
-            # 6. 줄 시작 캐릭터명 + 공백 2+ → 캐릭터명\t\t
-            content = _re.sub(
-                rf'(^|\n)({char_names_pattern})\s{{2,}}',
-                r'\1\2\t\t',
-                content
-            )
-            # 7. 연속 빈 줄 정리
-            content = _re.sub(r'\n{3,}', '\n\n', content)
-
-            scene["revised_content"] = content
-            fixed_count += 1
-
-    if fixed_count > 0:
-        # 메타 정보로 자동 보강 사실 기록
-        rr["_format_auto_fixed"] = fixed_count
-
-    return revise_result
-
-
-def run_revise(client):
-    """Stage 2: 전체 배치 처리 (구버전 호환 — 사용하지 않는 것을 권장)."""
-    prompt_text = build_revise_prompt(
-        raw_text=st.session_state.raw_text,
-        diagnose_result=st.session_state.diagnose_result,
-        genre=st.session_state.genre,
-        intensity=st.session_state.intensity,
-        locked=st.session_state.locked,
-        profession_input=st.session_state.profession_input,
-        period_key=st.session_state.period_key,
-        historical_type=st.session_state.historical_type,
-        fact_based=st.session_state.fact_based,
-    )
-    raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
-    if not raw:
-        return None
-    return parse_json(raw)
-
-
-def run_verify(client):
-    """Stage 3: Sonnet으로 검증 보고서 생성."""
-    prompt_text = build_verify_prompt(
-        raw_text=st.session_state.raw_text,
-        revise_result=st.session_state.revise_result,
-        instruction=st.session_state.instruction,
-        locked=st.session_state.locked,
-        genre=st.session_state.genre,
-    )
-    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
-    if not raw:
-        return None
-    return parse_json(raw)
-
-
-# =================================================================
-# [7] UI 컴포넌트
-# =================================================================
-def render_hero():
-    st.markdown("""
-    <div class="rev-hero">
-        <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE</div>
-        <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-def render_stepbar():
-    step = st.session_state.step
-    steps = [
-        (0, "입력"),
-        (1, "진단"),
-        (2, "집필"),
-        (3, "검증"),
-        (4, "완료"),
+    mapping = [
+        (['로맨스','romance','멜로','love','로코'],  'romance'),
+        (['액션','action','스릴러','thriller'],      'action'),
+        (['코미디','comedy'],                        'comedy'),
+        (['공포','horror','호러'],                   'horror'),
+        (['sf','sci-fi','판타지','fantasy','타임'],  'fantasy'),
+        (['가족','family','성장'],                   'family'),
+        (['범죄','crime','누아르','noir'],           'crime'),
+        (['전쟁','war','역사','historical','사극'],  'history'),
+        (['드라마','drama'],                         'drama'),
     ]
-    html = '<div class="rev-stepbar">'
-    for num, name in steps:
-        cls = "rev-step"
-        if num < step:
-            cls += " done"
-        elif num == step:
-            cls += " active"
-        html += f'<div class="{cls}"><span class="num">{num+1}</span>{name}</div>'
-    html += '</div>'
-    st.markdown(html, unsafe_allow_html=True)
+
+    genre_key = 'drama'
+    for keys, gkey in mapping:
+        if any(k in genre_str for k in keys):
+            genre_key = gkey
+            break
+
+    title = item.get('title', 'film')
+    ids = genre_ids[genre_key]
+    img_id = ids[abs(hash(title)) % len(ids)]
+    return f"https://picsum.photos/id/{img_id}/400/200"
 
 
-# =================================================================
-# [8] Step 화면들
-# =================================================================
-def show_step_0_input():
-    """Step 0: 작업 모드 선택 → 모드별 입력."""
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ① 작업 모드 선택 (카드 3개)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    st.markdown(
-        '<div style="text-align:center; margin:8px 0 16px;">'
-        '<div style="font-size:1.1rem; color:#191970; font-weight:700;">무엇을 하시겠습니까?</div>'
-        '<div style="font-size:0.85rem; color:#8E8E99; margin-top:4px;">'
-        '먼저 작업 종류를 선택하세요. 선택한 모드에 필요한 입력만 표시됩니다.'
-        '</div></div>',
-        unsafe_allow_html=True
-    )
-
-    # 카드 스타일 정의
+def apply_design():
     st.markdown("""
     <style>
-    .work-card-row { display: flex; gap: 12px; margin-bottom: 12px; }
-    .stButton > button.work-card {
-        height: auto !important;
-        padding: 18px 14px !important;
-        white-space: normal !important;
-        line-height: 1.45 !important;
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+
+    :root { color-scheme: light only !important; }
+
+    .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"],
+    [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"],
+    [data-testid="block-container"],
+    body { background-color: #FAFAFA !important; }
+
+    html, body, .stApp, p, span, h1, h2, h3, h4, h5,
+    label, li, td, th {
+        color: #191970 !important;
+        font-family: 'Pretendard', sans-serif !important;
     }
+    div {
+        font-family: 'Pretendard', sans-serif !important;
+    }
+
+    [data-testid="stSidebar"] { display: none !important; }
+
+    /* 배경색별 텍스트 강제 */
+    [style*="background:#FFCB05"] { color: #191970 !important; }
+    [style*="background:#FFCB05"] * { color: #191970 !important; }
+    [style*="background:#2EC484"] { color: #FFFFFF !important; }
+    [style*="background:#2EC484"] * { color: #FFFFFF !important; }
+
+    /* ── th 텍스트 색상 보호 (와일드카드 덮어씌움 방지) ── */
+    th[style*="color:#FFCB05"],
+    th[style*="color: #FFCB05"] {
+        color: #FFCB05 !important;
+    }
+    th[style*="background:#191970"] {
+        color: #FFCB05 !important;
+        background-color: #191970 !important;
+    }
+    th[style*="background:#191970"] * {
+        color: #FFCB05 !important;
+    }
+
+    /* ── Expander arrow 수정 ── */
+    /* 헤더 배경 */
+    [data-testid="stExpander"] details summary {
+        background: #F0F2FF !important;
+        border-radius: 8px !important;
+        padding: 10px 16px !important;
+        border: 1px solid #E0E4F0 !important;
+    }
+    [data-testid="stExpander"] details[open] summary {
+        border-radius: 8px 8px 0 0 !important;
+        border-bottom: 1px solid #FFCB05 !important;
+    }
+    /* 화살표 SVG 색상 명시 */
+    [data-testid="stExpander"] summary svg {
+        color: #191970 !important;
+        fill: #191970 !important;
+        stroke: #191970 !important;
+        opacity: 1 !important;
+    }
+    /* 결과 보기 expander (agent card 안) */
+    [data-testid="stExpander"] details summary p,
+    [data-testid="stExpander"] details summary span {
+        color: #191970 !important;
+        font-weight: 700 !important;
+    }
+    /* expander 내용 영역 */
+    [data-testid="stExpander"] details > div {
+        border: 1px solid #E0E4F0 !important;
+        border-top: none !important;
+        border-radius: 0 0 8px 8px !important;
+        padding: 16px !important;
+        background: #FAFAFA !important;
+    }
+
+    .agent-card {
+        background: #FFFFFF;
+        border: 1px solid #E6E9EF;
+        border-radius: 16px;
+        padding: 24px 28px;
+        margin-bottom: 20px;
+        position: relative;
+        overflow: hidden;
+        box-shadow: 0 2px 12px rgba(25,25,112,0.06);
+    }
+    .agent-card::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 4px;
+        background: linear-gradient(90deg, #FFCB05, #191970);
+    }
+    .agent-card.active { border-color: #FFCB05; box-shadow: 0 4px 20px rgba(255,203,5,0.2); }
+    .agent-card.done   { border-color: #B8E6D4; }
+    .agent-card.waiting { opacity: 0.42; }
+
+    .report-card {
+        background: #FFFFFF !important;
+        border: 1px solid #E6E9EF !important;
+        border-left: 5px solid #FFCB05 !important;
+        border-radius: 12px !important;
+        padding: 22px !important;
+        margin-bottom: 16px !important;
+        box-shadow: 0 2px 8px rgba(25,25,112,0.04) !important;
+    }
+    .report-card h3 {
+        color: #191970 !important;
+        font-size: 0.95rem !important;
+        font-weight: 800 !important;
+        margin-bottom: 14px !important;
+        letter-spacing: 0.04em !important;
+    }
+
+    /* ── 파일 업로더 버튼: Streamlit 기본 사용 ── */
+
+    /* ── #191970 배경: 흰색 텍스트 강제 ── */
+    [style*="background:#191970"],
+    [style*="background: #191970"] {
+        color: #FFFFFF !important;
+    }
+    [style*="background:#191970"] span,
+    [style*="background:#191970"] div,
+    [style*="background: #191970"] span,
+    [style*="background: #191970"] div {
+        color: #FFFFFF !important;
+    }
+
+    /* ── report-card 안 span 인라인 배경 보호 ── */
+    .report-card span[style*="background:#191970"],
+    div[style*="background:#FFFBE6"] span[style*="background:#191970"] {
+        background: #191970 !important;
+        background-color: #191970 !important;
+        color: #FFCB05 !important;
+    }
+
+    /* ── 테이블 헤더 th: 와일드카드 덮어쓰기 방지 ── */
+    th[style*="color:#FFCB05"],
+    th[style*="color: #FFCB05"] {
+        color: #FFCB05 !important;
+        background: #191970 !important;
+    }
+    thead tr[style*="background:#191970"] th,
+    thead tr[style*="background: #191970"] th {
+        color: #FFCB05 !important;
+        background: #191970 !important;
+    }
+
+    div.stButton > button {
+        background: #FFCB05 !important;
+        color: #191970 !important;
+        font-weight: 900 !important;
+        border-radius: 10px !important;
+        border: none !important;
+        letter-spacing: 0.04em !important;
+    }
+    div.stButton > button:hover {
+        background: #191970 !important;
+        color: #FFFFFF !important;
+        border: none !important;
+    }
+
+    .step-bar { display:flex; align-items:center; justify-content:center; gap:0; margin:24px 0; }
+    .step-dot { width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:0.8rem; flex-shrink:0; }
+    .step-dot.done   { background:#2EC484; color:#FFFFFF; }
+    .step-dot.active { background:#FFCB05; color:#191970; }
+    .step-dot.wait   { background:#E6E9EF; color:#AAAAAA; border:1px solid #DDD; }
+    .step-line { flex:1; height:2px; background:#E6E9EF; }
+    .step-line.done { background:#2EC484; }
+
+    .gallery-card {
+        background: #FFFFFF;
+        border: 1px solid #E6E9EF;
+        border-radius: 14px;
+        overflow: hidden;
+        text-align: center;
+        box-shadow: 0 2px 8px rgba(25,25,112,0.04);
+    }
+    .gallery-card-img {
+        width: 100%;
+        height: 140px;
+        object-fit: cover;
+        display: block;
+        background: #E6E9EF;
+    }
+    .gallery-card-body {
+        padding: 16px 18px 18px;
+    }
+
+    /* ── 스피너 배경 제거 ── */
+    [data-testid="stSpinner"],
+    [data-testid="stSpinner"] > div,
+    .stSpinner,
+    div[class*="StatusWidget"],
+    div[class*="stStatusWidget"] {
+        background: transparent !important;
+        background-color: transparent !important;
+        box-shadow: none !important;
+        border: none !important;
+    }
+    [data-testid="stSpinner"] p,
+    [data-testid="stSpinner"] span,
+    .stSpinner p,
+    .stSpinner span {
+        color: #191970 !important;
+        background: transparent !important;
+    }
+
+    hr { border-color: #E6E9EF !important; }
+    [data-testid="stAlert"] { background: #F0F4FF !important; border-color: #C5D0F0 !important; }
+    [data-testid="stDownloadButton"] button {
+        background: #191970 !important;
+        color: #FFFFFF !important;
+        font-weight: 900 !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stDownloadButton"] button span,
+    [data-testid="stDownloadButton"] button p,
+    [data-testid="stDownloadButton"] button div {
+        color: #FFFFFF !important;
+    }
+    [data-testid="stDownloadButton"] button:hover {
+        background: #FFCB05 !important;
+        color: #191970 !important;
+    }
+    [data-testid="stDownloadButton"] button:hover span,
+    [data-testid="stDownloadButton"] button:hover p,
+    [data-testid="stDownloadButton"] button:hover div {
+        color: #191970 !important;
+    }
+    /* ── Spinner: 배경 완전 투명 ── */
+    [data-testid="stSpinner"] > div,
+    [data-testid="stStatusWidget"] {
+        background: transparent !important;
+        background-color: transparent !important;
+    }
+    [data-testid="stSpinner"] p,
+    [data-testid="stSpinner"] span,
+    [data-testid="stSpinner"] div {
+        background: transparent !important;
+        background-color: transparent !important;
+        color: #191970 !important;
+    }
+
+    /* ── 파일 업로더: Streamlit 기본 스타일 사용 ── */
     </style>
     """, unsafe_allow_html=True)
 
-    cw1, cw2, cw3 = st.columns(3)
 
-    def _card(col, mode_id: str, emoji: str, title: str, sub: str, desc: str):
-        with col:
-            is_selected = (st.session_state.work_mode == mode_id)
-            label = f"{emoji}\n\n**{title}**\n\n{sub}\n\n{desc}"
-            btn_type = "primary" if is_selected else "secondary"
-            if st.button(
-                label,
-                key=f"card_{mode_id}",
-                use_container_width=True,
-                type=btn_type,
-                help=desc,
-            ):
-                st.session_state.work_mode = mode_id
-                # 모드 전환 시 구간 정보 초기화 (전체↔부분 수정 변경 시 혼선 방지)
-                if mode_id == "full":
-                    st.session_state.section_mode = False
-                    st.session_state.protected_ranges = []
-                    st.session_state.revision_ranges = []
-                else:
-                    st.session_state.section_mode = True
-                st.rerun()
+# ── Chris: 안경 쓴 분석가, 짧은 단발머리, 네이비 재킷 ──
+CHRIS_SVG = """
+<svg width="72" height="72" viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="72" height="72" rx="16" fill="#D6E4F0"/>
+  <!-- 몸/어깨 -->
+  <path d="M14 72 Q14 54 36 50 Q58 54 58 72Z" fill="#1B2A6B"/>
+  <!-- 셔츠 칼라 -->
+  <path d="M30 50 L36 58 L42 50" fill="white" stroke="#1B2A6B" stroke-width="1.5"/>
+  <!-- 목 -->
+  <rect x="31" y="42" width="10" height="10" rx="3" fill="#F5C99A"/>
+  <!-- 얼굴 -->
+  <ellipse cx="36" cy="30" rx="14" ry="15" fill="#F5C99A" stroke="#2D2D2D" stroke-width="1.8"/>
+  <!-- 머리카락: 짧고 단정한 옆가르마 -->
+  <path d="M22 26 Q22 12 36 11 Q50 12 50 26 Q46 18 36 18 Q26 18 22 26Z" fill="#2D2D2D"/>
+  <path d="M22 26 Q20 20 24 16" stroke="#2D2D2D" stroke-width="3" stroke-linecap="round"/>
+  <!-- 눈썹 -->
+  <path d="M26 26 Q29 24 32 26" stroke="#2D2D2D" stroke-width="2" stroke-linecap="round" fill="none"/>
+  <path d="M40 26 Q43 24 46 26" stroke="#2D2D2D" stroke-width="2" stroke-linecap="round" fill="none"/>
+  <!-- 안경 프레임 -->
+  <rect x="24" y="27" width="10" height="8" rx="3" fill="none" stroke="#2D2D2D" stroke-width="2"/>
+  <rect x="38" y="27" width="10" height="8" rx="3" fill="none" stroke="#2D2D2D" stroke-width="2"/>
+  <line x1="34" y1="31" x2="38" y2="31" stroke="#2D2D2D" stroke-width="2"/>
+  <line x1="22" y1="29" x2="24" y2="30" stroke="#2D2D2D" stroke-width="2"/>
+  <line x1="48" y1="29" x2="50" y2="30" stroke="#2D2D2D" stroke-width="2"/>
+  <!-- 눈동자 -->
+  <circle cx="29" cy="31" r="2" fill="#2D2D2D"/>
+  <circle cx="43" cy="31" r="2" fill="#2D2D2D"/>
+  <circle cx="30" cy="30.2" r="0.7" fill="white"/>
+  <circle cx="44" cy="30.2" r="0.7" fill="white"/>
+  <!-- 코 -->
+  <path d="M35 33 Q36 36 37 33" stroke="#C8905A" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <!-- 입: 진지한 표정 -->
+  <path d="M30 40 Q36 43 42 40" stroke="#2D2D2D" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+</svg>"""
 
-    _card(cw1, "full",
-          "📝", "전체 각색",
-          "시나리오 전체를 다시 씀",
-          "기본 모드. 시나리오 한 편을 통째로 진단하고 수정합니다.")
+# ── Shiho: 긴 웨이브 머리, 여성 전문가, 보라색 재킷 ──
+SHIHO_SVG = """
+<svg width="72" height="72" viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="72" height="72" rx="16" fill="#EDE0FF"/>
+  <!-- 긴 머리카락(뒤) -->
+  <path d="M18 30 Q15 50 18 68 L28 68 Q24 48 24 30Z" fill="#3D2314"/>
+  <path d="M54 30 Q57 50 54 68 L44 68 Q48 48 48 30Z" fill="#3D2314"/>
+  <!-- 몸/어깨 -->
+  <path d="M14 72 Q14 54 36 50 Q58 54 58 72Z" fill="#6B3FA0"/>
+  <!-- 목 -->
+  <rect x="31" y="42" width="10" height="10" rx="3" fill="#F5C99A"/>
+  <!-- 얼굴 -->
+  <ellipse cx="36" cy="30" rx="14" ry="15" fill="#F5C99A" stroke="#2D2D2D" stroke-width="1.8"/>
+  <!-- 머리카락(앞) -->
+  <path d="M22 28 Q22 12 36 11 Q50 12 50 28 Q47 18 36 18 Q25 18 22 28Z" fill="#3D2314"/>
+  <!-- 앞머리 -->
+  <path d="M22 22 Q28 15 36 16 Q30 17 26 22Z" fill="#3D2314"/>
+  <!-- 눈썹: 곡선형 -->
+  <path d="M25 25 Q28 22 33 24" stroke="#3D2314" stroke-width="2" stroke-linecap="round" fill="none"/>
+  <path d="M39 24 Q44 22 47 25" stroke="#3D2314" stroke-width="2" stroke-linecap="round" fill="none"/>
+  <!-- 눈: 크고 또렷 -->
+  <ellipse cx="29" cy="29" rx="4" ry="4.5" fill="white" stroke="#2D2D2D" stroke-width="1.5"/>
+  <ellipse cx="43" cy="29" rx="4" ry="4.5" fill="white" stroke="#2D2D2D" stroke-width="1.5"/>
+  <circle cx="30" cy="30" r="2.5" fill="#3D2314"/>
+  <circle cx="44" cy="30" r="2.5" fill="#3D2314"/>
+  <circle cx="30.8" cy="29" r="1" fill="white"/>
+  <circle cx="44.8" cy="29" r="1" fill="white"/>
+  <!-- 속눈썹 -->
+  <path d="M25 26 Q27 24 29 25" stroke="#2D2D2D" stroke-width="1.2" fill="none"/>
+  <path d="M43 25 Q45 24 47 26" stroke="#2D2D2D" stroke-width="1.2" fill="none"/>
+  <!-- 볼터치 -->
+  <ellipse cx="22" cy="33" rx="4" ry="2.5" fill="#FFB3C1" opacity="0.55"/>
+  <ellipse cx="50" cy="33" rx="4" ry="2.5" fill="#FFB3C1" opacity="0.55"/>
+  <!-- 코 -->
+  <path d="M35 33 Q36 36 37 33" stroke="#C8905A" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <!-- 입: 부드러운 미소 -->
+  <path d="M29 40 Q36 45 43 40" stroke="#2D2D2D" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+  <path d="M31 40 Q36 43 41 40" fill="#FF8FA3" opacity="0.5"/>
+  <!-- 귀걸이 -->
+  <circle cx="22" cy="32" r="2.5" fill="#FFCB05" stroke="#2D2D2D" stroke-width="1"/>
+  <circle cx="50" cy="32" r="2.5" fill="#FFCB05" stroke="#2D2D2D" stroke-width="1"/>
+</svg>"""
 
-    _card(cw2, "continuation",
-          "✍️", "이어쓰기",
-          "손본 부분 다음을 이어씀",
-          "1막은 이미 손봤고, 그 톤으로 나머지를 이어 쓰고 싶을 때.")
+# ── Moon: 올백머리, 한국 남성, 감독 느낌, 카키 재킷 ──
+MOON_SVG = """
+<svg width="72" height="72" viewBox="0 0 72 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="72" height="72" rx="16" fill="#DFF2E8"/>
+  <!-- 몸/어깨 -->
+  <path d="M14 72 Q14 54 36 50 Q58 54 58 72Z" fill="#3D6B4F"/>
+  <!-- 터틀넥 -->
+  <path d="M30 50 Q36 54 42 50 L42 44 Q36 47 30 44Z" fill="#2D2D2D"/>
+  <!-- 목 -->
+  <rect x="31" y="42" width="10" height="10" rx="3" fill="#E8B88A"/>
+  <!-- 얼굴 -->
+  <ellipse cx="36" cy="30" rx="14" ry="15" fill="#E8B88A" stroke="#2D2D2D" stroke-width="1.8"/>
+  <!-- 머리카락: 올백 스타일 -->
+  <path d="M22 26 Q22 10 36 10 Q50 10 50 26 Q48 16 36 15 Q24 15 22 26Z" fill="#1A1A1A"/>
+  <path d="M22 24 Q24 14 36 13" stroke="#1A1A1A" stroke-width="4" stroke-linecap="round"/>
+  <!-- 올백 라인 -->
+  <path d="M26 14 Q36 11 46 14" stroke="#333" stroke-width="1" fill="none" opacity="0.4"/>
+  <!-- 눈썹: 진하고 강한 -->
+  <path d="M24 25 Q28 22 33 24" stroke="#1A1A1A" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <path d="M39 24 Q44 22 48 25" stroke="#1A1A1A" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <!-- 눈: 날카로운 -->
+  <path d="M24 29 Q29 27 34 29 Q29 33 24 29Z" fill="#1A1A1A"/>
+  <path d="M38 29 Q43 27 48 29 Q43 33 38 29Z" fill="#1A1A1A"/>
+  <circle cx="29" cy="29.5" r="1" fill="white"/>
+  <circle cx="43" cy="29.5" r="1" fill="white"/>
+  <!-- 코 -->
+  <path d="M34 32 Q36 37 38 32" stroke="#B8784A" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+  <path d="M32 37 Q36 39 40 37" stroke="#B8784A" stroke-width="1.2" fill="none" stroke-linecap="round"/>
+  <!-- 입: 굳은 표정 -->
+  <path d="M29 42 Q36 44 43 42" stroke="#2D2D2D" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <!-- 인중 -->
+  <line x1="36" y1="39" x2="36" y2="42" stroke="#B8784A" stroke-width="1" opacity="0.5"/>
+</svg>"""
+def safe(text):
+    return html.escape(str(text)) if text else ""
 
-    _card(cw3, "partial",
-          "✂️", "부분 수정",
-          "특정 구간만 다시 씀",
-          "2막 엔딩만 약하다 같은 경우. 일부 씬만 핀포인트로 수정.")
+def parse_json(raw):
+    if not raw: return None
 
-    # 모드 선택 안 했으면 안내 후 종료
-    if not st.session_state.work_mode:
-        st.info("👆 위에서 작업 모드를 선택하세요.")
-        st.stop()
+    def try_parse(s):
+        try:
+            return json.loads(s, strict=False)
+        except:
+            return None
 
-    # 선택된 모드 표시 + 변경 버튼
-    mode_labels = {
-        "full": "📝 전체 각색",
-        "continuation": "✍️ 이어쓰기",
-        "partial": "✂️ 부분 수정",
-    }
-    cm1, cm2 = st.columns([5, 1])
-    with cm1:
-        st.markdown(
-            f'<div style="background:#EAF3DE; padding:10px 14px; border-radius:6px; '
-            f'border-left:3px solid #2EC484; margin:8px 0; font-size:0.9rem;">'
-            f'<b>선택된 모드: {mode_labels.get(st.session_state.work_mode, "")}</b>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-    with cm2:
-        if st.button("🔄 모드 변경", key="change_mode", use_container_width=True):
-            st.session_state.work_mode = None
-            st.rerun()
+    def clean(s):
+        # BOM 및 유니코드 공백 제거
+        s = s.strip().lstrip('\ufeff\u200b\u00a0\u200e\u200f')
+        # 마크다운 코드블록 제거
+        s = re.sub(r'```json\s*|```\s*', '', s).strip()
+        # // 주석 제거
+        s = re.sub(r'\s*//[^\n"]*', '', s)
+        return s
 
-    st.markdown("---")
+    # 1차: 그대로
+    r = try_parse(raw)
+    if r: return r
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ② 모드별 입력 영역
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 2차: 클린업 후
+    cleaned = clean(raw)
+    r = try_parse(cleaned)
+    if r: return r
 
-    # 1. 시나리오 업로드 (모든 모드 공통)
-    st.markdown('<div class="rev-card-title">1. 원본 시나리오 업로드 (DOCX 또는 PDF)</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">Writer Engine 출력 DOCX, 외부 시나리오 PDF 모두 가능합니다.</div>', unsafe_allow_html=True)
+    # 3차: { } 블록 추출 후 클린업
+    try:
+        start = raw.index('{')
+        end   = raw.rindex('}') + 1
+        chunk = clean(raw[start:end])
+        r = try_parse(chunk)
+        if r: return r
+    except:
+        pass
 
-    uploaded = st.file_uploader(
-        "DOCX 또는 PDF 파일 선택",
-        type=["docx", "pdf"],
-        key="docx_uploader",
-        label_visibility="collapsed"
-    )
+    # 4차: simplejson으로 재시도 (더 관대한 파서)
+    try:
+        import simplejson
+        return simplejson.loads(cleaned)
+    except:
+        pass
 
-    if uploaded:
-        text = extract_text_from_uploaded_file(uploaded)
-        if text:
-            st.session_state.raw_text = text
-            st.session_state.raw_filename = uploaded.name
-            # 제목은 파일명에서 추출 (확장자 제거)
-            st.session_state.title = re.sub(r'\.(docx|pdf)$', '', uploaded.name, flags=re.IGNORECASE)
-            st.success(f"✅ 업로드 완료: {uploaded.name}  ({len(text):,}자)")
-            with st.expander("📄 추출된 본문 미리보기 (앞 1,000자)"):
-                st.text(text[:1000] + ("..." if len(text) > 1000 else ""))
-        else:
-            st.error("❌ 본문 추출 실패")
+    return None
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 모드별 추가 필수 입력 (시나리오 바로 아래)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def get_client():
+    api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.error("❌ ANTHROPIC_API_KEY가 secrets에 없습니다.")
+        return None
+    return anthropic.Anthropic(api_key=api_key)
 
-    # 이어쓰기 모드: 손본본 업로드
-    if st.session_state.work_mode == "continuation":
-        st.markdown("---")
-        st.markdown('<div class="rev-card-title">2. 손본 시나리오 업로드 ✍️</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="rev-caption">앞부분(예: 1막)을 직접 손보신 시나리오를 올리세요. '
-            'AI가 자동으로 손본 부분을 감지해 보호하고, 그 다음을 같은 톤으로 이어 씁니다.</div>',
-            unsafe_allow_html=True
-        )
-
-        ref_file = st.file_uploader(
-            "손본 시나리오 (DOCX 또는 PDF)",
-            type=["docx", "pdf"],
-            key="continuation_uploader",
-            help="예: v2_3 — 1막을 새로 쓴 PDF 또는 DOCX",
-        )
-        if ref_file:
-            _text = extract_text_from_uploaded_file(ref_file)
-            if _text:
-                # 이어쓰기 모드는 diff_refined_text를 손본본 베이스로 사용
-                st.session_state.diff_refined_text = _text
-                st.session_state.diff_refined_filename = ref_file.name
-                # 톤 학습용으로도 같이 등록
-                st.session_state.tone_ref_text = _text
-                st.session_state.tone_ref_filename = ref_file.name
-                # 자동 감지 모드로 설정
-                st.session_state.section_input_method = "auto"
-                st.session_state.diff_use_main_as_before = True
-
-                st.success(f"✅ 손본본 등록: {ref_file.name} ({len(_text):,}자)")
-
-                # 이미 자동 감지가 됐다면 결과 표시
-                if st.session_state.section_detection:
-                    detection = st.session_state.section_detection.get("section_detection", {})
-                    cp = detection.get("continuation_point", {})
-                    if cp.get("detected") in (True, "true"):
-                        prot_str = ", ".join(
-                            f"{r.get('from','')}~{r.get('to','')}"
-                            for r in st.session_state.protected_ranges
-                        )
-                        rev_str = ", ".join(
-                            f"{r.get('from','')}~{r.get('to','')}"
-                            for r in st.session_state.revision_ranges
-                        )
-                        st.info(
-                            f"✓ 자동 감지 완료\n\n"
-                            f"🔒 보호 (안 건드림): {prot_str}\n\n"
-                            f"✏️ 재집필 (이어 씀): {rev_str}"
-                        )
-                else:
-                    st.caption("→ 분석 시작 시 자동 감지가 진행됩니다.")
-        elif st.session_state.diff_refined_filename:
-            st.info(f"📎 등록됨: {st.session_state.diff_refined_filename} "
-                    f"({len(st.session_state.diff_refined_text):,}자)")
-            if st.button("🗑️ 손본본 제거", key="btn_clear_continuation"):
-                st.session_state.diff_refined_text = ""
-                st.session_state.diff_refined_filename = ""
-                st.session_state.tone_ref_text = ""
-                st.session_state.tone_ref_filename = ""
-                st.session_state.section_detection = None
-                st.session_state.protected_ranges = []
-                st.session_state.revision_ranges = []
-                st.rerun()
-
-    # 부분 수정 모드: 어디를 다시 쓸지 선택
-    elif st.session_state.work_mode == "partial":
-        st.markdown("---")
-        st.markdown('<div class="rev-card-title">2. 어디를 다시 쓸까요? ✂️</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="rev-caption">수정할 부분을 선택하세요. 나머지는 자동으로 보호됩니다.</div>',
-            unsafe_allow_html=True
-        )
-
-        # 막 단위 빠른 선택
-        st.markdown("**빠른 선택 (작품 분량에 따라 자동 계산):**")
-        scene_count = 0
-        if st.session_state.raw_text:
-            import re as _re
-            scene_count = len(_re.findall(r'^\s*\*?\*?S#?\d+', st.session_state.raw_text, _re.MULTILINE))
-
-        if scene_count > 0:
-            # 막 분할: 1막 = 1~25%, 2막 = 25~75%, 3막 = 75~100%
-            act1_end = max(1, int(scene_count * 0.25))
-            act2_start = act1_end + 1
-            act2_end = max(act2_start, int(scene_count * 0.75))
-            act3_start = act2_end + 1
-
-            cb1, cb2, cb3 = st.columns(3)
-            with cb1:
-                if st.button(f"1막 다시 쓰기\n(S#1~S#{act1_end})",
-                             key="act1_btn", use_container_width=True):
-                    st.session_state.revision_ranges = [{
-                        "from": "S#1", "to": f"S#{act1_end}", "reason": "1막 재집필"
-                    }]
-                    st.session_state.section_input_method = "manual"
-                    st.rerun()
-            with cb2:
-                if st.button(f"2막 다시 쓰기\n(S#{act2_start}~S#{act2_end})",
-                             key="act2_btn", use_container_width=True):
-                    st.session_state.revision_ranges = [{
-                        "from": f"S#{act2_start}", "to": f"S#{act2_end}", "reason": "2막 재집필"
-                    }]
-                    st.session_state.section_input_method = "manual"
-                    st.rerun()
-            with cb3:
-                if st.button(f"3막 다시 쓰기\n(S#{act3_start}~S#{scene_count})",
-                             key="act3_btn", use_container_width=True):
-                    st.session_state.revision_ranges = [{
-                        "from": f"S#{act3_start}", "to": f"S#{scene_count}", "reason": "3막 재집필"
-                    }]
-                    st.session_state.section_input_method = "manual"
-                    st.rerun()
-        else:
-            st.caption("⚠️ 1번 시나리오를 먼저 업로드하면 막 단위 빠른 선택이 활성화됩니다.")
-
-        # 직접 지정
-        st.markdown("**또는 직접 지정 (씬 번호 입력):**")
-        st.caption("형식: `S#41-S#55` 또는 여러 구간은 콤마로 `S#41-S#55, S#67-S#67`")
-
-        current_rev_str = ", ".join(
-            f"{r.get('from','')}-{r.get('to','')}"
-            for r in st.session_state.revision_ranges
-        ) if st.session_state.revision_ranges else ""
-
-        rev_input = st.text_input(
-            "재집필 구간 직접 지정",
-            value=current_rev_str,
-            placeholder="예: S#41-S#55",
-            key="manual_rev_ranges",
-            label_visibility="collapsed",
-        )
-
-        if rev_input.strip() and rev_input != current_rev_str:
-            try:
-                import re as _re
-                new_ranges = []
-                for piece in rev_input.split(","):
-                    piece = piece.strip()
-                    m = _re.match(r'(S#\d+)\s*[-~]\s*(S#\d+)', piece)
-                    if m:
-                        new_ranges.append({
-                            "from": m.group(1),
-                            "to": m.group(2),
-                            "reason": "직접 지정",
-                        })
-                if new_ranges:
-                    st.session_state.revision_ranges = new_ranges
-                    st.session_state.section_input_method = "manual"
-                    st.success(f"✅ 재집필 구간 {len(new_ranges)}개 등록됨")
-            except Exception as e:
-                st.error(f"구간 파싱 실패: {e}")
-
-        # 등록된 구간 표시
-        if st.session_state.revision_ranges:
-            rev_str = ", ".join(
-                f"{r.get('from','')}~{r.get('to','')}"
-                for r in st.session_state.revision_ranges
+def call_claude(client, prompt, max_tokens=6000, system=None, retries=2):
+    """Claude API 호출 (스트리밍). max_tokens 잘림 시 50% 증량 자동 재시도."""
+    current_tokens = max_tokens
+    for attempt in range(1 + retries):
+        try:
+            kwargs = dict(
+                model="claude-opus-4-6",
+                max_tokens=current_tokens,
+                messages=[{"role": "user", "content": prompt}]
             )
-            st.info(f"✏️ 재집필 구간: **{rev_str}** (나머지는 자동 보호)")
+            if system:
+                kwargs["system"] = system
 
-            if st.button("🗑️ 구간 초기화", key="btn_clear_partial"):
-                st.session_state.revision_ranges = []
-                st.session_state.protected_ranges = []
-                st.rerun()
+            # 스트리밍으로 응답 수집 (10분+ 타임아웃 방지)
+            collected_text = ""
+            stop_reason = None
+            with client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    collected_text += text
+                # 스트림 종료 후 최종 메시지에서 stop_reason 확인
+                final_message = stream.get_final_message()
+                stop_reason = final_message.stop_reason
 
-    st.markdown("---")
+            if stop_reason == "max_tokens":
+                if attempt < retries:
+                    next_tokens = min(int(current_tokens * 1.5), 32000)
+                    st.info(f"🔄 응답이 {current_tokens} 토큰에서 잘렸습니다. {next_tokens} 토큰으로 재시도합니다... ({attempt+2}/{1+retries}회차)")
+                    current_tokens = next_tokens
+                    continue
+                else:
+                    st.warning(f"⚠️ {retries}회 재시도 후에도 응답이 {current_tokens} 토큰에서 잘렸습니다. 결과가 불완전할 수 있습니다.")
+            return collected_text
+        except Exception as e:
+            st.error(f"API 오류 상세: {type(e).__name__} — {e}")
+            return None
+    return None
 
-    # ── 제목 ──
-    st.session_state.title = st.text_input(
-        "프로젝트 제목",
-        value=st.session_state.title,
-        placeholder="예: 쿠킹클래스 러브 스토리",
+# =================================================================
+# [3] PDF 추출
+# =================================================================
+def extract_text(uploaded_file):
+    try:
+        reader = PdfReader(uploaded_file)
+        pages = [p.extract_text() for p in reader.pages if p.extract_text()]
+        text = "\n".join(pages)
+        if len(text) < 300:
+            st.error("텍스트가 너무 짧습니다. 이미지 스캔 PDF는 분석 불가합니다.")
+            return None
+        return text[:80000]
+    except Exception as e:
+        st.error(f"PDF 추출 실패: {e}")
+        return None
+
+# =================================================================
+# [4] BLUE — 분석 비서 (prompt.py 빌더 사용)
+# =================================================================
+def run_blue(text, client):
+    from prompt import SYSTEM_PROMPT
+    prompt = build_analysis_prompt(text)
+    # SYSTEM_PROMPT가 user 메시지 안에 포함되어 있으므로 제거 후 system으로 분리
+    user_prompt = prompt.replace(SYSTEM_PROMPT, '').strip()
+    raw = call_claude(client, user_prompt, max_tokens=12000, system=SYSTEM_PROMPT)
+    if not raw:
+        st.error("❌ API 응답이 없습니다.")
+        return None
+    data = parse_json(raw)
+    if not data:
+        st.error(f"❌ JSON 파싱 실패. 응답 앞 300자:\n{raw[:300]}")
+        return None
+    s = data.get('scores', {})
+    data['mark'] = {'final': round(
+        s.get('structure', 0) * 0.3 + s.get('hero', 0) * 0.3 +
+        s.get('concept', 0) * 0.2 + s.get('genre', 0) * 0.2, 1
+    )}
+    return data
+
+def _run_blue_OLD_UNUSED(text, client):
+    prompt = f"""
+당신은 글로벌 스튜디오의 수석 각본 분석가(Senior Script Consultant)입니다.
+전 세계 시청자를 사로잡을 수 있는 글로벌 스탠다드 시각으로 시나리오를 정밀 진단하세요.
+아래 시나리오를 분석하여 JSON만 출력하세요. 마크다운 금지.
+대사 안 쌍따옴표 금지 → 홑따옴표 사용.
+tension_data는 숫자만.
+
+[JSON Schema]
+{{
+  "title": "본문에서 추출한 작품 제목",
+  "scores": {{"structure":6,"hero":5,"concept":7,"genre":5}},
+  // 각 항목은 반드시 0~10 사이 정수로만 입력. 절대로 100점 만점 사용 금지. 소수점 금지.
+  "verdict": {{"status":"추천/고려/비추천","rationale":"3줄 근거"}},
+  "logline": {{"original":"원본 로그라인","washed":"개선 로그라인"}},
+  "synopsis": "기승전결 줄거리 5~7문장",
+  "pros_cons": {{
+    "pros":["장점1","장점2","장점3"],
+    "cons":["보완점1","보완점2","보완점3"],
+    "prescription":"장점을 살리고 보완점을 해결하기 위한 핵심처방 3줄. 구체적 액션 중심으로."
+  }},
+  "drive": {{
+    "goal":"주인공의 목적(욕망)",
+    "lack":"발생요인(상실/결핍)",
+    "strategy":"해결전략(방법)",
+    "evaluation":{{
+      "clarity":"목적(욕망)의 명확성 평가 (1-10점 및 이유)",
+      "urgency":"발생요인의 확실성 평가 (1-10점 및 이유)",
+      "consistency":"해결방법의 창의성과 개연성 평가 (1-10점 및 이유)",
+      "overall_diagnosis":"서사 동력 총평"
+    }}
+  }},
+  "beats": {{
+    "01. Opening Image":"내용","02. Theme Stated":"내용","03. Set-up":"내용",
+    "04. Catalyst":"내용","05. Debate":"내용","06. Break Into Two":"내용",
+    "07. B Story":"내용","08. Fun and Games":"내용","09. Midpoint":"내용",
+    "10. Bad Guys Close In":"내용","11. All Is Lost":"내용",
+    "12. Dark Night of the Soul":"내용","13. Break Into Three":"내용",
+    "14. Finale":"내용","15. Final Image":"내용"
+  }},
+  "characters": {{"names":["인물1","인물2"],"ratios":[60,40]}},
+  "tension_data": [0,2,5,8,10,8,5,7,9,10,9,8],
+  "genre_suitability": {{
+    "genre_name": "장르명(예: 스릴러, 로맨스, 액션 등)",
+    "checks": ["장르 필수 문법 1 - 충족 여부", "장르 필수 문법 2 - 충족 여부", "장르 필수 문법 3 - 충족 여부"],
+    "compliance_score": 0,
+    "missing_elements": ["이 장르에서 반드시 있어야 하는데 빠진 요소1", "빠진 요소2"],
+    "doctoring": "이 작품이 해당 장르의 문법을 얼마나 지키고 있는지, 어떤 장르 관습을 위반했는지, 장르 팬이 실망할 포인트가 무엇인지 구체적으로 서술. 스토리 내용 요약 금지."
+  }}
+}}
+
+시나리오:
+{text[:60000]}
+"""
+    raw = call_claude(client, prompt)
+    data = parse_json(raw)
+    if data:
+        s = data.get('scores', {})
+        data['mark'] = {'final': round(
+            s.get('structure', 0) * 0.3 + s.get('hero', 0) * 0.3 +
+            s.get('concept', 0) * 0.2 + s.get('genre', 0) * 0.2, 1
+        )}
+    return data
+
+# =================================================================
+# [5] JEAN — 워싱 비서 (prompt.py 빌더 사용)
+# =================================================================
+def run_jean(text, analysis, client):
+    from prompt import SYSTEM_PROMPT
+    prompt = build_doctoring_prompt(text, analysis)
+    user_prompt = prompt.replace(SYSTEM_PROMPT, '').strip()
+    raw = call_claude(client, user_prompt, max_tokens=12000, system=SYSTEM_PROMPT)
+    return parse_json(raw)
+
+def _run_jean_OLD_UNUSED(text, analysis, client):
+    prompt = f"""당신은 글로벌 OTT와 극장 영화 양쪽에서 검증된 세계 최고의 쇼러너(Showrunner)입니다.
+작품: {analysis.get('title', '')}
+장르: {analysis.get('genre_compliance', {}).get('genre_key', analysis.get('genre_suitability', {}).get('genre_name', ''))}
+
+시나리오의 시퀀스를 진단하고, 대사를 4축으로 심층 분석하고, 각색 제안을 작성하세요.
+JSON만 출력. 마크다운 금지.
+
+[washing_table 규칙]
+- 라벨은 "동사 → 동사" 형식 필수 (예: "잠복 → 발각")
+- 최소 6개 이상
+- 처방 끝에 반드시 [Risk: 수정 시 우려점] 기재
+
+[Dialogue Washing — 4축 분석 규칙]
+반드시 아래 4가지 기준으로 대사를 분석한다. 각 축마다 실제 대사를 인용하고 개선안을 제시한다.
+
+① 캐릭터 적합성 (Character Voice)
+   - 이 인물이 쓸 법한 어휘·문체·말투인가?
+   - 인물의 직업·나이·교육수준·감정 상태가 대사에 반영되어 있는가?
+   - 문제: 캐릭터 구분 없이 작가 목소리로 통일된 대사
+
+② 서브텍스트 (Subtext)
+   - 대사 표면과 이면의 감정이 충돌하는가?
+   - 말하지 않는 것이 말하는 것보다 강한가?
+   - 문제: 감정을 직접 설명하는 대사 ("나 너 좋아해", "화났어" 같은 설명형)
+
+③ 행동/감정/관계 구동 (Action-Driven)
+   - 대사가 장면을 앞으로 밀고 나가는가?
+   - 설명·정보 전달이 아닌 행동·감정·관계 변화를 만드는가?
+   - 문제: 플롯 설명 대사, 방백형 독백, 과거 회상 나레이션
+
+④ 개선 제안 (Rewrite Suggestion)
+   - 위 3축 문제를 동시에 해결하는 구체적인 대사 개선안 제시
+   - 세계 정상급 각본 스타일: 빠른 리듬, 반박, 말 끊기, 의미의 역전
+   - 홑따옴표 사용 필수. 쌍따옴표 금지.
+
+각 issues 항목의 type은 반드시 다음 중 하나:
+"캐릭터 부적합" / "서브텍스트 부재" / "설명형 대사" / "관계 미구동"
+
+[JSON Schema]
+{{
+  "washing_table": [
+    {{"seq":"Seq 1","label":"잠복 → 발각","diagnosis":"진단 2문장 이내","prescription":"처방. [Risk: 우려점]"}}
+  ],
+  "dialogue_analysis": {{
+    "overall_score": 6,
+    "overall_comment": "전체 대사 수준 총평. 장르/캐릭터 적합성 포함. 3줄.",
+    "axis_scores": {{
+      "character_voice": 5,
+      "subtext": 6,
+      "action_driven": 7
+    }},
+    "issues": [
+      {{
+        "type": "서브텍스트 부재",
+        "axis": "② 서브텍스트",
+        "description": "문제 설명 1~2문장",
+        "example_bad": "인물명: '문제 대사'",
+        "example_good": "인물명: '개선된 대사'",
+        "rewrite_note": "리라이팅 지시 1줄"
+      }}
+    ],
+    "strengths": ["강점 1", "강점 2"],
+    "rewrite_directives": [
+      "캐릭터 보이스 관련 지시",
+      "서브텍스트 관련 지시",
+      "행동 구동 관련 지시"
+    ]
+  }},
+  "suggestions": ["1. 제안","2. 제안","3. 제안","4. 제안","5. 제안",
+                  "6. 제안","7. 제안","8. 제안","9. 제안","10. 제안"]
+}}
+
+시나리오:
+{text[:40000]}
+"""
+    raw = call_claude(client, prompt, max_tokens=8000)
+    return parse_json(raw)
+
+# =================================================================
+# [6] PICTURES — 리라이팅 비서 (prompt.py 빌더 사용)
+# =================================================================
+def run_pictures(text, washing, client):
+    """MOON 리라이팅 — 2회 분할 호출 (수정씬 6개 → 추가씬 4개)"""
+    from prompt import SYSTEM_PROMPT
+    analysis = st.session_state.get('analysis', {})
+    prompt = build_rewrite_prompt(text, analysis, washing)
+    user_prompt = prompt.replace(SYSTEM_PROMPT, '').strip()
+
+    # ── PASS 1: 수정씬 6개 ──
+    pass1_instruction = (
+        "\n\n[이번 호출의 임무]\n"
+        "이번에는 수정씬 6개만 작성하라. 추가씬은 다음 호출에서 작성한다.\n"
+        "JSON 스키마는 동일하되, scenes 배열에 수정씬 6개만 포함하라.\n"
+        "target_reason은 전체 10개 씬 기준으로 작성하라."
     )
+    st.info("✍️ MOON Pass 1/2 — 수정씬 6개 작성 중...")
+    raw1 = call_claude(client, user_prompt + pass1_instruction, max_tokens=16000, system=SYSTEM_PROMPT)
+    result1 = parse_json(raw1) if raw1 else None
+    if not result1 or not result1.get('rewriting', {}).get('scenes'):
+        st.warning("⚠️ Pass 1 (수정씬) 파싱 실패. 단일 호출로 재시도합니다...")
+        # fallback: 단일 호출
+        raw_full = call_claude(client, user_prompt, max_tokens=16000, system=SYSTEM_PROMPT)
+        result_full = parse_json(raw_full) if raw_full else None
+        if result_full and not result_full.get('rewriting', {}).get('scenes'):
+            st.warning(f"⚠️ scenes 파싱 실패. raw 앞 500자: {raw_full[:500] if raw_full else 'None'}")
+        return result_full
 
-    # ── 장르 + 강도 ──
-    c1, c2 = st.columns(2)
-    with c1:
-        st.session_state.genre = st.selectbox(
-            "장르",
-            options=list(GENRE_RULES.keys()),
-            index=list(GENRE_RULES.keys()).index(st.session_state.genre)
-                if st.session_state.genre in GENRE_RULES else 0,
-        )
-    with c2:
-        intensity_options = list(INTENSITY_RULES.keys())
-        intensity_labels = {
-            "CONSERVATIVE": "CONSERVATIVE (원본 70%+ 보존)",
-            "BALANCED":     "BALANCED (원본 50% 보존)",
-            "AGGRESSIVE":   "AGGRESSIVE (원본 20~30% 유지)",
+    scenes_pass1 = result1.get('rewriting', {}).get('scenes', [])
+    target_reason = result1.get('rewriting', {}).get('target_reason', '')
+
+    # ── PASS 2: 추가씬 4개 ──
+    # Pass 1 결과를 컨텍스트로 전달
+    pass1_summary = "\n".join([
+        f"  - {sc.get('scene_no','')}: {sc.get('linked_diagnosis','')}"
+        for sc in scenes_pass1
+    ])
+    pass2_instruction = (
+        f"\n\n[이번 호출의 임무]\n"
+        f"이전 호출에서 수정씬 6개를 완성했다. 이번에는 추가씬 4개만 작성하라.\n"
+        f"\n[이미 완성된 수정씬 목록]\n{pass1_summary}\n"
+        f"\n추가씬은 위 수정씬에서 다루지 못한 문제를 보완하거나, 장르적 재미를 복구하는 씬이어야 한다.\n"
+        f"JSON 스키마는 동일하되, scenes 배열에 추가씬 4개만 포함하라.\n"
+        f"target_reason은 생략하라 (빈 문자열)."
+    )
+    st.info("✍️ MOON Pass 2/2 — 추가씬 4개 작성 중...")
+    raw2 = call_claude(client, user_prompt + pass2_instruction, max_tokens=16000, system=SYSTEM_PROMPT)
+    result2 = parse_json(raw2) if raw2 else None
+
+    scenes_pass2 = []
+    if result2 and result2.get('rewriting', {}).get('scenes'):
+        scenes_pass2 = result2.get('rewriting', {}).get('scenes', [])
+
+    # ── 병합 ──
+    all_scenes = scenes_pass1 + scenes_pass2
+    merged = {
+        "rewriting": {
+            "target_reason": target_reason,
+            "scenes": all_scenes
         }
-        selected_label = st.selectbox(
-            "수정 강도 (Intensity)",
-            options=[intensity_labels[k] for k in intensity_options],
-            index=intensity_options.index(st.session_state.intensity),
+    }
+
+    revised_count = sum(1 for s in all_scenes if s.get('type') == '수정씬')
+    added_count = sum(1 for s in all_scenes if s.get('type') == '추가씬')
+    st.success(f"✅ MOON 완료 — 수정씬 {revised_count}개 + 추가씬 {added_count}개 = 총 {len(all_scenes)}개 씬")
+
+    return merged
+
+def _run_pictures_OLD_UNUSED(text, washing, client):
+    suggestions = washing.get('suggestions', [])
+    washing_table = washing.get('washing_table', [])
+    dialogue = washing.get('dialogue_analysis', {})
+    
+    # 각색 제안 요약
+    suggestions_text = "\n".join([f"- {s}" for s in suggestions[:10]])
+    
+    # 워싱 테이블에서 핵심 문제 추출
+    problems_text = "\n".join([
+        f"- [{r.get('seq','')}] {r.get('label','')}: {r.get('diagnosis','')}"
+        for r in washing_table[:6]
+    ])
+
+    # Shiho가 전달한 대사 리라이팅 지시사항
+    dialogue_directives = dialogue.get('rewrite_directives', [])
+    dialogue_issues = dialogue.get('issues', [])
+    
+    directives_text = "\n".join([f"- {d}" for d in dialogue_directives])
+    issues_text = "\n".join([
+        f"- {issue.get('type','')}: {issue.get('rewrite_note','')}\n"
+        f"  ❌ {issue.get('example_bad','')}\n"
+        f"  ✅ 방향: {issue.get('example_good','')}"
+        for issue in dialogue_issues[:4]
+    ])
+
+    # 예시 씬 내용 (f-string 밖에서 정의)
+    example_revised = (
+        "INT. 주인공 집 거실 - 새벽 3시\n\n"
+        "텅 빈 소파. 식어버린 커피잔.\n\n"
+        "주인공: (전화기를 바라보며) '전화하면 안 되는 사람한테 전화하고 싶은 밤이 있잖아.'\n\n"
+        "침묵. 그는 전화기를 뒤집어 화면이 보이지 않게 둔다."
+    )
+    example_added = (
+        "EXT. 한강 다리 위 - 저녁\n\n"
+        "바람이 세다. 두 사람이 난간에 기대 서울 야경을 바라본다.\n\n"
+        "상대: '왜 그때 말 안 했어?'\n\n"
+        "주인공: (강물을 내려다보며) '말했으면 달라졌을 것 같아서. 근데 달라지는 게 더 무서웠거든.'\n\n"
+        "상대가 아무 말 없이 손을 잡는다. 주인공은 뿌리치지 않는다."
+    )
+    fallback_directives = "- 서브텍스트를 담은 대사 작성\n- 인물 고유의 말투 살리기\n- 갈등이 대사 안에 내재될 것"
+    fallback_issues = "- 전반적인 대사 품질 향상 필요"
+
+    prompt = f"""당신은 세계 최고의 각본가입니다.
+글로벌 스튜디오와 OTT 오리지널 양쪽에서 검증된 각본 리라이터입니다.
+
+아래 시나리오의 핵심 문제를 해결하는 각색 원고를 작성하세요.
+
+[진단된 핵심 문제 — Shiho 진단]
+{problems_text}
+
+[각색 제안]
+{suggestions_text}
+
+[대사 리라이팅 지시사항 — Shiho가 Moon에게 전달]
+{directives_text if directives_text else fallback_directives}
+
+[수정이 필요한 대사 유형]
+{issues_text if issues_text else fallback_issues}
+
+[리라이팅 규칙 - 반드시 준수]
+1. 총 10개 씬을 작성한다. 9개나 11개는 실패.
+2. 수정씬 6개: 원본에서 문제가 있는 장면을 완전히 새로 쓴다.
+   - 원본의 핵심 정보(인물, 장소, 사건)는 유지
+   - 대사와 지문은 100% 새로 쓴다
+   - 진단된 문제를 구체적으로 해결해야 한다
+3. 추가씬 4개: 시나리오에 없지만 반드시 필요한 장면을 창작한다.
+   - 각색 제안에서 언급된 빠진 요소를 채운다
+   - 캐릭터 심리, 관계 변화, 복선 등을 보완한다
+4. 각 씬 형식:
+   - 씬헤딩: INT./EXT. 장소 - 시간대
+   - 지문: 3~5줄, 인물의 행동과 감정 묘사
+   - 대사: 인물 이름 뒤 콜론, 홑따옴표 안에 대사
+   - 각 씬 200~300자 분량
+5. 대사 품질 (Shiho 지시사항 반드시 반영):
+   - 인물 고유의 말투와 어휘를 살린다
+   - 대사 안에 서브텍스트(말 뒤에 숨은 감정)를 담는다
+   - "그래", "알아", "맞아" 같은 밋밋한 대사 금지
+   - 한 대사 안에 두 인물의 욕망이 충돌하게 쓴다
+6. JSON만 출력. 마크다운 코드블록 금지.
+
+[JSON 출력 형식]
+{{
+  "rewriting": {{
+    "target_reason": "이 10개 씬을 선택한 전략적 이유 — 어떤 문제를 어떻게 해결하는지 구체적으로 3~4줄",
+    "scenes": [
+      {{
+        "scene_no": "S#3",
+        "type": "수정씬",
+        "insert_between": "",
+        "original": "기존: 주인공이 집에서 혼자 고민하는 장면. 독백 위주로 내면을 직접 설명함.",
+        "content": "{example_revised}"
+      }},
+      {{
+        "scene_no": "S#신규-감정씬",
+        "type": "추가씬",
+        "insert_between": "S#7과 S#8 사이 (복선 구간)",
+        "original": "",
+        "content": "{example_added}"
+      }}
+    ]
+  }}
+}}
+
+[분석할 시나리오]
+{text[:45000]}
+"""
+    raw = call_claude(client, prompt, max_tokens=16000)
+    result = parse_json(raw)
+    # scenes가 비어있으면 raw 확인용 (개발 디버그)
+    if result and not result.get('rewriting', {}).get('scenes'):
+        st.warning(f"⚠️ scenes 파싱 실패. raw 앞 500자: {raw[:500] if raw else 'None'}")
+    return result
+
+# =================================================================
+# [7] 리포트 렌더러
+# =================================================================
+def render_analysis(data):
+
+    # 1. 종합
+    # ── 4축 점수 계산 ──
+    sc       = data.get('scores', {})
+    s_score  = sc.get('structure', 0)
+    h_score  = sc.get('hero', 0)
+    c_score  = sc.get('concept', 0)
+    g_score  = sc.get('genre', 0)
+    final    = data.get('mark', {}).get('final', 0)
+    verdict  = data.get('verdict', {})
+
+    def score_bar(val, color='#191970'):
+        pct = min(int(val) * 10, 100)
+        return (
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="flex:1;background:#E6E9EF;border-radius:20px;height:8px;overflow:hidden;">'
+            f'<div style="background:{color};width:{pct}%;height:100%;border-radius:20px;"></div></div>'
+            f'<div style="font-size:0.82rem;font-weight:900;color:{color};min-width:28px;">{val}</div>'
+            f'</div>'
         )
-        for k, lbl in intensity_labels.items():
-            if lbl == selected_label:
-                st.session_state.intensity = k
-                break
-        st.caption(f"→ {INTENSITY_RULES[st.session_state.intensity]['description']}")
 
-    st.markdown("---")
+    verdict_color = {'추천': '#2EC484', '고려': '#FFCB05', '비추천': '#FF6432'}.get(verdict.get('status', ''), '#191970')
 
-    # ── 피드백 자료 (v2.1: 선택사항으로 격하) ──
-    st.markdown('<div class="rev-card-title">2. 피드백 자료 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항)</span></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">모니터 보고서·투자사 피드백·본인 메모·Rewrite Engine 진단 등 수정 방향에 도움되는 자료를 자유롭게 입력하세요. '
-                '비워두어도 자동 진단이 작동합니다.</div>',
-                unsafe_allow_html=True)
+    # score_bar 변수 미리 생성 (f-string 안 함수호출 → Streamlit 1.54 이스케이프 버그 방지)
+    bar_s = score_bar(s_score, '#191970')
+    bar_h = score_bar(h_score, '#191970')
+    bar_c = score_bar(c_score, '#B8860B')
+    bar_g = score_bar(g_score, '#2EC484')
+    final_pct = min(int(float(final)*10), 100)
+    verdict_status    = safe(verdict.get('status',''))
+    verdict_rationale = safe(verdict.get('rationale',''))
 
-    # Rewrite Engine JSON 자동 변환 expander
-    with st.expander("🔗 Rewrite Engine 진단·처방 JSON 불러오기 (자동 변환)"):
-        st.caption("Rewrite Engine에서 다운로드한 진단·처방 JSON을 업로드하거나 텍스트로 붙여넣으면, "
-                   "CHRIS 분석 + SHIHO 처방이 자동으로 수정 지시문으로 변환됩니다. "
-                   "(MOON 리라이팅은 자동 제외됩니다.)")
+    # 섹션1-A: 점수 헤더 카드
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>1. 종합 분석 (Total Analysis) — Hollywood Standard</h3>
+        <div style="display:flex;align-items:center;gap:20px;margin-bottom:20px;
+                    background:#F0F2FF;border-radius:12px;padding:16px 20px;">
+            <div style="text-align:center;min-width:70px;">
+                <div style="font-size:3rem;font-weight:950;color:#FFCB05;line-height:1;">{final}</div>
+                <div style="font-size:0.72rem;color:#191970;opacity:0.5;margin-top:2px;">/ 10.0</div>
+            </div>
+            <div style="width:1px;height:52px;background:#E0E4F0;"></div>
+            <div style="flex:1;">
+                <div style="display:inline-block;background:{verdict_color};color:#FFFFFF;
+                            padding:3px 14px;border-radius:20px;font-weight:900;
+                            font-size:0.82rem;margin-bottom:6px;">{verdict_status}</div>
+                <div style="font-size:0.86rem;line-height:1.7;color:#191970;">{verdict_rationale}</div>
+            </div>
+        </div>
+        <div style="font-size:0.72rem;font-weight:900;letter-spacing:0.1em;color:#191970;
+                    opacity:0.5;margin-bottom:10px;">4축 정밀 평가 (Hollywood Standard)</div>
+    </div>""", unsafe_allow_html=True)
 
-        rj_col1, rj_col2 = st.columns([1, 1])
-        with rj_col1:
-            uploaded_json = st.file_uploader(
-                "JSON 파일 업로드",
-                type=["json"],
-                key="rewrite_json_uploader",
-            )
-        with rj_col2:
-            pasted_json = st.text_area(
-                "또는 JSON 직접 붙여넣기",
-                height=120,
-                key="rewrite_json_pasted",
-                placeholder='{\n  "scores": {...},\n  "pros_cons": {...},\n  ...\n}',
-            )
+    # 섹션1-B: 4축 테이블 (score_bar 변수 사용)
+    st.markdown(f"""
+    <div class="report-card" style="margin-top:4px;">
+        <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+            <thead>
+                <tr style="background:#191970;">
+                    <th style="padding:8px 12px;text-align:left;color:#FFCB05 !important;font-size:0.72rem;letter-spacing:0.08em;width:22%;">AXIS</th>
+                    <th style="padding:8px 12px;text-align:left;color:#FFCB05 !important;font-size:0.72rem;letter-spacing:0.08em;width:18%;">가중치</th>
+                    <th style="padding:8px 12px;text-align:left;color:#FFCB05 !important;font-size:0.72rem;letter-spacing:0.08em;">평가 기준</th>
+                    <th style="padding:8px 12px;text-align:left;color:#FFCB05 !important;font-size:0.72rem;letter-spacing:0.08em;width:30%;">점수</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr style="background:#F8F9FF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:10px 12px;font-weight:900;color:#191970;">① STRUCTURE<br><span style="font-weight:400;font-size:0.75rem;color:#8899BB;">구성/플롯</span></td>
+                    <td style="padding:10px 12px;font-weight:700;color:#191970;">30%</td>
+                    <td style="padding:10px 12px;color:#191970;font-size:0.82rem;line-height:1.5;">인과관계의 정밀도<br>3막 구조의 완성도</td>
+                    <td style="padding:10px 12px;">{bar_s}</td>
+                </tr>
+                <tr style="background:#FFFFFF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:10px 12px;font-weight:900;color:#191970;">② HERO<br><span style="font-weight:400;font-size:0.75rem;color:#8899BB;">캐릭터</span></td>
+                    <td style="padding:10px 12px;font-weight:700;color:#191970;">30%</td>
+                    <td style="padding:10px 12px;color:#191970;font-size:0.82rem;line-height:1.5;">Goal / Need / Strategy<br>감정선의 선명도</td>
+                    <td style="padding:10px 12px;">{bar_h}</td>
+                </tr>
+                <tr style="background:#F8F9FF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:10px 12px;font-weight:900;color:#191970;">③ CONCEPT<br><span style="font-weight:400;font-size:0.75rem;color:#8899BB;">소재/컨셉</span></td>
+                    <td style="padding:10px 12px;font-weight:700;color:#191970;">20%</td>
+                    <td style="padding:10px 12px;color:#191970;font-size:0.82rem;line-height:1.5;">하이컨셉 여부 · 독창성<br>시장성 있는 설정</td>
+                    <td style="padding:10px 12px;">{bar_c}</td>
+                </tr>
+                <tr style="background:#FFFFFF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:10px 12px;font-weight:900;color:#191970;">④ GENRE<br><span style="font-weight:400;font-size:0.75rem;color:#8899BB;">장르 적합성</span></td>
+                    <td style="padding:10px 12px;font-weight:700;color:#191970;">20%</td>
+                    <td style="padding:10px 12px;color:#191970;font-size:0.82rem;line-height:1.5;">장르 문법 충실도<br>타깃 관객 소구력</td>
+                    <td style="padding:10px 12px;">{bar_g}</td>
+                </tr>
+                <tr style="background:#EEF0FA;">
+                    <td colspan="2" style="padding:10px 12px;font-weight:900;color:#191970;font-size:0.9rem;">FINAL</td>
+                    <td style="padding:10px 12px;font-size:0.78rem;color:#191970;opacity:0.6;">0.3S + 0.3H + 0.2C + 0.2G</td>
+                    <td style="padding:10px 12px;">
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <div style="flex:1;background:#C5CBE8;border-radius:20px;height:8px;overflow:hidden;">
+                                <div style="background:#FFCB05;width:{final_pct}%;height:100%;border-radius:20px;"></div>
+                            </div>
+                            <div style="font-size:0.95rem;font-weight:950;color:#FFCB05;min-width:36px;">{final}</div>
+                        </div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>""", unsafe_allow_html=True)
 
-        if st.button("📥 Rewrite Engine JSON → 수정 지시문 변환", key="btn_convert_rewrite_json"):
-            json_source = None
-            if uploaded_json is not None:
-                try:
-                    json_source = uploaded_json.read().decode("utf-8")
-                except Exception as e:
-                    st.error(f"파일 읽기 실패: {e}")
-            elif pasted_json.strip():
-                json_source = pasted_json.strip()
+    # 2. 로그라인
+    log = data.get('logline', {})
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>2. 로그라인 분석 (Logline Pack)</h3>
+        <div style="padding:14px;border:1px solid #E6E9EF;border-radius:8px;margin-bottom:12px;">
+            <div style="font-size:0.7rem;font-weight:700;letter-spacing:0.12em;margin-bottom:6px;color:#191970;opacity:0.6;">ORIGINAL</div>
+            <div style="line-height:1.7;color:#191970;">{safe(log.get('original', ''))}</div>
+        </div>
+        <div style="padding:14px;border:2px solid #FFCB05;border-radius:8px;background:#FFFBE6;">
+            <div style="font-size:0.7rem;font-weight:700;letter-spacing:0.12em;margin-bottom:6px;color:#B8860B;">✨ WASHED</div>
+            <div style="font-weight:700;font-size:1.05rem;line-height:1.7;color:#191970;">{safe(log.get('washed', ''))}</div>
+        </div>
+    </div>""", unsafe_allow_html=True)
 
-            if json_source:
-                try:
-                    # v2.0 — 원문도 별도 저장 (메타 흡수용)
-                    st.session_state.rewrite_json_text = json_source
-                    st.session_state.rewrite_metadata = None  # 캐시 무효화
+    # 3. 줄거리
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>3. 줄거리 분석 (Synopsis)</h3>
+        <div style="line-height:1.9;color:#191970;">{safe(data.get('synopsis', ''))}</div>
+    </div>""", unsafe_allow_html=True)
 
-                    converted = parse_rewrite_engine_json(json_source)
-                    if converted:
-                        # 기존 지시문이 있으면 추가, 없으면 대체
-                        if st.session_state.instruction.strip():
-                            st.session_state.instruction = (
-                                st.session_state.instruction.rstrip() +
-                                "\n\n--- Rewrite Engine 진단·처방 결과 ---\n\n" +
-                                converted
-                            )
-                        else:
-                            st.session_state.instruction = converted
-                        st.success(f"✅ 변환 완료! 지시문에 추가되었습니다 ({len(converted):,}자). v2.0 진단 시 preserve_notes·weak_zones도 자동 흡수됩니다.")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ JSON에서 변환 가능한 진단·처방 내용을 찾지 못했습니다.")
-                except Exception as e:
-                    st.error(f"변환 실패: {e}")
+    # 4. 장단점
+    pc = data.get('pros_cons', {})
+    pros_html = "".join([f"<li style='margin-bottom:7px;line-height:1.6;color:#191970;'>{safe(p)}</li>" for p in pc.get('pros', [])])
+    cons_html = "".join([f"<li style='margin-bottom:7px;line-height:1.6;color:#191970;'>{safe(c)}</li>" for c in pc.get('cons', [])])
+    prescription = safe(pc.get('prescription', ''))
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>4. 장점 및 보완점 (Pros &amp; Cons)</h3>
+        <div style="display:flex;gap:14px;">
+            <div style="flex:1;background:#EDFAF3;border-left:3px solid #2EC484;padding:16px;border-radius:8px;">
+                <div style="color:#1A7A50;font-weight:800;font-size:0.75rem;margin-bottom:10px;">✅ PROS</div>
+                <ul style="margin:0;padding-left:16px;">{pros_html}</ul>
+            </div>
+            <div style="flex:1;background:#FFF3EE;border-left:3px solid #FF6432;padding:16px;border-radius:8px;">
+                <div style="color:#CC3300;font-weight:800;font-size:0.75rem;margin-bottom:10px;">⚠️ CONS</div>
+                <ul style="margin:0;padding-left:16px;">{cons_html}</ul>
+            </div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+    if prescription:
+        st.markdown(f"""
+        <div style="background:#FFFBE6;border-left:4px solid #FFCB05;padding:14px 16px;
+                    border-radius:8px;margin-top:-8px;margin-bottom:16px;">
+            <div style="font-size:0.75rem;font-weight:800;color:#B8860B;
+                        margin-bottom:6px;letter-spacing:0.08em;">💊 핵심 처방 (Key Prescription)</div>
+            <div style="font-size:0.9rem;line-height:1.8;color:#191970;font-weight:600;">{prescription}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # 5. 서사동력
+    drive = data.get('drive', {})
+    if not isinstance(drive, dict):
+        drive = {}
+    ev = drive.get('evaluation', {})
+    # 방어: evaluation이 문자열이나 리스트로 올 수 있음
+    if not isinstance(ev, dict):
+        ev = {'overall_diagnosis': str(ev) if ev else ''}
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>5. 서사 동력 (Narrative Drive)</h3>
+        <div style="display:flex;gap:10px;margin-bottom:14px;">
+            <div style="flex:1;background:#FFFBE6;padding:14px;border-radius:10px;text-align:center;border:1px solid #FFE066;">
+                <div style="font-size:0.72rem;color:#B8860B;font-weight:700;margin-bottom:7px;">① 목적(욕망)</div>
+                <div style="font-size:0.87rem;line-height:1.5;color:#191970;">{safe(drive.get('goal', ''))}</div>
+            </div>
+            <div style="flex:1;background:#FFFBE6;padding:14px;border-radius:10px;text-align:center;border:1px solid #FFE066;">
+                <div style="font-size:0.72rem;color:#B8860B;font-weight:700;margin-bottom:7px;">② 발생요인</div>
+                <div style="font-size:0.87rem;line-height:1.5;color:#191970;">{safe(drive.get('lack', ''))}</div>
+            </div>
+            <div style="flex:1;background:#FFFBE6;padding:14px;border-radius:10px;text-align:center;border:1px solid #FFE066;">
+                <div style="font-size:0.72rem;color:#B8860B;font-weight:700;margin-bottom:7px;">③ 해결전략</div>
+                <div style="font-size:0.87rem;line-height:1.5;color:#191970;">{safe(drive.get('strategy', ''))}</div>
+            </div>
+        </div>
+        <div style="background:#EEF0FA;padding:14px;border-radius:8px;border:1px solid #C5CBE8;">
+            <p style="margin:4px 0;font-size:0.88rem;color:#191970;"><strong>목적(욕망) 명확성</strong>  {safe(ev.get('clarity', ''))}</p>
+            <p style="margin:4px 0;font-size:0.88rem;color:#191970;"><strong>발생요인 확실성</strong>  {safe(ev.get('urgency', ''))}</p>
+            <p style="margin:4px 0;font-size:0.88rem;color:#191970;"><strong>해결전략 창의성</strong>  {safe(ev.get('consistency', ''))}</p>
+            <p style="margin:10px 0 0;font-size:0.88rem;line-height:1.7;color:#191970;border-top:1px solid #C5CBE8;padding-top:10px;">{safe(ev.get('overall_diagnosis', ''))}</p>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    # 6. 15-Beat Sheet
+    beats = data.get('beats', {})
+    circles = {i: c for i, c in enumerate(['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩','⑪','⑫','⑬','⑭','⑮'], 1)}
+    BEAT_KO = {
+        "Opening Image":   "오프닝 이미지",
+        "Theme Stated":    "주제 제시",
+        "Set-up":          "설정",
+        "Catalyst":        "촉매",
+        "Debate":          "갈등",
+        "Break Into Two":  "2막 진입",
+        "B Story":         "B 스토리",
+        "Fun and Games":   "재미와 게임",
+        "Midpoint":        "중간점",
+        "Bad Guys Close In":"위기 고조",
+        "All Is Lost":     "모든 것을 잃다",
+        "Dark Night of Soul":"영혼의 어둔 밤",
+        "Break Into Three":"3막 진입",
+        "Finale":          "피날레",
+        "Final Image":     "최종 이미지",
+    }
+    rows = ""
+    # 방어: beats가 list로 올 수도 있음 (예: [{"name": "Opening Image", "content": "..."}])
+    if isinstance(beats, list):
+        beat_items = []
+        for i, item in enumerate(beats, 1):
+            if isinstance(item, dict):
+                k = item.get('name', item.get('beat', f'Beat {i}'))
+                v = item.get('content', item.get('desc', item.get('description', '')))
+                beat_items.append((f"{i:02d}. {k}", v))
             else:
-                st.warning("⚠️ JSON 파일을 업로드하거나 텍스트로 붙여넣어 주세요.")
-
-    st.session_state.instruction = st.text_area(
-        "지시문",
-        value=st.session_state.instruction,
-        height=240,
-        placeholder="예:\n• 3막에서 주인공이 특정 남주를 선택하는 결말이 뻔함. 자기 발견 엔딩으로 재집필.\n"
-                    "• 유진의 대사가 너무 설명적임. 행동으로 보여주도록.\n"
-                    "• S#35 카페 씬의 시작을 '도착 과정' 대신 '이미 진행 중인 상황'으로 변경.\n\n"
-                    "또는 Rewrite Engine의 진단·처방 내용을 그대로 붙여넣기도 가능합니다.",
-        label_visibility="collapsed",
-    )
-
-    # ── LOCKED ──
-    st.markdown('<div class="rev-card-title">3. LOCKED — 절대 건드리지 말 요소</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">수정에서 제외할 요소를 자유롭게 적어주세요. LOCKED는 지시문보다 우선합니다.</div>',
-                unsafe_allow_html=True)
-    st.session_state.locked = st.text_area(
-        "LOCKED",
-        value=st.session_state.locked,
-        height=120,
-        placeholder="예:\n• 주인공의 직업(쇼핑 호스트) 유지\n"
-                    "• 엔딩에서 주인공이 혼자 남는 구도 유지\n"
-                    "• S#50의 반전은 건드리지 말 것\n"
-                    "• 세웅 캐릭터의 대사는 그대로 유지",
-        label_visibility="collapsed",
-    )
-
-    # ── 직업 전문성 (선택사항) ──
-    st.markdown('<div class="rev-card-title">4. 주요 캐릭터 직업 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항)</span></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">입력 시 해당 직업의 전문 용어·공간 디테일·금지 사항이 수정본 집필에 반영됩니다. '
-                '비워두면 원본에서 자동 감지합니다.</div>', unsafe_allow_html=True)
-    st.session_state.profession_input = st.text_area(
-        "직업",
-        value=st.session_state.profession_input,
-        height=80,
-        placeholder="예: 유진=쇼핑 호스트, 진호=변호사, 세웅=셰프\n"
-                    "또는 단순히: 변호사, 셰프, 쇼핑 호스트",
-        label_visibility="collapsed",
-    )
-
-    # ── 시대 / 역사영화 / 실화 (선택사항) ──
-    st.markdown('<div class="rev-card-title">5. 시대 · 실화 정보 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(사극·시대극·실화영화 작업 시)</span></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">현대 배경이면 그대로 두세요. 사극·시대극이면 시대를 선택하고, 실화 기반이면 체크하세요.</div>',
-                unsafe_allow_html=True)
-
-    period_keys = get_period_keys_for_ui()
-    period_labels = get_period_labels_for_ui()
-
-    cp1, cp2 = st.columns([1, 1])
-    with cp1:
-        # 시대 드롭다운
+                beat_items.append((f"{i:02d}. Beat {i}", str(item)))
+    elif isinstance(beats, dict):
+        # value가 dict인 경우 ("01. Opening Image": {"content": "..."}) 평탄화
+        beat_items = []
+        for k, v in beats.items():
+            if isinstance(v, dict):
+                v = v.get('content', v.get('desc', v.get('description', str(v))))
+            beat_items.append((k, v))
+        # 안전 정렬: 숫자 prefix 기준 (k가 string일 때만)
         try:
-            current_idx = period_keys.index(st.session_state.period_key)
-        except ValueError:
-            current_idx = 0
-        selected_period = st.selectbox(
-            "시대 배경",
-            options=period_keys,
-            index=current_idx,
-            format_func=lambda k: period_labels.get(k, k),
-        )
-        st.session_state.period_key = selected_period
+            beat_items.sort(key=lambda x: str(x[0]))
+        except Exception:
+            pass
+    else:
+        beat_items = []
 
-    with cp2:
-        # 역사영화 유형 (사극일 때만 활성화)
-        is_historical = (st.session_state.period_key != "(현대)")
-        ht_options = ["정통", "팩션", "퓨전"]
-        try:
-            ht_idx = ht_options.index(st.session_state.historical_type)
-        except ValueError:
-            ht_idx = 0
-        selected_ht = st.radio(
-            "역사영화 유형",
-            options=ht_options,
-            index=ht_idx,
-            horizontal=True,
-            disabled=not is_historical,
-            help="정통: 사실 충실 / 팩션: 사실+허구 결합 / 퓨전: 현대 감각 적극 도입",
-        )
-        st.session_state.historical_type = selected_ht
-        if not is_historical:
-            st.caption("→ 시대 선택 시 활성화됩니다")
+    for idx, (k, v) in enumerate(beat_items, 1):
+        name = re.sub(r'^[\d\.\-\_\s]+', '', str(k)).strip()
+        ko = BEAT_KO.get(name, '')
+        display_name = f"{ko}<br><span style='font-weight:400;font-size:0.75rem;color:#8899BB;'>({name})</span>" if ko else name
+        bg = "#F8F9FF" if idx % 2 == 0 else "#FFFFFF"
+        rows += (f'<tr style="background:{bg};border-bottom:1px solid #E6E9EF;">'
+                 f'<td style="padding:9px 14px;font-weight:700;color:#191970;width:26%;font-size:0.85rem;">{circles.get(idx,"")} {display_name}</td>'
+                 f'<td style="padding:9px 14px;line-height:1.6;font-size:0.86rem;color:#191970;">{safe(v)}</td></tr>')
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>6. 구성 및 플롯 (15-Beat Sheet)</h3>
+        <table style="width:100%;border-collapse:collapse;">
+            <thead><tr style="background:#191970;">
+                <th style="padding:9px 14px;text-align:left;font-size:0.75rem;letter-spacing:0.1em;color:#FFCB05 !important;width:26%;">BEAT</th>
+                <th style="padding:9px 14px;text-align:left;font-size:0.75rem;letter-spacing:0.1em;color:#FFCB05 !important;">DESCRIPTION</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+    </div>""", unsafe_allow_html=True)
 
-    # 실화 기반 체크박스
-    st.session_state.fact_based = st.checkbox(
-        "🎬 이 작품은 실화 또는 역사적 사건을 기반으로 합니다 (명예훼손·인격권 가이드 적용)",
-        value=st.session_state.fact_based,
-        help="실명 사용·특정 가능 디테일·실존 공인 악역화 등의 리스크를 자동 점검합니다",
-    )
-
-    # ── 6. 고급 옵션 (작가 톤 학습 + 장르 DNA) — 펼치기 ──
-    advanced_label = "🎛️ 고급 옵션 — 작가 톤 학습 + 장르 DNA (선택사항)"
-    if st.session_state.work_mode == "continuation":
-        advanced_label = "🎛️ 고급 옵션 — 장르 DNA로 톤 강화 (선택사항)"
-
-    with st.expander(advanced_label, expanded=False):
-        st.markdown('<div class="rev-caption">필요시 펼쳐서 추가 자료를 업로드하세요. 모두 선택사항입니다.</div>',
-                    unsafe_allow_html=True)
-
-        tab_tone, tab_diff, tab_genre = st.tabs([
-            "📐 톤 레퍼런스 (작가 톤 1편)",
-            "🔬 Diff 학습 (Before vs After)",
-            "🎬 장르 DNA (참고작 1~3편)"
-        ])
-
-        # 탭 1: 톤 레퍼런스 (작가 손본 1편)
-        with tab_tone:
-            st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 작가 고유의 톤 DNA를 자동 추출해 모든 새 각색에 강제 주입합니다.")
-            ref_file = st.file_uploader(
-                "작가가 손본 시나리오 (DOCX 또는 PDF)",
-                type=["docx", "pdf"],
-                key="tone_ref_uploader",
-                help="예: v2_3 같은 작가가 직접 다듬은 버전"
-            )
-            if ref_file:
-                _text = extract_text_from_uploaded_file(ref_file)
-                if _text:
-                    st.session_state.tone_ref_text = _text
-                    st.session_state.tone_ref_filename = ref_file.name
-                    st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
-                    if st.session_state.tone_dna:
-                        st.info("✓ 톤 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 톤이 시나리오 분석·집필에 자동 적용됩니다.")
-                    else:
-                        st.caption("→ Stage 1 진단 시작 시 톤 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
-            elif st.session_state.tone_ref_filename:
-                st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
-                if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
-                    st.session_state.tone_ref_text = ""
-                    st.session_state.tone_ref_filename = ""
-                    st.session_state.tone_dna = None
-                    st.rerun()
-
-        # 탭 2: Diff 학습 (Before + After)
-        with tab_diff:
-            st.caption("이전 버전(Before) vs 작가 손본 최신(After) 두 개를 비교해 편집 패턴(삭제·압축·통합 기준)을 자동 학습합니다.")
-
-            use_main = st.checkbox(
-                "✅ Before로 1번 원본 시나리오를 자동 사용 (권장)",
-                value=st.session_state.diff_use_main_as_before,
-                key="diff_use_main_chk",
-                help="대부분의 경우 1번 원본을 Before로 쓰는 것이 자연스럽습니다."
-            )
-            st.session_state.diff_use_main_as_before = use_main
-
-            ref2_file = st.file_uploader(
-                "손본 최신 버전 (After · DOCX 또는 PDF)",
-                type=["docx", "pdf"],
-                key="diff_refined_uploader",
-                help="예: v2_3"
-            )
-            if ref2_file:
-                _text = extract_text_from_uploaded_file(ref2_file)
-                if _text:
-                    st.session_state.diff_refined_text = _text
-                    st.session_state.diff_refined_filename = ref2_file.name
-                    st.success(f"✅ After 등록: {ref2_file.name} ({len(_text):,}자)")
-            elif st.session_state.diff_refined_filename:
-                st.info(f"📎 After: {st.session_state.diff_refined_filename}")
-
-            if not use_main:
-                st.markdown("**고급 옵션 — Before 별도 업로드:**")
-                orig_file = st.file_uploader(
-                    "Before (별도 지정 · DOCX 또는 PDF)",
-                    type=["docx", "pdf"],
-                    key="diff_orig_uploader",
-                )
-                if orig_file:
-                    _text = extract_text_from_uploaded_file(orig_file)
-                    if _text:
-                        st.session_state.diff_orig_text = _text
-                        st.session_state.diff_orig_filename = orig_file.name
-                        st.success(f"✅ Before: {orig_file.name}")
-
-            if st.session_state.diff_refined_text:
-                if st.session_state.diff_analysis:
-                    st.info("✓ Diff 학습 완료. **Stage 1 진단 시작** 버튼을 누르면 학습된 편집 패턴이 시나리오 분석·집필에 자동 적용됩니다.")
-                else:
-                    st.caption("→ Stage 1 진단 시작 시 편집 패턴이 자동으로 먼저 학습되고, 그 결과로 시나리오를 진단합니다.")
-                if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
-                    st.session_state.diff_refined_text = ""
-                    st.session_state.diff_refined_filename = ""
-                    st.session_state.diff_orig_text = ""
-                    st.session_state.diff_orig_filename = ""
-                    st.session_state.diff_analysis = None
-                    st.rerun()
-
-        # 탭 3: 장르 DNA (참고작 1~3편)
-        with tab_genre:
-            # 가장 위에 '선택사항' 강조
-            st.markdown(
-                '<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
-                'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
-                '<b>💡 장르 DNA는 100% 선택사항입니다.</b><br>'
-                '없어도 엔진은 정상 작동합니다 (일반 장르 룰 적용).<br>'
-                '있으면 같은 장르 명작들의 본질(코믹 폭발·정보 비대칭 등)을 정량적으로 강제할 수 있습니다.'
-                '</div>',
-                unsafe_allow_html=True
-            )
-
-            st.caption("📝 한국어·영문 시나리오 모두 가능. 영문 명작도 자유롭게 사용하세요 (출력은 항상 한국어).")
-
-            # ─────────────────────────────────────────
-            # STEP 1. 참고작 업로드 (메인 동선)
-            # ─────────────────────────────────────────
-            st.markdown('<div style="background:#FFF8DD; padding:10px 14px; border-radius:6px; '
-                        'border-left:3px solid #FFCB05; margin:12px 0 8px; font-size:0.88rem;">'
-                        '<b>① 처음 사용 — 참고작이 없으면?</b><br>'
-                        '아래 사이트에서 무료로 다운로드 가능합니다:<br>'
-                        '• <b>IMSDb</b> (imsdb.com) — Hollywood 명작 다수<br>'
-                        '• <b>SimplyScripts</b> (simplyscripts.com) — 장르별 정리<br>'
-                        '• <b>Script Slug</b> (scriptslug.com) — 최신작<br>'
-                        '같은 장르 명작 1~3편 다운 → 아래 업로드 → 분석 시 장르 DNA 자동 추출'
-                        '</div>', unsafe_allow_html=True)
-
-            genre_files = st.file_uploader(
-                "참고작 시나리오 (1~3편 · 같은 장르 · DOCX 또는 PDF)",
-                type=["docx", "pdf"],
-                key="genre_ref_uploader",
-                accept_multiple_files=True,
-                help="한국·영문 모두 가능. 외부 시나리오는 보통 PDF로 유통됩니다 (IMSDb·SimplyScripts 등). "
-                     "예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
-                     "느와르 → 「Drive」+「No Country for Old Men」 / 호러 → 「Hereditary」+「Get Out」"
-            )
-            if genre_files:
-                texts = []
-                names = []
-                for gf in genre_files[:3]:
-                    _text = extract_text_from_uploaded_file(gf)
-                    if _text:
-                        texts.append(_text)
-                        names.append(gf.name)
-                if texts:
-                    st.session_state.genre_ref_texts = texts
-                    st.session_state.genre_ref_filenames = names
-                    total_chars = sum(len(t) for t in texts)
-                    st.success(f"✅ 참고작 {len(texts)}편 로드 (총 {total_chars:,}자): {', '.join(names)}")
-                    if st.session_state.genre_dna:
-                        st.info("✓ 장르 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 DNA가 시나리오 분석·집필에 자동 적용됩니다.")
-                    else:
-                        st.caption("→ Stage 1 진단 시작 시 장르 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
-            elif st.session_state.genre_ref_filenames:
-                st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
-
-            # ─────────────────────────────────────────
-            # STEP 2. 추출된 DNA 다운로드 (라이브러리 보관)
-            # ─────────────────────────────────────────
-            if st.session_state.genre_dna:
-                st.markdown('<div style="background:#EAF3DE; padding:8px 12px; border-radius:6px; '
-                            'border-left:3px solid #2EC484; margin:14px 0 8px; font-size:0.88rem;">'
-                            '<b>② 추출 완료 — 다음 작품에서 재사용하려면 JSON으로 보관하세요</b>'
-                            '</div>', unsafe_allow_html=True)
-                import json as _json
-                dna_json = _json.dumps(st.session_state.genre_dna, ensure_ascii=False, indent=2)
-                cdl1, cdl2 = st.columns([3, 1])
-                with cdl1:
-                    st.download_button(
-                        "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
-                        data=dna_json.encode("utf-8"),
-                        file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
-                        mime="application/json",
-                        key="dl_genre_dna",
-                        help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요",
-                        use_container_width=True,
-                    )
-                with cdl2:
-                    if st.button("🗑️ 제거", key="btn_clear_genre_dna", use_container_width=True):
-                        st.session_state.genre_ref_texts = []
-                        st.session_state.genre_ref_filenames = []
-                        st.session_state.genre_dna = None
-                        st.rerun()
-
-            # ─────────────────────────────────────────
-            # STEP 3. 라이브러리 — 이전에 보관한 JSON 재사용 (반복 사용자)
-            # ─────────────────────────────────────────
-            st.markdown("---")
-            with st.expander("📚 장르 DNA 라이브러리 — 이전에 추출해둔 JSON 불러오기"):
-                st.caption("같은 장르로 작업한 적이 있다면, 이전에 다운로드해둔 JSON을 업로드해서 "
-                           "참고작 다시 안 올리고 바로 적용할 수 있습니다.")
-                dna_json_file = st.file_uploader(
-                    "장르 DNA JSON 업로드",
-                    type=["json"],
-                    key="genre_dna_json_uploader"
-                )
-                if dna_json_file:
+    # 7. 시각화
+    st.markdown('<div class="report-card"><h3>7. 시각화 (Visualization)</h3></div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        arc = data.get('tension_data', [])
+        nums = []
+        for v in arc:
+            try: nums.append(float(v))
+            except: pass
+        if nums:
+            fig = px.line(y=nums, template="plotly_white", title="긴장도 곡선 (Tension Arc)")
+            fig.update_traces(line_color='#191970', line_width=2.5, mode='lines+markers',
+                              marker=dict(size=6, color='#FFCB05', line=dict(color='#191970', width=1)))
+            fig.update_layout(height=260, margin=dict(l=10,r=10,t=36,b=10),
+                              paper_bgcolor='#FAFAFA', plot_bgcolor='#FAFAFA',
+                              yaxis=dict(range=[0,11], gridcolor='#E6E9EF'),
+                              xaxis=dict(gridcolor='#E6E9EF'),
+                              title_font_color='#191970', font_color='#191970', title_font_size=13)
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    with col2:
+        chars = data.get('characters', {})
+        # 방어: characters가 list로 올 수도 있음 (예: [{"name": "A", "ratio": 60}])
+        if isinstance(chars, list):
+            names = []
+            ratios = []
+            for c in chars:
+                if isinstance(c, dict):
+                    names.append(str(c.get('name', '')))
                     try:
-                        import json as _json
-                        raw = dna_json_file.read().decode("utf-8")
-                        loaded = _json.loads(raw)
-                        st.session_state.genre_dna = loaded
-                        summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
-                        st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
-                    except Exception as e:
-                        st.error(f"JSON 로드 실패: {e}")
-
-    # ── 실행 버튼 ──
-    st.markdown("---")
-
-    # 모드별 입력 검증
-    has_scenario = bool(st.session_state.raw_text)
-    work_mode = st.session_state.work_mode
-    ready = False
-    error_msg = None
-    info_msg = None
-
-    if not has_scenario:
-        error_msg = "⚠️ 1번 원본 시나리오 업로드는 필수입니다."
-    elif work_mode == "continuation":
-        if not st.session_state.diff_refined_text:
-            error_msg = "⚠️ 이어쓰기 모드는 2번 손본 시나리오 업로드가 필수입니다."
+                        ratios.append(float(c.get('ratio', c.get('ratios', 0))))
+                    except (ValueError, TypeError):
+                        ratios.append(0)
+        elif isinstance(chars, dict):
+            names = [str(n) for n in chars.get('names', [])]
+            ratios = []
+            for r in chars.get('ratios', []):
+                try:
+                    ratios.append(float(r))
+                except (ValueError, TypeError):
+                    ratios.append(0)
         else:
-            ready = True
-    elif work_mode == "partial":
-        if not st.session_state.revision_ranges:
-            error_msg = ("⚠️ 부분 수정 모드는 재집필 구간 선택이 필수입니다. "
-                         "1막/2막/3막 버튼을 누르거나 직접 입력하세요.")
-        else:
-            ready = True
+            names = []
+            ratios = []
+
+        # 길이 정합성 — 더 짧은 쪽에 맞춤
+        n = min(len(names), len(ratios))
+        names = names[:n]
+        ratios = ratios[:n]
+
+        # 모든 값이 0이면 그래프 안 그림 (plotly 에러 방지)
+        if names and ratios and sum(ratios) > 0:
+            fig2 = px.pie(values=ratios, names=names,
+                          hole=0.45, title="인물 비중 (Narrative Share)",
+                          color_discrete_sequence=['#191970','#FFCB05','#2EC484','#FF6432','#94A3B8'])
+            fig2.update_layout(height=260, margin=dict(l=10,r=10,t=36,b=10),
+                               paper_bgcolor='#FAFAFA',
+                               title_font_color='#191970', font_color='#191970', title_font_size=13,
+                               legend=dict(font=dict(color='#191970', size=11)))
+            st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False})
+
+    # 8. 장르
+    genre = data.get('genre_compliance', {})
+    # must_have_check 렌더링 (새 스키마)
+    must_checks = genre.get('must_have_check', [])
+    if must_checks:
+        tags = "".join([
+            f"<span style='background:{'#EDFAF3' if c.get('status','') == '충족' else ('#FFFBE6' if c.get('status','') == '약함' else '#FFF3EE')};color:{'#1A7A50' if c.get('status','') == '충족' else ('#B8860B' if c.get('status','') == '약함' else '#CC3300')};border:1px solid {'#2EC484' if c.get('status','') == '충족' else ('#FFE066' if c.get('status','') == '약함' else '#FF6432')};padding:3px 11px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:7px;margin-bottom:6px;display:inline-block;'>{'✓' if c.get('status','') == '충족' else ('△' if c.get('status','') == '약함' else '✗')} {safe(c.get('item',''))}</span>"
+            for c in must_checks
+        ])
     else:
-        # 전체 각색 모드
-        ready = True
-        aux_inputs = [
-            bool(st.session_state.instruction.strip()),
-            bool(st.session_state.rewrite_json_text.strip()),
-            bool(st.session_state.genre_dna or st.session_state.genre_ref_texts),
-            bool(st.session_state.tone_ref_text),
+        # fallback: 이전 스키마 호환
+        tags = "".join([
+            f"<span style='background:#EDFAF3;color:#1A7A50;border:1px solid #2EC484;padding:3px 11px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:7px;margin-bottom:6px;display:inline-block;'>✓ {safe(c)}</span>"
+            for c in genre.get('checks', [])
+        ])
+    missing = genre.get('missing_elements', [])
+    missing_html = "".join([
+        f"<span style='background:#FFF3EE;color:#CC3300;border:1px solid #FF6432;padding:3px 10px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:6px;margin-bottom:6px;display:inline-block;'>✗ {safe(m)}</span>"
+        for m in missing
+    ])
+    compliance = genre.get('compliance_score', 0)
+    bar_color = '#2EC484' if compliance >= 7 else ('#FFCB05' if compliance >= 4 else '#FF6432')
+    genre_display = safe(genre.get('genre_key', genre.get('genre_name', '')))
+    
+    # 장르적 재미 진단
+    genre_fun_diagnosis = safe(genre.get('genre_fun_diagnosis', ''))
+    genre_fun_alive = genre.get('genre_fun_alive', None)
+    fun_badge = ""
+    if genre_fun_alive is not None:
+        fun_badge = (f"<span style='background:{'#EDFAF3' if genre_fun_alive else '#FFF3EE'};color:{'#1A7A50' if genre_fun_alive else '#CC3300'};"
+                     f"border:1px solid {'#2EC484' if genre_fun_alive else '#FF6432'};padding:3px 11px;border-radius:20px;font-size:0.75rem;"
+                     f"font-weight:700;margin-left:10px;'>{'✓ 장르적 재미 작동' if genre_fun_alive else '✗ 장르적 재미 약함'}</span>")
+
+    # 실패 패턴 데이터 (렌더링은 아래에서 별도 st.markdown으로)
+    fail_patterns = genre.get('fail_patterns_found', [])
+
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>8. 장르 분석 및 적합도 (Genre Compliance)</h3>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+            <div style="font-size:1.5rem;font-weight:900;color:#191970;">{genre_display}</div>
+            {fun_badge}
+            <div style="flex:1;background:#E6E9EF;border-radius:20px;height:10px;overflow:hidden;">
+                <div style="background:{bar_color};width:{compliance*10}%;height:100%;border-radius:20px;"></div>
+            </div>
+            <div style="font-size:1.1rem;font-weight:900;color:{bar_color};">{compliance}/10</div>
+        </div>
+        <div style="margin-bottom:10px;"><strong style="font-size:0.78rem;color:#191970;display:block;margin-bottom:6px;">✅ 장르 필수 요소 체크</strong>{tags}</div>
+        {"<div style='margin-bottom:12px;'><strong style='font-size:0.78rem;color:#CC3300;display:block;margin-bottom:6px;'>❌ 누락된 장르 필수 요소</strong>" + missing_html + "</div>" if missing else ""}
+    </div>""", unsafe_allow_html=True)
+
+    # 실패 패턴 (별도 렌더링)
+    if fail_patterns:
+        fail_items = "".join([
+            f"<span style='background:#FFF3EE;color:#CC3300;border:1px solid #FF6432;padding:3px 10px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:6px;margin-bottom:6px;display:inline-block;'>⚠ {safe(f)}</span>"
+            for f in fail_patterns
+        ])
+        st.markdown(f"""
+        <div class="report-card" style="margin-top:-8px;">
+            <strong style="font-size:0.78rem;color:#CC3300;display:block;margin-bottom:6px;">⚠️ 발견된 실패 패턴</strong>
+            {fail_items}
+        </div>""", unsafe_allow_html=True)
+
+    # Hook/Punch 체크 (별도 렌더링)
+    hp = genre.get('hook_punch_check', {})
+    if hp:
+        hook_ok = hp.get('hook_present', False)
+        punch_ok = hp.get('punch_present', False)
+        hook_bg = '#EDFAF3' if hook_ok else '#FFF3EE'
+        hook_border = '#2EC484' if hook_ok else '#FF6432'
+        hook_color = '#1A7A50' if hook_ok else '#CC3300'
+        hook_icon = '✓' if hook_ok else '✗'
+        punch_bg = '#EDFAF3' if punch_ok else '#FFF3EE'
+        punch_border = '#2EC484' if punch_ok else '#FF6432'
+        punch_color = '#1A7A50' if punch_ok else '#CC3300'
+        punch_icon = '✓' if punch_ok else '✗'
+        hook_note = safe(hp.get('hook_note', ''))
+        punch_note = safe(hp.get('punch_note', ''))
+        st.markdown(f"""
+        <div class="report-card" style="margin-top:-8px;">
+            <div style="display:flex;gap:10px;">
+                <div style="flex:1;background:{hook_bg};padding:10px;border-radius:8px;border-left:3px solid {hook_border};">
+                    <div style="font-size:0.72rem;font-weight:800;color:{hook_color};margin-bottom:4px;">{hook_icon} Hook (오프닝)</div>
+                    <div style="font-size:0.84rem;color:#191970;line-height:1.6;">{hook_note}</div>
+                </div>
+                <div style="flex:1;background:{punch_bg};padding:10px;border-radius:8px;border-left:3px solid {punch_border};">
+                    <div style="font-size:0.72rem;font-weight:800;color:{punch_color};margin-bottom:4px;">{punch_icon} Punch (결정타)</div>
+                    <div style="font-size:0.84rem;color:#191970;line-height:1.6;">{punch_note}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # 장르적 재미 진단 (별도 렌더링)
+    if genre_fun_diagnosis:
+        st.markdown(f"""
+        <div class="report-card" style="margin-top:-8px;">
+            <div style="background:#FFFBE6;border-left:3px solid #FFCB05;padding:14px;border-radius:8px;line-height:1.8;color:#191970;">
+                <strong style="font-size:0.75rem;color:#B8860B;display:block;margin-bottom:6px;">🎬 장르적 재미 진단</strong>
+                {genre_fun_diagnosis}
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # 장르 종합 코멘트
+    doctoring = safe(genre.get('doctoring', ''))
+    if doctoring:
+        st.markdown(f"""
+        <div class="report-card" style="margin-top:-8px;">
+            <div style="background:#EEF0FA;padding:16px;border-radius:8px;line-height:1.8;color:#191970;">{doctoring}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 8-B. OPENING MASTERY (v2.1 신규)
+    # ═══════════════════════════════════════════════════════════════
+    om = genre.get('opening_mastery', {})
+    if om and isinstance(om, dict):
+        # 오프닝 기법 이름 매핑
+        TECHNIQUE_KO = {
+            "ACTION_DROP": "액션 드롭",
+            "COLD_OPEN": "콜드 오픈",
+            "TEASE_REVEAL": "티즈 앤 리빌",
+            "IN_MEDIA_RES": "인 미디어스 레스",
+            "CHARACTER_REVEAL_ACTION": "캐릭터 리빌 액션",
+            "HOOK_DIALOGUE": "훅 다이얼로그",
+            "UNDEFINED": "미정의 (약한 오프닝)"
+        }
+        intended = om.get('intended_technique', 'UNDEFINED')
+        intended_ko = TECHNIQUE_KO.get(intended, intended)
+        intended_evidence = safe(om.get('intended_technique_evidence', ''))
+        alignment = om.get('dna_alignment', 'partial')
+        alignment_reason = safe(om.get('dna_alignment_reason', ''))
+        alignment_map = {
+            'aligned':    ('#EDFAF3', '#2EC484', '#1A7A50', '✓ 장르 DNA 일치'),
+            'partial':    ('#FFFBE6', '#FFCB05', '#B8860B', '△ 부분 일치'),
+            'misaligned': ('#FFF3EE', '#FF6432', '#CC3300', '✗ 장르 DNA 불일치')
+        }
+        align_bg, align_border, align_color, align_label = alignment_map.get(alignment, alignment_map['partial'])
+
+        opening_score = om.get('opening_score', 0)
+        try:
+            opening_score_num = int(float(opening_score))
+        except (ValueError, TypeError):
+            opening_score_num = 0
+        score_color = '#2EC484' if opening_score_num >= 7 else ('#FFCB05' if opening_score_num >= 4 else '#FF6432')
+
+        # 도파민 6감각 점수
+        dop = om.get('dopamine_scores', {})
+        if not isinstance(dop, dict):
+            dop = {}
+        dopamine_keys = [
+            ('shock', '충격'), ('laughter', '웃음'), ('tension', '긴장'),
+            ('wonder', '경이'), ('curiosity', '호기심'), ('emotional_resonance', '감정 울림')
         ]
-        if not any(aux_inputs):
-            info_msg = "ℹ️ 보조 자료 없이 진행합니다. 시나리오 자체를 자동 진단해 약점을 찾습니다."
 
-    if error_msg:
-        st.warning(error_msg)
-    elif info_msg:
-        st.info(info_msg)
-    else:
-        # 등록된 자료 한눈에
-        active = []
-        if st.session_state.instruction.strip(): active.append("📝 피드백")
-        if st.session_state.diff_refined_text: active.append("🔬 Diff")
-        if st.session_state.rewrite_json_text.strip(): active.append("🔗 Rewrite JSON")
-        if st.session_state.tone_ref_text: active.append("📐 톤 레퍼런스")
-        if st.session_state.genre_dna or st.session_state.genre_ref_texts: active.append("🎬 장르 DNA")
-        if st.session_state.section_mode: active.append("✂️ 구간 모드")
-        st.caption(f"등록된 자료: {' · '.join(active)}")
+        def dop_bar(score_raw):
+            try:
+                s = int(float(score_raw))
+            except (ValueError, TypeError):
+                s = 0
+            s = max(0, min(10, s))
+            color = '#2EC484' if s >= 7 else ('#FFCB05' if s >= 4 else '#FF6432')
+            return (f'<div style="display:flex;align-items:center;gap:8px;">'
+                    f'<div style="flex:1;background:#E6E9EF;border-radius:20px;height:6px;overflow:hidden;">'
+                    f'<div style="background:{color};width:{s*10}%;height:100%;border-radius:20px;"></div></div>'
+                    f'<div style="font-size:0.78rem;font-weight:900;color:{color};min-width:22px;">{s}</div>'
+                    f'</div>')
 
-    # 진단 버튼 직전 — 무슨 일이 일어날지 미리 안내
-    if ready:
-        pending = []
-        if st.session_state.tone_ref_text and not st.session_state.tone_dna:
-            pending.append("톤 DNA 추출")
-        if st.session_state.diff_refined_text and not st.session_state.diff_analysis:
-            pending.append("Diff 학습")
-        if st.session_state.genre_ref_texts and not st.session_state.genre_dna:
-            pending.append("장르 DNA 추출")
-        if not st.session_state.distribution_diagnostic:
-            pending.append("분포 진단")
-        if st.session_state.rewrite_json_text.strip() and not st.session_state.rewrite_metadata:
-            pending.append("Rewrite 메타 흡수")
-
-        if pending:
-            st.markdown(
-                f'<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
-                f'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
-                f'<b>🔬 Stage 1 진단 시작 시 자동 진행:</b><br>'
-                f'1단계 사전 분석 ({", ".join(pending)}) → '
-                f'2단계 시나리오 진단 (수정 플랜 생성)'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-        else:
-            st.markdown(
-                '<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
-                'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
-                '<b>🔬 Stage 1 진단 시작 시 자동 진행:</b><br>'
-                '캐시된 사전 분석 결과를 활용해 바로 시나리오 진단(수정 플랜 생성)을 시작합니다.'
-                '</div>',
-                unsafe_allow_html=True
+        dop_rows = ""
+        for key, ko in dopamine_keys:
+            score_raw = dop.get(key, 0)
+            dop_rows += (
+                f'<tr style="border-bottom:1px solid #E6E9EF;">'
+                f'<td style="padding:8px 12px;font-weight:700;color:#191970;font-size:0.84rem;width:28%;">{ko}</td>'
+                f'<td style="padding:8px 12px;">{dop_bar(score_raw)}</td>'
+                f'</tr>'
             )
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🔬 Stage 1: 진단 시작 (DIAGNOSE)",
-                     disabled=not ready, use_container_width=True):
-            client = get_client()
-            if client:
-                with st.spinner("🔬 사전 분석 + 수정 플랜 생성 중... (Sonnet 4.6)"):
-                    result = run_diagnose(client)
-                    if result:
-                        st.session_state.diagnose_result = result
-                        st.session_state.step = 1
-                        st.rerun()
-                    else:
-                        st.error("진단 실패. 다시 시도해주세요.")
-    with c2:
-        if st.button("🔄 초기화", use_container_width=True):
-            reset_workflow()
-            st.rerun()
+        working = om.get('dopamine_working', [])
+        missing = om.get('dopamine_missing', [])
+        working_tags = "".join([
+            f"<span style='background:#EDFAF3;color:#1A7A50;border:1px solid #2EC484;padding:3px 10px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:6px;margin-bottom:6px;display:inline-block;'>✓ {safe(w)}</span>"
+            for w in working
+        ]) if isinstance(working, list) else ""
+        missing_tags = "".join([
+            f"<span style='background:#FFF3EE;color:#CC3300;border:1px solid #FF6432;padding:3px 10px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:6px;margin-bottom:6px;display:inline-block;'>✗ {safe(m)}</span>"
+            for m in missing
+        ]) if isinstance(missing, list) else ""
+
+        # 자극 vs 도파민 경고
+        prov = om.get('provocation_without_dopamine', False)
+        prov_note = safe(om.get('provocation_note', ''))
+
+        # 복합 장르 체크
+        cgc = om.get('complex_genre_check', {})
+        if not isinstance(cgc, dict):
+            cgc = {}
+
+        opening_diag = safe(om.get('opening_diagnosis', ''))
+
+        # ── 조건부 HTML 미리 조립 (f-string 안 삼항연산자 회피) ──
+        evidence_html = (
+            f'<div style="background:#F8F9FF;padding:10px 14px;border-radius:8px;font-size:0.82rem;color:#191970;line-height:1.7;margin-bottom:10px;">'
+            f'<strong style="color:#B8860B;">근거:</strong> {intended_evidence}'
+            f'</div>'
+        ) if intended_evidence else ''
+
+        alignment_html = (
+            f'<div style="background:#F8F9FF;padding:10px 14px;border-radius:8px;font-size:0.82rem;color:#191970;line-height:1.7;">'
+            f'<strong style="color:#B8860B;">DNA 일치 분석:</strong> {alignment_reason}'
+            f'</div>'
+        ) if alignment_reason else ''
+
+        # ── 헤더 카드 ──
+        st.markdown(f"""
+        <div class="report-card">
+            <h3>8-B. 오프닝 마스터리 (Opening Mastery)</h3>
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+                <div style="background:#191970;color:#FFCB05;padding:8px 16px;border-radius:10px;">
+                    <div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;opacity:0.8;">작가가 노린 기법</div>
+                    <div style="font-size:1.1rem;font-weight:900;margin-top:2px;">{safe(intended_ko)}</div>
+                </div>
+                <div style="background:{align_bg};color:{align_color};border:1px solid {align_border};
+                            padding:6px 14px;border-radius:20px;font-weight:800;font-size:0.82rem;">
+                    {align_label}
+                </div>
+                <div style="flex:1;"></div>
+                <div style="text-align:center;">
+                    <div style="font-size:0.68rem;color:#191970;opacity:0.6;font-weight:700;">오프닝 점수</div>
+                    <div style="font-size:1.8rem;font-weight:950;color:{score_color};line-height:1;">{opening_score_num}<span style="font-size:0.9rem;opacity:0.5;">/10</span></div>
+                </div>
+            </div>
+            {evidence_html}
+            {alignment_html}
+        </div>""", unsafe_allow_html=True)
+
+        # ── 도파민 작동/누락 섹션도 조건부 HTML 미리 조립 ──
+        working_html = (
+            f'<div style="margin-top:12px;">'
+            f'<strong style="font-size:0.72rem;color:#1A7A50;display:block;margin-bottom:6px;">✅ 작동 중인 감각</strong>'
+            f'{working_tags}'
+            f'</div>'
+        ) if working_tags else ''
+
+        missing_html = (
+            f'<div style="margin-top:10px;">'
+            f'<strong style="font-size:0.72rem;color:#CC3300;display:block;margin-bottom:6px;">❌ 누락된 감각 (장르 DNA 요구)</strong>'
+            f'{missing_tags}'
+            f'</div>'
+        ) if missing_tags else ''
+
+        # ── 도파민 6감각 테이블 ──
+        st.markdown(f"""
+        <div class="report-card" style="margin-top:-8px;">
+            <strong style="font-size:0.78rem;color:#191970;display:block;margin-bottom:10px;">🧠 도파민 6감각 진단</strong>
+            <table style="width:100%;border-collapse:collapse;">
+                <tbody>{dop_rows}</tbody>
+            </table>
+            {working_html}
+            {missing_html}
+        </div>""", unsafe_allow_html=True)
+
+        # ── 자극 vs 도파민 경고 ──
+        if prov:
+            st.markdown(f"""
+            <div class="report-card" style="margin-top:-8px;">
+                <div style="background:#FFF3EE;border-left:4px solid #FF6432;padding:14px;border-radius:8px;">
+                    <strong style="font-size:0.78rem;color:#CC3300;display:block;margin-bottom:6px;">⚠️ 자극만 있고 도파민 없음 (Provocation without Dopamine)</strong>
+                    <div style="font-size:0.85rem;color:#191970;line-height:1.7;">{prov_note}</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── 복합 장르 체크 ──
+        if cgc.get('is_complex'):
+            follows = cgc.get('opening_follows_core', False)
+            cg_bg = '#EDFAF3' if follows else '#FFF3EE'
+            cg_border = '#2EC484' if follows else '#FF6432'
+            cg_color = '#1A7A50' if follows else '#CC3300'
+            cg_icon = '✓' if follows else '✗'
+            primary_g = safe(cgc.get('primary_genre', ''))
+            core_g = safe(cgc.get('core_genre', ''))
+            cg_note = safe(cgc.get('note', ''))
+            st.markdown(f"""
+            <div class="report-card" style="margin-top:-8px;">
+                <div style="background:{cg_bg};border-left:4px solid {cg_border};padding:14px;border-radius:8px;">
+                    <strong style="font-size:0.78rem;color:{cg_color};display:block;margin-bottom:6px;">{cg_icon} 복합 장르 — 두 번째 장르 = 본질</strong>
+                    <div style="font-size:0.84rem;color:#191970;line-height:1.7;margin-bottom:6px;">
+                        표면: <strong>{primary_g}</strong> · 본질: <strong>{core_g}</strong>
+                    </div>
+                    <div style="font-size:0.82rem;color:#191970;line-height:1.7;">{cg_note}</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── 오프닝 종합 진단 ──
+        if opening_diag:
+            st.markdown(f"""
+            <div class="report-card" style="margin-top:-8px;">
+                <div style="background:#FFFBE6;border-left:4px solid #FFCB05;padding:14px;border-radius:8px;line-height:1.8;color:#191970;">
+                    <strong style="font-size:0.75rem;color:#B8860B;display:block;margin-bottom:6px;">🎬 오프닝 종합 진단</strong>
+                    {opening_diag}
+                </div>
+            </div>""", unsafe_allow_html=True)
 
 
-def show_step_1_diagnose():
-    """Step 1: DIAGNOSE 결과 확인 + REVISE 실행."""
-    dr = st.session_state.diagnose_result.get("revision_plan", {})
+def render_washing(data):
+    # ═══════════════════════════════════════════════════════════════
+    # 8-C. OPENING RX — SHIHO의 오프닝 교정 처방 (v2.1 신규)
+    # ═══════════════════════════════════════════════════════════════
+    rx = data.get('opening_rx', {})
+    if rx and isinstance(rx, dict):
+        TECHNIQUE_KO = {
+            "ACTION_DROP": "액션 드롭",
+            "COLD_OPEN": "콜드 오픈",
+            "TEASE_REVEAL": "티즈 앤 리빌",
+            "IN_MEDIA_RES": "인 미디어스 레스",
+            "CHARACTER_REVEAL_ACTION": "캐릭터 리빌 액션",
+            "HOOK_DIALOGUE": "훅 다이얼로그",
+            "UNDEFINED": "미정의"
+        }
+        respect = rx.get('respect_intent', True)
+        kept = rx.get('intent_kept_technique', '')
+        kept_ko = TECHNIQUE_KO.get(kept, kept)
+        switch_reason = safe(rx.get('switch_reason', ''))
+        completion = safe(rx.get('completion_plan', ''))
+        preserve = rx.get('preserve_from_original', [])
+        inj = rx.get('dopamine_injection', [])
+        complex_note = safe(rx.get('complex_genre_note', ''))
+        direction = safe(rx.get('overall_direction', ''))
 
-    st.markdown('<div class="rev-card-title">🔬 Stage 1: 진단 결과 (Revision Plan)</div>',
-                unsafe_allow_html=True)
+        respect_label = '✓ 작가 의도 존중 — 기법 유지' if respect else '↻ 기법 전환 권장'
+        respect_bg = '#EDFAF3' if respect else '#FFFBE6'
+        respect_color = '#1A7A50' if respect else '#B8860B'
+        respect_border = '#2EC484' if respect else '#FFCB05'
 
-    # v2.2 — 구간 모드 상태 표시 (가장 위에)
-    if st.session_state.section_mode:
-        prot_str = ", ".join(
-            f"{r.get('from','')}~{r.get('to','')}"
-            for r in st.session_state.protected_ranges
-        ) or "(없음)"
-        rev_str = ", ".join(
-            f"{r.get('from','')}~{r.get('to','')}"
-            for r in st.session_state.revision_ranges
-        ) or "(없음)"
+        preserve_items = "".join([
+            f"<li style='margin-bottom:6px;line-height:1.6;color:#191970;font-size:0.86rem;'>{safe(p)}</li>"
+            for p in preserve
+        ]) if isinstance(preserve, list) else ""
 
-        # 보호 구간이 비어 있으면 강한 경고
-        if not st.session_state.protected_ranges:
-            st.error(
-                "⚠️ **구간 모드 ON이지만 보호 구간이 등록되지 않았습니다.**\n\n"
-                "- 자동 감지 모드라면: 6번 Diff 학습 탭에 손본본을 올렸는지 확인하세요.\n"
-                "- 수동 모드라면: 7번 처리 모드에서 재집필 구간을 직접 입력하세요.\n\n"
-                "→ 입력으로 돌아가 7번 처리 모드를 다시 점검해주세요. "
-                "현재 진단은 전체 각색처럼 동작했습니다."
-            )
-        else:
-            st.markdown(
-                f'<div style="background:#EAF3DE; padding:10px 14px; border-radius:6px; '
-                f'border-left:3px solid #2EC484; margin:8px 0 16px; font-size:0.9rem;">'
-                f'<b>✂️ 구간 지정 모드 ON</b><br>'
-                f'🔒 보호 구간 (안 건드림): <code>{prot_str}</code><br>'
-                f'✏️ 재집필 구간 (다시 씀): <code>{rev_str}</code>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-    else:
-        st.markdown(
-            '<div style="background:#FFF8DD; padding:8px 14px; border-radius:6px; '
-            'border-left:3px solid #FFCB05; margin:8px 0 16px; font-size:0.85rem;">'
-            '<b>📝 전체 각색 모드</b> — 시나리오 전체가 진단·수정 대상입니다.'
-            '</div>',
-            unsafe_allow_html=True
+        inj_items = ""
+        if isinstance(inj, list):
+            for d in inj:
+                if isinstance(d, dict):
+                    sense = safe(d.get('sense', ''))
+                    how = safe(d.get('how', ''))
+                    inj_items += (
+                        f"<div style='background:#FFFBE6;border-left:3px solid #FFCB05;padding:10px 12px;border-radius:6px;margin-bottom:8px;'>"
+                        f"<div style='font-size:0.72rem;font-weight:800;color:#B8860B;margin-bottom:4px;'>🧠 {sense}</div>"
+                        f"<div style='font-size:0.84rem;color:#191970;line-height:1.6;'>{how}</div>"
+                        f"</div>"
+                    )
+
+        # ── 조건부 HTML 블록을 미리 조립 (f-string 안 삼항연산자 회피) ──
+        switch_html = (
+            f'<div style="background:#FFF5F5;border-left:3px solid #D32F2F;padding:10px 14px;border-radius:6px;margin-bottom:10px;">'
+            f'<strong style="font-size:0.72rem;color:#D32F2F;display:block;margin-bottom:4px;">↻ 기법 전환 이유</strong>'
+            f'<div style="font-size:0.84rem;color:#191970;line-height:1.6;">{switch_reason}</div>'
+            f'</div>'
+        ) if switch_reason else ''
+
+        completion_html = (
+            f'<div style="background:#EEF0FA;padding:12px 14px;border-radius:8px;margin-bottom:10px;">'
+            f'<strong style="font-size:0.72rem;color:#191970;display:block;margin-bottom:6px;">✨ 완성도 끌어올림 방안</strong>'
+            f'<div style="font-size:0.88rem;color:#191970;line-height:1.7;">{completion}</div>'
+            f'</div>'
+        ) if completion else ''
+
+        preserve_html = (
+            f'<div style="margin-bottom:10px;">'
+            f'<strong style="font-size:0.75rem;color:#1A7A50;display:block;margin-bottom:6px;">🔒 원본에서 반드시 보존할 것</strong>'
+            f'<ul style="margin:0;padding-left:20px;">{preserve_items}</ul>'
+            f'</div>'
+        ) if preserve_items else ''
+
+        inj_html = (
+            f'<div style="margin-bottom:10px;">'
+            f'<strong style="font-size:0.75rem;color:#B8860B;display:block;margin-bottom:6px;">💊 도파민 보강 처방</strong>'
+            f'{inj_items}'
+            f'</div>'
+        ) if inj_items else ''
+
+        complex_html = (
+            f'<div style="background:#FFF3EE;border-left:3px solid #FF6432;padding:10px 14px;border-radius:6px;margin-bottom:10px;">'
+            f'<strong style="font-size:0.72rem;color:#CC3300;display:block;margin-bottom:4px;">🎭 복합 장르 조정</strong>'
+            f'<div style="font-size:0.84rem;color:#191970;line-height:1.6;">{complex_note}</div>'
+            f'</div>'
+        ) if complex_note else ''
+
+        direction_html = (
+            f'<div style="background:#FFFBE6;border:1px dashed #FFCB05;padding:12px 14px;border-radius:8px;">'
+            f'<strong style="font-size:0.72rem;color:#B8860B;display:block;margin-bottom:4px;">🧭 교정 전체 방향</strong>'
+            f'<div style="font-size:0.88rem;color:#191970;line-height:1.7;font-weight:600;">{direction}</div>'
+            f'</div>'
+        ) if direction else ''
+
+        st.markdown(f"""
+        <div class="report-card">
+            <h3>8-C. 오프닝 교정 처방 (Opening RX)</h3>
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+                <div style="background:{respect_bg};color:{respect_color};border:1px solid {respect_border};
+                            padding:6px 14px;border-radius:20px;font-weight:800;font-size:0.82rem;">
+                    {respect_label}
+                </div>
+                <div style="background:#191970;color:#FFCB05;padding:6px 14px;border-radius:10px;font-weight:800;font-size:0.85rem;">
+                    유지 기법: {safe(kept_ko)}
+                </div>
+            </div>
+            {switch_html}
+            {completion_html}
+            {preserve_html}
+            {inj_html}
+            {complex_html}
+            {direction_html}
+        </div>""", unsafe_allow_html=True)
+
+    # 9. 시퀀스 워싱
+    st.markdown('<div class="report-card"><h3>9. 시퀀스 워싱 (Washing Table)</h3></div>', unsafe_allow_html=True)
+    for row in data.get('washing_table', []):
+        seq          = safe(row.get('seq', ''))
+        label        = safe(row.get('label', ''))
+        diagnosis    = safe(row.get('diagnosis', ''))
+        prescription = safe(row.get('prescription', ''))
+        opening_note = safe(row.get('opening_note', ''))
+        opening_note_html = (
+            f'<div style="background:#FFFBE6;border-left:3px solid #FFCB05;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:0.82rem;color:#191970;line-height:1.6;">'
+            f'<strong style="font-size:0.7rem;color:#B8860B;">🎬 오프닝 노트:</strong> {opening_note}'
+            f'</div>'
+        ) if opening_note else ''
+
+        st.markdown(f"""
+        <div style="background:#FFFFFF;border:1px solid #E6E9EF;border-radius:10px;padding:16px;margin-bottom:12px;">
+            <div style="margin-bottom:10px;">
+                <span style="background:#191970;color:#FFFFFF !important;padding:2px 10px;border-radius:4px;font-weight:900;font-size:0.72rem;">{seq}</span>
+                <span style="font-weight:700;margin-left:10px;color:#191970;">{label}</span>
+            </div>
+            {opening_note_html}
+            <div style="display:flex;gap:12px;">
+                <div style="flex:1;background:#FFF5F5;padding:12px;border-radius:8px;border-left:3px solid #D32F2F;">
+                    <div style="color:#D32F2F;font-size:0.72rem;font-weight:800;margin-bottom:5px;">⚠️ 진단</div>
+                    <div style="font-size:0.88rem;line-height:1.6;color:#191970;">{diagnosis}</div>
+                </div>
+                <div style="flex:1.2;background:#EEF0FA;padding:12px;border-radius:8px;border-left:3px solid #191970;">
+                    <div style="color:#191970;font-size:0.72rem;font-weight:800;margin-bottom:5px;">✅ 처방</div>
+                    <div style="font-size:0.88rem;line-height:1.6;color:#191970;">{prescription}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    # 9-B. 대사 분석 (Dialogue Washing)
+    da = data.get('dialogue_analysis', {})
+    if da:
+        # 점수 정규화: AI가 0~100으로 줄 수도 있으므로 10 초과면 /10
+        def norm(v):
+            v = float(v or 0)
+            return round(v / 10, 1) if v > 10 else v
+
+        score = norm(da.get('overall_score', 0))
+        bar_color = '#2EC484' if score >= 7 else ('#FFCB05' if score >= 4 else '#FF6432')
+        ax = da.get('axis_scores', {})
+        cv  = norm(ax.get('character_voice', 0))
+        st_ = norm(ax.get('subtext', 0))
+        ad  = norm(ax.get('action_driven', 0))
+
+        def mini_bar(val, color):
+            pct = min(int(float(val) * 10), 100)
+            return (f'<div style="display:flex;align-items:center;gap:6px;">'
+                    f'<div style="flex:1;background:#E6E9EF;border-radius:10px;height:6px;overflow:hidden;">'
+                    f'<div style="background:{color};width:{pct}%;height:100%;border-radius:10px;"></div></div>'
+                    f'<span style="font-size:0.78rem;font-weight:900;color:{color};">{val}</span></div>')
+
+        # mini_bar 미리 생성 (f-string 안에서 함수 호출 방지)
+        bar_cv = mini_bar(cv, '#191970')
+        bar_st = mini_bar(st_, '#6B3FA0')
+        bar_ad = mini_bar(ad, '#2EC484')
+        overall_comment = safe(da.get('overall_comment',''))
+        bar_final = (
+            f'<div style="display:flex;align-items:center;gap:6px;">'
+            f'<div style="flex:1;background:#C5CBE8;border-radius:10px;height:8px;overflow:hidden;">'
+            f'<div style="background:{bar_color};width:{min(int(float(score)*10),100)}%;height:100%;border-radius:10px;"></div></div>'
+            f'<span style="font-size:0.9rem;font-weight:950;color:{bar_color};">{score}/10</span></div>'
         )
 
-    # 요약
-    summary = dr.get("summary", "")
-    if summary:
-        st.markdown('<div class="rev-card"><b style="color:#191970;">전체 수정 방향</b></div>',
-                    unsafe_allow_html=True)
-        st.write(summary)
+        # 헤더 + 4축 기준 태그
+        st.markdown("""
+        <div class="report-card">
+            <h3>9-B. 대사 워싱 (Dialogue Washing)</h3>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+                <span style="background:#EEF0FA;color:#191970;border:1px solid #C5CBE8;padding:3px 10px;border-radius:20px;font-size:0.72rem;font-weight:700;">① 캐릭터 적합성</span>
+                <span style="background:#EEF0FA;color:#191970;border:1px solid #C5CBE8;padding:3px 10px;border-radius:20px;font-size:0.72rem;font-weight:700;">② 서브텍스트</span>
+                <span style="background:#EEF0FA;color:#191970;border:1px solid #C5CBE8;padding:3px 10px;border-radius:20px;font-size:0.72rem;font-weight:700;">③ 행동/감정/관계 구동</span>
+                <span style="background:#FFFBE6;color:#B8860B;border:1px solid #FFE066;padding:3px 10px;border-radius:20px;font-size:0.72rem;font-weight:700;">④ 개선 제안</span>
+            </div>
+        </div>""", unsafe_allow_html=True)
 
-    # 예상 씬 수
-    cnt = dr.get("estimated_scene_count", "")
-    conf = dr.get("confidence", "")
-    if cnt or conf:
-        st.markdown(f'<span class="rev-badge">수정 대상 씬: {cnt}</span>'
-                    f'<span class="rev-badge y">진단 신뢰도: {conf}/10</span>',
-                    unsafe_allow_html=True)
+        # 3축 점수 테이블 (별도 markdown)
+        st.markdown(f"""
+        <div style="margin-bottom:12px;">
+        <table style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+            <thead><tr style="background:#191970;">
+                <th style="padding:7px 12px;text-align:left;color:#FFCB05 !important;font-size:0.7rem;letter-spacing:0.08em;">평가 축</th>
+                <th style="padding:7px 12px;text-align:left;color:#FFCB05 !important;font-size:0.7rem;letter-spacing:0.08em;">기준</th>
+                <th style="padding:7px 12px;text-align:left;color:#FFCB05 !important;font-size:0.7rem;letter-spacing:0.08em;width:35%;">점수</th>
+            </tr></thead>
+            <tbody>
+                <tr style="background:#F8F9FF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:8px 12px;font-weight:800;color:#191970;font-size:0.82rem;">① 캐릭터 적합성</td>
+                    <td style="padding:8px 12px;font-size:0.78rem;color:#191970;">고유 어휘·말투·감정 반영</td>
+                    <td style="padding:8px 12px;">{bar_cv}</td>
+                </tr>
+                <tr style="background:#FFFFFF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:8px 12px;font-weight:800;color:#191970;font-size:0.82rem;">② 서브텍스트</td>
+                    <td style="padding:8px 12px;font-size:0.78rem;color:#191970;">표면↔이면 충돌, 설명형 금지</td>
+                    <td style="padding:8px 12px;">{bar_st}</td>
+                </tr>
+                <tr style="background:#F8F9FF;border-bottom:1px solid #E6E9EF;">
+                    <td style="padding:8px 12px;font-weight:800;color:#191970;font-size:0.82rem;">③ 행동/감정/관계</td>
+                    <td style="padding:8px 12px;font-size:0.78rem;color:#191970;">장면 추진력, 정보전달 금지</td>
+                    <td style="padding:8px 12px;">{bar_ad}</td>
+                </tr>
+                <tr style="background:#EEF0FA;">
+                    <td colspan="2" style="padding:8px 12px;font-weight:900;color:#191970;font-size:0.88rem;">종합 대사 수준</td>
+                    <td style="padding:8px 12px;">{bar_final}</td>
+                </tr>
+            </tbody>
+        </table>
+        <div style="background:#EEF0FA;padding:14px;border-radius:8px;line-height:1.8;color:#191970;">
+            {overall_comment}
+        </div>
+        </div>""", unsafe_allow_html=True)
 
-    st.markdown("---")
+        # 강점
+        strengths = da.get('strengths', [])
+        if strengths:
+            s_html = "".join([
+                f"<span style='background:#EDFAF3;color:#1A7A50;border:1px solid #2EC484;padding:3px 11px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-right:7px;margin-bottom:6px;display:inline-block;'>✓ {safe(s)}</span>"
+                for s in strengths
+            ])
+            st.markdown(f"""
+            <div style="background:#FFFFFF;border:1px solid #E6E9EF;border-radius:10px;padding:14px;margin-bottom:12px;">
+                <div style="font-size:0.75rem;font-weight:800;color:#1A7A50;margin-bottom:8px;">💪 대사 강점</div>
+                <div>{s_html}</div>
+            </div>""", unsafe_allow_html=True)
 
-    # LOCKED 요약
-    locked_summary = dr.get("locked_summary", "")
-    if locked_summary:
-        with st.expander("🔒 LOCKED로 인식된 요소"):
-            st.write(locked_summary)
+        # 4축 기준별 Before/After
+        issues = da.get('issues', [])
+        if issues:
+            st.markdown("""
+            <div style="font-size:0.85rem;font-weight:800;color:#CC3300;margin:16px 0 8px;">
+                🔍 Dialogue Washing — 4축 진단 Before / After
+            </div>""", unsafe_allow_html=True)
+            axis_colors = {
+                '① 캐릭터 적합성': '#191970',
+                '② 서브텍스트':    '#6B3FA0',
+                '③ 행동/감정/관계':'#2EC484',
+            }
+            for issue in issues:
+                axis_label = safe(issue.get('axis', ''))
+                axis_color = axis_colors.get(issue.get('axis', ''), '#FF6432')
+                st.markdown(f"""
+                <div style="background:#FFFFFF;border:1px solid #E6E9EF;border-radius:10px;padding:16px;margin-bottom:12px;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                        <span style="background:#FF6432;color:#FFFFFF;padding:2px 10px;border-radius:4px;font-weight:900;font-size:0.72rem;">{safe(issue.get('type',''))}</span>
+                        <span style="background:{axis_color};color:#FFFFFF;padding:2px 10px;border-radius:4px;font-weight:700;font-size:0.68rem;">{axis_label}</span>
+                        <span style="font-size:0.83rem;color:#555;">{safe(issue.get('description',''))}</span>
+                    </div>
+                    <div style="display:flex;gap:10px;margin-bottom:10px;">
+                        <div style="flex:1;background:#FFF5F5;padding:11px;border-radius:8px;border-left:3px solid #FF6432;">
+                            <div style="font-size:0.68rem;font-weight:800;color:#CC3300;margin-bottom:5px;">❌ BEFORE (원문)</div>
+                            <div style="font-size:0.88rem;line-height:1.6;color:#333;font-family:'Courier New',monospace;">{safe(issue.get('example_bad',''))}</div>
+                        </div>
+                        <div style="flex:1;background:#EDFAF3;padding:11px;border-radius:8px;border-left:3px solid #2EC484;">
+                            <div style="font-size:0.68rem;font-weight:800;color:#1A7A50;margin-bottom:5px;">✅ ④ 개선 제안 (AFTER)</div>
+                            <div style="font-size:0.88rem;line-height:1.6;color:#333;font-family:'Courier New',monospace;">{safe(issue.get('example_good',''))}</div>
+                        </div>
+                    </div>
+                    <div style="background:#FFFBE6;padding:10px;border-radius:6px;border-left:3px solid #FFCB05;">
+                        <div style="font-size:0.68rem;font-weight:800;color:#B8860B;margin-bottom:4px;">✏️ Moon 리라이팅 지시</div>
+                        <div style="font-size:0.85rem;color:#191970;">{safe(issue.get('rewrite_note',''))}</div>
+                    </div>
+                </div>""", unsafe_allow_html=True)
 
-    # 충돌
-    conflicts = dr.get("conflicts", [])
-    if conflicts:
-        st.markdown('<div class="rev-card-title" style="color:#E14444;">⚠️ 지시문 vs LOCKED 충돌</div>',
-                    unsafe_allow_html=True)
-        for c in conflicts:
-            st.warning(f"• **지시:** {c.get('instruction_item','')}\n\n"
-                       f"**충돌:** {c.get('locked_conflict','')}\n\n"
-                       f"**해결:** {c.get('resolution','')}")
+        # rewrite_directives는 내부 프롬프트용 - 보고서에 미노출
 
-    # 수정 대상 씬 목록
-    scenes = dr.get("target_scenes", [])
-    if scenes:
-        st.markdown(f'<div class="rev-card-title">📋 수정 대상 씬 ({len(scenes)}개)</div>',
-                    unsafe_allow_html=True)
-        for idx, sc in enumerate(scenes, 1):
-            with st.expander(f"Scene {idx}: {sc.get('scene_id', '')}  —  {sc.get('scene_position', '')}"):
-                st.markdown(f"**플롯상 기능:** {sc.get('original_function','')}")
-                st.markdown(f"**보존 요소:** {sc.get('preservation_notes','')}")
-                items = sc.get("revision_items", [])
-                for i, it in enumerate(items, 1):
-                    src = it.get("source", "")
-                    badge = "📝" if src == "user_instruction" else "🔍"
-                    st.markdown(f"{badge} **[{i}] {it.get('target_element','')}**")
-                    st.markdown(f"- 이슈: {it.get('issue','')}")
-                    st.markdown(f"- 방향: {it.get('proposed_direction','')}")
+    # 10. 각색 제안
+    suggestions = data.get('suggestions', [])
+    st.markdown('<div class="report-card"><h3>10. 각색 제안 (Action Plan)</h3>', unsafe_allow_html=True)
+    for i, s in enumerate(suggestions, 1):
+        clean = re.sub(r'^[\d\.\s]+', '', str(s)).strip()
+        st.markdown(f"""
+        <div style="background:#F8F9FF;border:1px solid #E6E9EF;border-radius:8px;padding:12px;display:flex;gap:10px;align-items:flex-start;margin-bottom:8px;">
+            <div style="background:#191970;color:#FFFFFF !important;border-radius:5px;padding:2px 8px;font-weight:900;font-size:0.68rem;white-space:nowrap;flex-shrink:0;margin-top:2px;">STEP {i:02d}</div>
+            <div style="font-size:0.88rem;line-height:1.5;color:#191970;">{safe(clean)}</div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # Out of Scope
-    oos = dr.get("out_of_scope", [])
-    if oos:
-        with st.expander("⏩ 처리 불가 항목 (Out of Scope)"):
-            for item in oos:
-                st.markdown(f"- {item}")
 
-    st.markdown("---")
+def render_rewriting(data):
+    rewrite = data.get('rewriting', {})
+    scenes = rewrite.get('scenes', [])
+    revised_count = sum(1 for s in scenes if s.get('type') == '수정씬')
+    added_count   = sum(1 for s in scenes if s.get('type') == '추가씬')
 
-    # 실행 버튼
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("✍️ Stage 2: 집필 시작 (REVISE)", use_container_width=True):
-            # 배치 분할 실행 (DIAGNOSE 결과 기반)
-            batches = split_into_batches(
-                st.session_state.diagnose_result,
-                batch_size=st.session_state.batch_size
-            )
-            if not batches:
-                st.error("수정 대상 씬이 없습니다. 진단 결과를 확인해주세요.")
+    st.markdown(f"""
+    <div class="report-card">
+        <h3>11. 각색 원고 (Rewrite Scenes)</h3>
+        <div style="background:#FFFBE6;padding:14px;border-radius:8px;
+                    border-left:3px solid #FFCB05;margin-bottom:16px;line-height:1.8;">
+            <strong style="color:#191970;font-size:0.75rem;display:block;margin-bottom:5px;">✏️ 각색 전략</strong>
+            <span style="color:#191970;">{safe(rewrite.get('target_reason', ''))}</span>
+        </div>
+        <div style="display:flex;gap:10px;margin-bottom:4px;">
+            <span style="background:#191970;color:#FFFFFF !important;padding:4px 14px;
+                         border-radius:20px;font-size:0.78rem;font-weight:800;">총 {len(scenes)}개 씬</span>
+            <span style="background:#2EC484;color:#FFFFFF;padding:4px 14px;
+                         border-radius:20px;font-size:0.78rem;font-weight:800;">✏️ 수정씬 {revised_count}개</span>
+            <span style="background:#FF6432;color:#FFFFFF;padding:4px 14px;
+                         border-radius:20px;font-size:0.78rem;font-weight:800;">✨ 추가씬 {added_count}개</span>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    for i, sc in enumerate(scenes):
+        scene_type  = sc.get('type', '수정씬')
+        is_revised  = scene_type == '수정씬'
+        badge_color = '#2EC484' if is_revised else '#FF6432'
+        badge_bg    = '#EDFAF3' if is_revised else '#FFF3EE'
+        badge_icon  = '✏️' if is_revised else '✨'
+        original    = sc.get('original', '')
+        scene_no    = safe(sc.get('scene_no', f'Scene {i+1}'))
+        content     = sc.get('content', '')
+
+        insert_between = sc.get('insert_between', '')
+        header_extra = f"  ·  📍 {safe(insert_between)}" if (not is_revised and insert_between) else ""
+
+        # 씬 헤더 카드 (expander 대신 div)
+        st.markdown(f"""
+        <div style="background:#FFFFFF;border:2px solid {badge_color};border-radius:12px;
+                    padding:16px 20px;margin-bottom:8px;">
+            <div style="font-size:0.88rem;font-weight:900;color:#191970;margin-bottom:10px;">
+                {badge_icon} {scene_no}  [{scene_type}]{header_extra}
+            </div>""", unsafe_allow_html=True)
+
+        if not is_revised and insert_between:
+            st.markdown(f"""
+            <div style="background:#EEF0FA;border-left:3px solid #191970;
+                        padding:8px 14px;border-radius:6px;margin-bottom:8px;">
+                <span style="font-size:0.68rem;font-weight:800;color:#191970;">📍 삽입 위치</span>
+                <span style="font-size:0.84rem;color:#191970;margin-left:8px;">{safe(insert_between)}</span>
+            </div>""", unsafe_allow_html=True)
+
+        if original:
+            st.markdown(f"""
+            <div style="background:#F5F5F5;border-left:3px solid #AAAAAA;
+                        padding:10px 14px;border-radius:8px;margin-bottom:8px;">
+                <div style="font-size:0.68rem;font-weight:800;color:#888;margin-bottom:4px;">📄 기존 씬 (BEFORE)</div>
+                <div style="font-size:0.84rem;color:#555;line-height:1.7;">{safe(original)}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="font-size:0.68rem;font-weight:800;color:{badge_color};margin-bottom:6px;letter-spacing:0.06em;">
+            {badge_icon} {scene_type} (AFTER)
+        </div>""", unsafe_allow_html=True)
+
+        if content:
+            lines_sc = content.replace('\\n', '\n').replace('\n', '\n').split('\n')
+            formatted = ""
+            for line in lines_sc:
+                line_s = line.strip()
+                if not line_s:
+                    formatted += "<div style='height:8px;'></div>"
+                elif line_s.startswith('INT.') or line_s.startswith('EXT.'):
+                    formatted += f'<div style="font-weight:900;color:#191970;font-size:0.9rem;letter-spacing:0.05em;margin:10px 0 4px;">{safe(line_s)}</div>'
+                elif ':' in line_s and len(line_s.split(':')[0]) < 20 and line_s.split(':')[0].replace(' ','').replace('(','').replace(')','').replace('.','').upper() == line_s.split(':')[0].replace(' ','').replace('(','').replace(')','').replace('.','').upper():
+                    parts = line_s.split(':', 1)
+                    formatted += f'<div style="margin:6px 0 3px;padding-left:12px;"><span style="font-weight:900;color:#191970;font-size:0.86rem;">{safe(parts[0])}:</span> <span style="color:#333;font-size:0.86rem;line-height:1.7;">{safe(parts[1].strip())}</span></div>'
+                else:
+                    formatted += f'<div style="color:#444;font-size:0.85rem;line-height:1.75;margin:2px 0;">{safe(line_s)}</div>'
+
+            st.markdown(f"""
+            <div style="background:#FAFAFA;border:1px solid #E6E9EF;border-radius:8px;
+                        padding:16px 20px;font-family:'Courier Prime','Courier New',monospace;">
+                {formatted}
+            </div>
+        </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+
+
+# =================================================================
+# [7-B] JSON 익스포트 — Revise Engine 연동용 (v2.2 신규)
+# =================================================================
+def export_diagnosis_json(item, level="shiho"):
+    """진단·처방 데이터를 JSON으로 직렬화 — Revise Engine v2.3 호환.
+    
+    출력 구조 (이중 트랙):
+      [A] Revise 자동 흡수 키:
+          - rewrite_suggestions: SHIHO 휴리스틱 파싱 또는 MOON scenes 기반
+          - add_suggestions:     SHIHO 휴리스틱 파싱 또는 MOON scenes 기반
+          - weak_zone_scenes:    SHIHO genre_fun_recovery 평면화
+          - moon_opinion_text 등: MOON 시점에만, 평면 키
+      
+      [B] 원본 데이터 보존 (참고/검증용):
+          - chris_analysis:     CHRIS 분석 전체
+          - shiho_prescription: SHIHO 진단/처방 전체 (washing_table, suggestions, opening_rx 등)
+          - moon_rewrite:       MOON 결과 (level='full'일 때만)
+    
+    level:
+      'chris' : CHRIS 분석만 (검토용)
+      'shiho' : CHRIS + SHIHO (Revise 입력용 표준)
+      'full'  : CHRIS + SHIHO + MOON (Revise 입력용 완전판)
+    """
+    from datetime import datetime
+    import re as _re
+
+    # ── 장르 정보 ──
+    genre_info = item.get('genre', {})
+    if isinstance(genre_info, dict):
+        genre_str = genre_info.get('primary', '')
+        if genre_info.get('tags'):
+            tags = genre_info.get('tags', [])
+            if isinstance(tags, list) and tags:
+                genre_str = f"{genre_str} ({', '.join(tags)})"
+    else:
+        genre_str = str(genre_info)
+    
+    # ─────────────────────────────────────────────────────────
+    # [A] Revise 자동 흡수용 평면 키 조립
+    # ─────────────────────────────────────────────────────────
+    rewrite_suggestions = []
+    add_suggestions = []
+    weak_zone_scenes = []
+    moon_opinion_text = ""
+    moon_market_direction = ""
+    moon_genre_strengthening = ""
+    moon_unique_value = ""
+
+    # ── rewrite_suggestions / add_suggestions: MOON 우선, 없으면 SHIHO 휴리스틱 ──
+    rewriting = item.get('rewriting', {}) if level == "full" else {}
+    moon_scenes = rewriting.get('scenes', []) if isinstance(rewriting, dict) else []
+    
+    if level == "full" and moon_scenes:
+        # MOON 결과로 정확히 매핑
+        for sc in moon_scenes:
+            if not isinstance(sc, dict):
+                continue
+            scene_no = str(sc.get('scene_no', ''))
+            scene_type = sc.get('type', '')
+            content = sc.get('content', '')
+            
+            # scene_no 에서 첫 번째 S#숫자 패턴 추출
+            m = _re.search(r'S#\s*(\d+)', scene_no)
+            scene_id = f"S#{m.group(1)}" if m else scene_no
+            
+            if scene_type == '추가씬':
+                # "S#X와 S#Y 사이" 또는 "S#X-신규" 패턴 → insert_after 추출
+                # 또는 scene_no 자체에 들어있는 첫 숫자 사용
+                insert_after = scene_id
+                m_after = _re.search(r'S#(\d+)\s*(?:와|이후|다음|뒤)', scene_no)
+                if m_after:
+                    insert_after = f"S#{m_after.group(1)}"
+                add_suggestions.append({
+                    "scene_id": scene_no,
+                    "insert_after": insert_after,
+                    "type": "추가씬",
+                    "content_plan": content[:500] if content else "",
+                    "why": sc.get('reason', '') or rewriting.get('target_reason', ''),
+                    "function": sc.get('function', ''),
+                })
+            else:  # 수정씬
+                rewrite_suggestions.append({
+                    "scene_id": scene_id,
+                    "what_to_change": content[:500] if content else "",
+                    "why": sc.get('reason', '') or rewriting.get('target_reason', ''),
+                    "preserve": [],
+                    "type": "REWRITE",
+                    "before": sc.get('original', ''),
+                })
+    else:
+        # SHIHO 휴리스틱 파싱 (suggestions[] 텍스트 → REWRITE/ADD 분류)
+        ADD_KEYWORDS = ['추가', '신설', '삽입', '인서트', '신규', '새로운', '집어넣', '넣는다']
+        MERGE_KEYWORDS = ['병합', '합치', '통합', '한 씬으로', '한씬으로', '합쳐']
+        DELETE_KEYWORDS = ['삭제', '제거', '빼라', '뺀다']
+        
+        for s in item.get('suggestions', []):
+            if not isinstance(s, str):
+                continue
+            text = s.strip()
+            if not text:
+                continue
+            # 앞의 번호 제거 ("1. ...", "STEP 01 ..." 등)
+            cleaned = _re.sub(r'^(?:STEP\s*)?\d+[\.\)\s]+', '', text).strip()
+            
+            # scene_id 추출 (첫 번째 S#숫자)
+            m = _re.search(r'S\s*#\s*(\d+)', cleaned)
+            scene_id = f"S#{m.group(1)}" if m else ""
+            
+            # 분류
+            is_add = any(kw in cleaned for kw in ADD_KEYWORDS)
+            is_merge = any(kw in cleaned for kw in MERGE_KEYWORDS)
+            
+            if is_add and not is_merge:
+                # 추가 씬 — insert_after는 첫 S#숫자 사용
+                add_suggestions.append({
+                    "scene_id": f"(NEW) {scene_id}" if scene_id else "(NEW)",
+                    "insert_after": scene_id,
+                    "type": "추가 시퀀스",
+                    "content_plan": cleaned,
+                    "why": "",
+                    "_source": "shiho_heuristic",
+                })
             else:
-                st.session_state.revise_batches = batches
-                st.session_state.batch_results = {}
-                st.session_state.current_batch = 0
-                st.session_state.step = 2
-                st.success(f"✅ {len(batches)}개 배치로 분할되었습니다. 배치별로 집필을 진행합니다.")
+                rewrite_suggestions.append({
+                    "scene_id": scene_id,
+                    "what_to_change": cleaned,
+                    "why": "",
+                    "preserve": [],
+                    "type": "MERGE" if is_merge else "REWRITE",
+                    "_source": "shiho_heuristic",
+                })
+
+    # ── weak_zone_scenes: SHIHO genre_fun_recovery.weak_zones 평면화 ──
+    gfr = item.get('genre_fun_recovery', {}) if isinstance(item.get('genre_fun_recovery'), dict) else {}
+    for wz in gfr.get('weak_zones', []):
+        if not isinstance(wz, dict):
+            continue
+        weak_zone_scenes.append({
+            "seq_ref": wz.get('seq_ref', ''),
+            "issue": wz.get('what_is_missing', ''),
+            "hook_suggestion": wz.get('hook_suggestion', ''),
+            "punch_suggestion": wz.get('punch_suggestion', ''),
+        })
+
+    # ── moon_opinion 평면 키들 (MOON 시점에만) ──
+    if level == "full":
+        target_reason = rewriting.get('target_reason', '') if isinstance(rewriting, dict) else ''
+        verdict_rationale = item.get('verdict', {}).get('rationale', '') if isinstance(item.get('verdict'), dict) else ''
+        gfr_direction = gfr.get('overall_direction', '')
+        opening_rx = item.get('opening_rx', {})
+        opening_direction = opening_rx.get('overall_direction', '') if isinstance(opening_rx, dict) else ''
+
+        # 전체 의견: target_reason 우선, 없으면 verdict_rationale
+        moon_opinion_text = target_reason or verdict_rationale
+        # 시장 방향: verdict_rationale (CHRIS의 상업적 판단 부분)
+        moon_market_direction = verdict_rationale
+        # 장르 강화: SHIHO genre_fun_recovery
+        moon_genre_strengthening = gfr_direction
+        # 차별성/오프닝 방향: SHIHO opening_rx
+        moon_unique_value = opening_direction
+
+    # ─────────────────────────────────────────────────────────
+    # [B] 원본 데이터 보존 (참고/검증용)
+    # ─────────────────────────────────────────────────────────
+    chris_analysis = {
+        "scores":            item.get('scores', {}),
+        "mark":              item.get('mark', {}),
+        "verdict":           item.get('verdict', {}),
+        "logline":           item.get('logline', {}),
+        "synopsis":          item.get('synopsis', ''),
+        "pros_cons":         item.get('pros_cons', {}),
+        "drive":             item.get('drive', {}),
+        "characters":        item.get('characters', {}),
+        "beats":             item.get('beats', {}),
+        "tension_data":      item.get('tension_data', []),
+        "genre_compliance":  item.get('genre_compliance', {}),
+    }
+    
+    shiho_prescription = None
+    if level in ("shiho", "full"):
+        shiho_prescription = {
+            "washing_table":      item.get('washing_table', []),
+            "dialogue_analysis":  item.get('dialogue_analysis', {}),
+            "suggestions":        item.get('suggestions', []),
+            "opening_rx":         item.get('opening_rx', {}),
+            "genre_fun_recovery": item.get('genre_fun_recovery', {}),
+        }
+    
+    moon_rewrite = None
+    if level == "full":
+        moon_rewrite = item.get('rewriting', {})
+
+    # ─────────────────────────────────────────────────────────
+    # 최종 페이로드 — A(Revise 흡수) + B(원본) 동시 수록
+    # ─────────────────────────────────────────────────────────
+    payload = {
+        # ── 메타 정보 ──
+        "title":            item.get('title', ''),
+        "report_date":      datetime.now().strftime('%Y-%m-%d'),
+        "engine_version":   "Rewrite Engine v2.2",
+        "schema_version":   "1.0",
+        
+        # ── [A] Revise Engine v2.3 자동 흡수 키 (평면) ──
+        "rewrite_suggestions": rewrite_suggestions,
+        "add_suggestions":     add_suggestions,
+        "weak_zone_scenes":    weak_zone_scenes,
+        "moon_opinion_text":          moon_opinion_text,
+        "moon_market_direction":      moon_market_direction,
+        "moon_genre_strengthening":   moon_genre_strengthening,
+        "moon_unique_value":          moon_unique_value,
+        
+        # ── [B] 원본 데이터 보존 (사용자 검증·참고용) ──
+        "chris_analysis":     chris_analysis,
+    }
+    if shiho_prescription is not None:
+        payload["shiho_prescription"] = shiho_prescription
+    if moon_rewrite is not None:
+        payload["moon_rewrite"] = moon_rewrite
+
+    # ── 메타데이터 (Revise Engine 호환) ──
+    payload["metadata"] = {
+        "engine":             "rewrite-engine",
+        "export_level":       level,
+        "exported_at":        datetime.now().isoformat(),
+        "genre":              genre_str,
+        "genre_key":          item.get('genre_compliance', {}).get('genre_key', ''),
+        "rewrite_count":      len(rewrite_suggestions),
+        "add_count":          len(add_suggestions),
+        "weak_zone_count":    len(weak_zone_scenes),
+        "rewrite_source":     "moon_scenes" if (level == "full" and moon_scenes) else ("shiho_heuristic" if rewrite_suggestions else "none"),
+        "schema_note":        "Revise Engine v2.3 자동 흡수 키 + 원본 데이터 동시 수록. 평면 키는 absorb_rewrite_engine_metadata()용.",
+    }
+    
+    json_str = json.dumps(payload, ensure_ascii=False, indent=2)
+    return json_str.encode('utf-8')
+
+
+# =================================================================
+# [8] DOCX 생성
+# =================================================================
+def create_docx(item, level="full"):
+    """DOCX 보고서 생성 — level 파라미터로 출력 범위 제어
+    level:
+      'chris'   : CHRIS 분석만 (섹션 1~8-B)
+      'shiho'   : CHRIS + SHIHO (섹션 1~11, MOON 제외)
+      'full'    : CHRIS + SHIHO + MOON (섹션 1~12, 기존 기본값)
+    """
+    import subprocess, tempfile, os, shutil
+
+    # level에 따라 washing/rewriting 섹션 필터링
+    if level == "chris":
+        washing_payload = {}  # SHIHO 전체 제거
+        rewriting_payload = {"rewriting": {}}
+    elif level == "shiho":
+        washing_payload = {
+            "washing_table":      item.get("washing_table", []),
+            "dialogue_analysis":  item.get("dialogue_analysis", {}),
+            "suggestions":        item.get("suggestions", []),
+            "opening_rx":         item.get("opening_rx", {}),
+            "genre_fun_recovery": item.get("genre_fun_recovery", {})
+        }
+        rewriting_payload = {"rewriting": {}}  # MOON 제거
+    else:  # full
+        washing_payload = {
+            "washing_table":      item.get("washing_table", []),
+            "dialogue_analysis":  item.get("dialogue_analysis", {}),
+            "suggestions":        item.get("suggestions", []),
+            "opening_rx":         item.get("opening_rx", {}),
+            "genre_fun_recovery": item.get("genre_fun_recovery", {})
+        }
+        rewriting_payload = {"rewriting": item.get("rewriting", {})}
+
+    # report_data.json 생성
+    report_data = {
+        "analysis":  item,
+        "washing":   washing_payload,
+        "rewriting": rewriting_payload,
+        "export_level": level  # gen_docx.js가 참조 (디버깅/향후 확장용)
+    }
+
+    tmp_dir = tempfile.mkdtemp()
+    json_path   = os.path.join(tmp_dir, "report_data.json")
+    out_path    = os.path.join(tmp_dir, "report_output.docx")
+
+    # gen_docx.js를 tmp_dir에 복사
+    script_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_docx.js")
+    if not os.path.exists(script_src):
+        for candidate in ["/app/gen_docx.js", "./gen_docx.js"]:
+            if os.path.exists(candidate):
+                script_src = candidate
+                break
+    script_path = os.path.join(tmp_dir, "gen_docx.js")
+    try:
+        shutil.copy2(script_src, script_path)
+    except Exception:
+        return _create_docx_fallback(item, level=level)
+
+    # docx npm 패키지 설치
+    nm_path = os.path.join(tmp_dir, "node_modules", "docx")
+    if not os.path.exists(nm_path):
+        try:
+            npm_result = subprocess.run(
+                ["npm", "install", "docx"],
+                capture_output=True, text=True, timeout=120,
+                cwd=tmp_dir
+            )
+            if npm_result.returncode != 0:
+                return _create_docx_fallback(item, level=level)
+        except Exception:
+            return _create_docx_fallback(item, level=level)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, ensure_ascii=False)
+
+    try:
+        result = subprocess.run(
+            ["node", script_path, json_path, out_path],
+            capture_output=True, text=True, timeout=60,
+            cwd=tmp_dir
+        )
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return _create_docx_fallback(item, level=level)
+
+    # 파일 존재 + 크기 검증 (10KB 미만이면 손상으로 판단)
+    if result.returncode != 0 or not os.path.exists(out_path):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return _create_docx_fallback(item, level=level)
+
+    file_size = os.path.getsize(out_path)
+    if file_size < 10000:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return _create_docx_fallback(item, level=level)
+
+    with open(out_path, "rb") as f:
+        data = f.read()
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return data
+
+
+def _create_docx_fallback(item, level="full"):
+    """Node.js 실패 시 python-docx fallback — level에 따라 섹션 필터링
+    level: 'chris' | 'shiho' | 'full'
+    """
+
+    def safe_int(v, default=0):
+        try: return int(float(v))
+        except: return default
+
+    def safe_str(v, default=''):
+        if v is None: return default
+        return str(v)
+
+    try:
+        doc = Document()
+
+        # 표지
+        t = doc.add_heading("시나리오 검토 보고서", 0)
+        t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_paragraph(f"작품명: {safe_str(item.get('title', ''))}").alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.add_page_break()
+
+        # 1. 종합 분석 — 4축 평가표
+        doc.add_heading("1. 종합 분석 (Total Analysis) — Hollywood Standard", 1)
+        mark = item.get('mark', {}).get('final', 0)
+        sc   = item.get('scores', {})
+        verdict = item.get('verdict', {})
+        doc.add_paragraph(f"최종 점수: {mark} / 10.0   판정: {safe_str(verdict.get('status',''))}")
+        doc.add_paragraph(f"판정 근거: {safe_str(verdict.get('rationale',''))}")
+        doc.add_heading("4축 정밀 평가 (Hollywood Standard)", 2)
+        tbl = doc.add_table(rows=6, cols=4)
+        tbl.style = 'Table Grid'
+        headers = ['AXIS', '가중치', '평가 기준', '점수']
+        for i, h in enumerate(headers):
+            tbl.rows[0].cells[i].text = h
+        axis_data = [
+            ('① STRUCTURE / 구성·플롯',  '30%', '인과관계 정밀도 / 3막 구조 완성도',      safe_int(sc.get('structure', 0))),
+            ('② HERO / 캐릭터',          '30%', 'Goal / Need / Strategy / 감정선',          safe_int(sc.get('hero', 0))),
+            ('③ CONCEPT / 소재·컨셉',    '20%', '하이컨셉 · 독창성 · 시장성',              safe_int(sc.get('concept', 0))),
+            ('④ GENRE / 장르 적합성',    '20%', '장르 문법 충실도 / 타깃 소구력',           safe_int(sc.get('genre', 0))),
+        ]
+        for i, (axis, weight, criteria, val) in enumerate(axis_data, 1):
+            row = tbl.rows[i].cells
+            row[0].text = axis
+            row[1].text = weight
+            row[2].text = criteria
+            clamped = min(max(val, 0), 10)
+            row[3].text = f"{'█'*clamped}{'░'*(10-clamped)}  {val}/10"
+        final_row = tbl.rows[5].cells
+        final_row[0].text = 'FINAL'
+        final_row[1].text = ''
+        final_row[2].text = '0.3S + 0.3H + 0.2C + 0.2G'
+        final_row[3].text = f"{mark} / 10.0"
+
+        # 2. 로그라인
+        doc.add_heading("2. 로그라인 분석 (Logline Pack)", 1)
+        log = item.get('logline', {})
+        if isinstance(log, dict):
+            doc.add_heading("ORIGINAL", 2)
+            doc.add_paragraph(safe_str(log.get('original', '')))
+            doc.add_heading("WASHED", 2)
+            doc.add_paragraph(safe_str(log.get('washed', '')))
+        else:
+            doc.add_paragraph(safe_str(log))
+
+        # 3. 줄거리
+        doc.add_heading("3. 줄거리 (Synopsis)", 1)
+        doc.add_paragraph(safe_str(item.get('synopsis', '')))
+
+        # 4. 장단점 + 핵심처방
+        doc.add_heading("4. 장점 및 보완점 (Pros & Cons)", 1)
+        pc = item.get('pros_cons', {})
+        if isinstance(pc, dict):
+            for p in pc.get('pros', []):  doc.add_paragraph(f"✅ {safe_str(p)}")
+            for c in pc.get('cons', []):  doc.add_paragraph(f"⚠️ {safe_str(c)}")
+            if pc.get('prescription'):
+                doc.add_heading("핵심 처방 (Key Prescription)", 2)
+                doc.add_paragraph(safe_str(pc.get('prescription', '')))
+
+        # 5. 서사 동력
+        doc.add_heading("5. 서사 동력 (Narrative Drive)", 1)
+        drive = item.get('drive', {})
+        if isinstance(drive, dict):
+            doc.add_paragraph(f"① 목적(욕망): {safe_str(drive.get('goal',''))}")
+            doc.add_paragraph(f"② 발생요인: {safe_str(drive.get('lack',''))}")
+            doc.add_paragraph(f"③ 해결전략: {safe_str(drive.get('strategy',''))}")
+            ev = drive.get('evaluation', {})
+            if isinstance(ev, dict):
+                doc.add_paragraph(f"목적 명확성: {safe_str(ev.get('clarity',''))}")
+                doc.add_paragraph(f"발생요인 확실성: {safe_str(ev.get('urgency',''))}")
+                doc.add_paragraph(f"해결전략 창의성: {safe_str(ev.get('consistency',''))}")
+                doc.add_paragraph(safe_str(ev.get('overall_diagnosis', '')))
+
+        # 6. 15-Beat Sheet
+        BEAT_KO = {
+            "Opening Image":"오프닝 이미지","Theme Stated":"주제 제시","Set-up":"설정",
+            "Catalyst":"촉매","Debate":"갈등","Break Into Two":"2막 진입",
+            "B Story":"B 스토리","Fun and Games":"재미와 게임","Midpoint":"중간점",
+            "Bad Guys Close In":"위기 고조","All Is Lost":"모든 것을 잃다",
+            "Dark Night of Soul":"영혼의 어둔 밤","Dark Night of the Soul":"영혼의 어둔 밤",
+            "Break Into Three":"3막 진입","Finale":"피날레","Climax":"클라이맥스",
+            "Final Image":"최종 이미지",
+        }
+        circles_fb = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩','⑪','⑫','⑬','⑭','⑮']
+        doc.add_heading("6. 구성 및 플롯 (15-Beat Sheet)", 1)
+        beats = item.get('beats', {})
+        if isinstance(beats, dict) and beats:
+            btbl = doc.add_table(rows=1, cols=2)
+            btbl.style = 'Table Grid'
+            btbl.rows[0].cells[0].text = 'BEAT'
+            btbl.rows[0].cells[1].text = 'DESCRIPTION'
+            for idx, (k, v) in enumerate(sorted(beats.items()), 0):
+                name = re.sub(r'^[\d\.\-\_\s]+', '', str(k)).strip()
+                ko   = BEAT_KO.get(name, name)
+                row  = btbl.add_row()
+                row.cells[0].text = f"{circles_fb[idx] if idx < 15 else ''} {ko} ({name})"
+                row.cells[1].text = safe_str(v)
+
+        # 7. 장르
+        doc.add_heading("7. 장르 분석 및 적합도 (Genre Compliance)", 1)
+        genre = item.get('genre_compliance', item.get('genre_suitability', {}))
+        if isinstance(genre, dict):
+            doc.add_paragraph(f"장르: {safe_str(genre.get('genre_key', genre.get('genre_name', '')))}")
+            doc.add_paragraph(f"준수도: {genre.get('compliance_score',0)} / 10")
+            # 장르적 재미 진단
+            genre_fun_alive = genre.get('genre_fun_alive', None)
+            if genre_fun_alive is not None:
+                doc.add_paragraph(f"장르적 재미: {'✓ 작동' if genre_fun_alive else '✗ 약함'}")
+            if genre.get('genre_fun_diagnosis'):
+                doc.add_paragraph(f"장르적 재미 진단: {safe_str(genre.get('genre_fun_diagnosis',''))}")
+            # must_have_check
+            must_checks = genre.get('must_have_check', [])
+            if isinstance(must_checks, list) and must_checks:
+                doc.add_heading("필수 요소 체크", 2)
+                for c in must_checks:
+                    if isinstance(c, dict):
+                        status_icon = '✅' if c.get('status') == '충족' else ('△' if c.get('status') == '약함' else '❌')
+                        doc.add_paragraph(f"{status_icon} {safe_str(c.get('item',''))} [{safe_str(c.get('status',''))}] — {safe_str(c.get('evidence',''))}")
+            else:
+                for c in genre.get('checks', []):
+                    doc.add_paragraph(f"✅ {safe_str(c)}")
+            # Hook/Punch 체크
+            hp = genre.get('hook_punch_check', {})
+            if isinstance(hp, dict) and hp:
+                doc.add_heading("Hook / Punch 체크", 2)
+                doc.add_paragraph(f"{'✓' if hp.get('hook_present') else '✗'} Hook: {safe_str(hp.get('hook_note',''))}")
+                doc.add_paragraph(f"{'✓' if hp.get('punch_present') else '✗'} Punch: {safe_str(hp.get('punch_note',''))}")
+            # 실패 패턴
+            fail_patterns = genre.get('fail_patterns_found', [])
+            if isinstance(fail_patterns, list) and fail_patterns:
+                doc.add_heading("발견된 실패 패턴", 2)
+                for f in fail_patterns:
+                    doc.add_paragraph(f"⚠️ {safe_str(f)}")
+            for m in genre.get('missing_elements', []):
+                doc.add_paragraph(f"❌ {safe_str(m)}")
+            if genre.get('doctoring'):
+                doc.add_paragraph(safe_str(genre.get('doctoring', '')))
+
+            # ─── 7-B. OPENING MASTERY (v2.1) ───
+            om = genre.get('opening_mastery', {})
+            if isinstance(om, dict) and om:
+                TECH_KO = {
+                    "ACTION_DROP":"액션 드롭","COLD_OPEN":"콜드 오픈",
+                    "TEASE_REVEAL":"티즈 앤 리빌","IN_MEDIA_RES":"인 미디어스 레스",
+                    "CHARACTER_REVEAL_ACTION":"캐릭터 리빌 액션","HOOK_DIALOGUE":"훅 다이얼로그",
+                    "UNDEFINED":"미정의"
+                }
+                doc.add_heading("7-B. 오프닝 마스터리 (Opening Mastery)", 1)
+                intended = om.get('intended_technique','UNDEFINED')
+                doc.add_paragraph(f"작가가 노린 기법: {TECH_KO.get(intended, intended)}")
+                align_map = {'aligned':'✓ 장르 DNA 일치','partial':'△ 부분 일치','misaligned':'✗ 장르 DNA 불일치'}
+                doc.add_paragraph(f"장르 DNA 일치도: {align_map.get(om.get('dna_alignment','partial'), '-')}")
+                try:
+                    osc = int(float(om.get('opening_score', 0)))
+                except (ValueError, TypeError):
+                    osc = 0
+                doc.add_paragraph(f"오프닝 점수: {osc} / 10")
+                if om.get('intended_technique_evidence'):
+                    doc.add_paragraph(f"근거: {safe_str(om.get('intended_technique_evidence',''))}")
+                if om.get('dna_alignment_reason'):
+                    doc.add_paragraph(f"DNA 일치 분석: {safe_str(om.get('dna_alignment_reason',''))}")
+                # 도파민 6감각
+                dop = om.get('dopamine_scores', {})
+                if isinstance(dop, dict) and dop:
+                    doc.add_heading("도파민 6감각", 2)
+                    DOP_KO = [('shock','충격'),('laughter','웃음'),('tension','긴장'),
+                              ('wonder','경이'),('curiosity','호기심'),('emotional_resonance','감정 울림')]
+                    for key, ko in DOP_KO:
+                        doc.add_paragraph(f"  {ko}: {safe_int(dop.get(key, 0))} / 10")
+                if om.get('dopamine_working'):
+                    doc.add_paragraph(f"작동 중인 감각: {', '.join([safe_str(w) for w in om.get('dopamine_working', [])])}")
+                if om.get('dopamine_missing'):
+                    doc.add_paragraph(f"누락된 감각: {', '.join([safe_str(m) for m in om.get('dopamine_missing', [])])}")
+                if om.get('provocation_without_dopamine'):
+                    doc.add_paragraph(f"⚠️ 자극만 있고 도파민 없음: {safe_str(om.get('provocation_note',''))}")
+                cgc = om.get('complex_genre_check', {})
+                if isinstance(cgc, dict) and cgc.get('is_complex'):
+                    doc.add_paragraph(f"복합 장르 — 표면: {safe_str(cgc.get('primary_genre',''))} · 본질: {safe_str(cgc.get('core_genre',''))}")
+                    doc.add_paragraph(safe_str(cgc.get('note','')))
+                if om.get('opening_diagnosis'):
+                    doc.add_paragraph(f"오프닝 종합 진단: {safe_str(om.get('opening_diagnosis',''))}")
+
+            # ─── 7-C. OPENING RX (v2.1) — SHIHO 자료, level='chris'에서는 스킵 ───
+            rx = item.get('opening_rx', {})
+            if level != "chris" and isinstance(rx, dict) and rx:
+                TECH_KO = {
+                    "ACTION_DROP":"액션 드롭","COLD_OPEN":"콜드 오픈",
+                    "TEASE_REVEAL":"티즈 앤 리빌","IN_MEDIA_RES":"인 미디어스 레스",
+                    "CHARACTER_REVEAL_ACTION":"캐릭터 리빌 액션","HOOK_DIALOGUE":"훅 다이얼로그",
+                    "UNDEFINED":"미정의"
+                }
+                doc.add_heading("7-C. 오프닝 교정 처방 (Opening RX)", 1)
+                doc.add_paragraph("✓ 작가 의도 존중 — 기법 유지" if rx.get('respect_intent', True) else "↻ 기법 전환 권장")
+                kept = rx.get('intent_kept_technique','')
+                doc.add_paragraph(f"유지 기법: {TECH_KO.get(kept, kept)}")
+                if rx.get('switch_reason'):
+                    doc.add_paragraph(f"기법 전환 이유: {safe_str(rx.get('switch_reason',''))}")
+                if rx.get('completion_plan'):
+                    doc.add_paragraph(f"완성도 끌어올림 방안: {safe_str(rx.get('completion_plan',''))}")
+                preserve = rx.get('preserve_from_original', [])
+                if isinstance(preserve, list) and preserve:
+                    doc.add_heading("원본에서 반드시 보존할 것", 2)
+                    for p in preserve:
+                        doc.add_paragraph(f"• {safe_str(p)}")
+                inj = rx.get('dopamine_injection', [])
+                if isinstance(inj, list) and inj:
+                    doc.add_heading("도파민 보강 처방", 2)
+                    for d in inj:
+                        if isinstance(d, dict):
+                            doc.add_paragraph(f"  [{safe_str(d.get('sense',''))}] {safe_str(d.get('how',''))}")
+                if rx.get('complex_genre_note'):
+                    doc.add_paragraph(f"복합 장르 조정: {safe_str(rx.get('complex_genre_note',''))}")
+                if rx.get('overall_direction'):
+                    doc.add_paragraph(f"교정 전체 방향: {safe_str(rx.get('overall_direction',''))}")
+
+        # 8~10 섹션은 SHIHO 자료 — level='chris'에서는 전체 스킵
+        if level != "chris":
+            # 8. 시퀀스 워싱
+            doc.add_page_break()
+            doc.add_heading("8. 시퀀스 워싱 (Washing Table)", 1)
+            for row in item.get('washing_table', []):
+                if not isinstance(row, dict): continue
+                doc.add_paragraph(f"[{safe_str(row.get('seq',''))}]  {safe_str(row.get('label',''))}")
+                wtbl = doc.add_table(rows=1, cols=2)
+                wtbl.style = 'Table Grid'
+                wtbl.rows[0].cells[0].text = f"⚠️ 진단\n{safe_str(row.get('diagnosis',''))}"
+                wtbl.rows[0].cells[1].text = f"✅ 처방\n{safe_str(row.get('prescription',''))}"
+
+            # 9. 대사 워싱
+            doc.add_heading("9. 대사 워싱 (Dialogue Washing)", 1)
+            da = item.get('dialogue_analysis', {})
+            if isinstance(da, dict) and da:
+                doc.add_paragraph(f"종합 대사 수준: {da.get('overall_score',0)} / 10")
+                ax = da.get('axis_scores', {})
+                if isinstance(ax, dict) and ax:
+                    doc.add_heading("3축 점수", 2)
+                    atbl = doc.add_table(rows=4, cols=3)
+                    atbl.style = 'Table Grid'
+                    atbl.rows[0].cells[0].text = '평가 축'
+                    atbl.rows[0].cells[1].text = '기준'
+                    atbl.rows[0].cells[2].text = '점수'
+                    axes = [
+                        ('① 캐릭터 적합성', '고유 어휘·말투·감정 반영',   safe_int(ax.get('character_voice',0))),
+                        ('② 서브텍스트',    '표면↔이면 충돌, 설명형 금지', safe_int(ax.get('subtext',0))),
+                        ('③ 행동/감정/관계','장면 추진력, 정보전달 금지',   safe_int(ax.get('action_driven',0))),
+                    ]
+                    for i, (lbl, crit, val) in enumerate(axes, 1):
+                        atbl.rows[i].cells[0].text = lbl
+                        atbl.rows[i].cells[1].text = crit
+                        clamped = min(max(val, 0), 10)
+                        atbl.rows[i].cells[2].text = f"{'█'*clamped}{'░'*(10-clamped)}  {val}/10"
+                doc.add_paragraph(safe_str(da.get('overall_comment', '')))
+                for s in da.get('strengths', []):
+                    doc.add_paragraph(f"💪 {safe_str(s)}")
+                issues = da.get('issues', [])
+                if isinstance(issues, list) and issues:
+                    doc.add_heading("대사 4축 진단 Before / After", 2)
+                    for issue in issues:
+                        if not isinstance(issue, dict): continue
+                        doc.add_paragraph(f"[{safe_str(issue.get('type',''))}]  {safe_str(issue.get('axis',''))}  {safe_str(issue.get('description',''))}")
+                        itbl = doc.add_table(rows=1, cols=2)
+                        itbl.style = 'Table Grid'
+                        itbl.rows[0].cells[0].text = f"❌ BEFORE\n{safe_str(issue.get('example_bad',''))}"
+                        itbl.rows[0].cells[1].text = f"✅ ④ 개선 제안\n{safe_str(issue.get('example_good',''))}"
+                        if issue.get('rewrite_note'):
+                            doc.add_paragraph(f"✏️ Moon 지시: {safe_str(issue.get('rewrite_note',''))}")
+
+            # 10. 각색 제안
+            doc.add_heading("10. 각색 제안 (Action Plan)", 1)
+            for i, s in enumerate(item.get('suggestions', []), 1):
+                clean_s = re.sub(r'^[\d\.\s]+', '', safe_str(s)).strip()
+                doc.add_paragraph(f"STEP {i:02d}  {clean_s}")
+
+        # 11. 각색 원고 — MOON 자료, level이 'full'일 때만
+        if level == "full":
+            doc.add_page_break()
+            doc.add_heading("11. 각색 원고 (Rewrite Scenes)", 1)
+            rw = item.get('rewriting', {})
+            if isinstance(rw, dict):
+                if rw.get('target_reason'):
+                    doc.add_paragraph(f"✏️ 각색 전략: {safe_str(rw.get('target_reason',''))}")
+                for sc in rw.get('scenes', []):
+                    if not isinstance(sc, dict): continue
+                    is_r = sc.get('type') == '수정씬'
+                    doc.add_heading(f"{safe_str(sc.get('scene_no',''))}  [{'✏️ 수정씬' if is_r else '✨ 추가씬'}]", 2)
+                    if sc.get('original'):
+                        doc.add_paragraph(f"📄 기존 씬 (BEFORE)\n{safe_str(sc.get('original',''))}")
+                    content = safe_str(sc.get('content', ''))
+                    content = content.replace('\\n', '\n')
+                    doc.add_paragraph(f"{'✏️ 수정씬' if is_r else '✨ 추가씬'} (AFTER)\n{content}")
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
+    except Exception as e:
+        st.error(f"DOCX 생성 중 오류 발생: {type(e).__name__} — {e}")
+        # 최소한의 오류 보고서라도 생성
+        try:
+            doc_err = Document()
+            doc_err.add_heading("DOCX 생성 오류", 0)
+            doc_err.add_paragraph(f"오류: {type(e).__name__} — {e}")
+            doc_err.add_paragraph(f"작품명: {safe_str(item.get('title', ''))}")
+            doc_err.add_paragraph("전체 보고서 생성에 실패했습니다. Streamlit 화면의 분석 결과를 참고해주세요.")
+            buf_err = io.BytesIO()
+            doc_err.save(buf_err)
+            buf_err.seek(0)
+            return buf_err.getvalue()
+        except:
+            return None
+
+
+# =================================================================
+# [9] 진행 바
+# =================================================================
+def render_step_bar(step):
+    labels = ["📄 업로드", "🔍 CHRIS", "🧹 SHIHO", "✍️ MOON"]
+    dots = ""
+    for i, label in enumerate(labels):
+        cls = "done" if i < step else ("active" if i == step else "wait")
+        sym = "✓" if i < step else str(i + 1)
+        dots += (f'<div style="display:flex;flex-direction:column;align-items:center;gap:5px;">'
+                 f'<div class="step-dot {cls}">{sym}</div>'
+                 f'<div style="font-size:0.68rem;opacity:0.65;white-space:nowrap;color:#191970;">{label}</div></div>')
+        if i < len(labels) - 1:
+            lc = "done" if i < step - 1 else ""
+            dots += f'<div class="step-line {lc}" style="margin-bottom:20px;"></div>'
+    st.markdown(f'<div class="step-bar">{dots}</div>', unsafe_allow_html=True)
+
+# =================================================================
+# [10] 비서 카드
+# =================================================================
+AVATAR_MAP = {
+    "CHRIS": CHRIS_SVG,
+    "SHIHO": SHIHO_SVG,
+    "MOON":  MOON_SVG,
+}
+
+def agent_card(emoji, name, role, desc, status, key, btn_label, btn_fn, result_fn, result_data):
+    badge_map = {
+        'waiting': '<span style="background:#E6E9EF;color:#888888;padding:2px 10px;border-radius:20px;font-size:0.72rem;font-weight:800;">대기 중</span>',
+        'active':  '<span style="background:#FFCB05;color:#191970;padding:2px 10px;border-radius:20px;font-size:0.72rem;font-weight:800;">● 준비됨</span>',
+        'done':    '<span style="background:#2EC484;color:#FFFFFF;padding:2px 10px;border-radius:20px;font-size:0.72rem;font-weight:800;">✓ 완료</span>',
+    }
+    avatar_html = AVATAR_MAP.get(name, f'<div style="font-size:2.2rem;">{emoji}</div>')
+    st.markdown(f"""
+    <div class="agent-card {status}">
+        <div style="display:flex;align-items:flex-start;gap:18px;">
+            <div style="width:72px;height:72px;flex-shrink:0;border-radius:16px;overflow:hidden;">{avatar_html}</div>
+            <div style="flex:1;">
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:3px;">
+                    <span style="font-size:1.15rem;font-weight:900;letter-spacing:0.04em;color:#191970;">{name}</span>
+                    {badge_map[status]}
+                </div>
+                <div style="font-size:0.75rem;color:#B8860B;font-weight:700;margin-bottom:4px;letter-spacing:0.06em;">{role}</div>
+                <div style="font-size:0.83rem;color:#191970;opacity:0.65;line-height:1.5;">{desc}</div>
+            </div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    if status == 'active':
+        if st.button(btn_label, key=f"{key}_btn", use_container_width=True):
+            btn_fn()
+
+    if status == 'done' and result_data:
+        result_fn(result_data)
+
+# =================================================================
+# [11] 워크스페이스 페이지
+# =================================================================
+def show_workspace():
+    st.markdown("""
+    <div style="text-align:center;padding:36px 0 8px;">
+        <div style="font-size:0.72rem;font-weight:900;letter-spacing:0.5em;color:#FFCB05;margin-bottom:6px;">BLUE JEANS PICTURES</div>
+        <div style="font-size:2.8rem;font-weight:950;color:#191970;line-height:1;letter-spacing:-0.03em;">REWRITE ENGINE</div>
+        <div style="margin-top:6px;font-size:0.75rem;letter-spacing:0.15em;color:#191970;opacity:0.4;">YOUNG · VINTAGE · FREE · INNOVATIVE</div>
+    </div>""", unsafe_allow_html=True)
+
+    step = st.session_state.step
+    render_step_bar(step)
+    st.markdown('<hr>', unsafe_allow_html=True)
+
+    client = get_client()
+
+    # ── 업로드 ──
+    if step == 0:
+
+
+        # 파일 업로드 전: uploader + 커스텀 드롭존 안내
+        # 파일 업로드 후: uploader 숨기고 파일 정보 카드만 표시
+        if not st.session_state.get('_uploaded_ready'):
+            uploaded = st.file_uploader(
+                "분석할 시나리오 PDF를 업로드하세요",
+                type=["pdf"],
+                key="pdf_uploader"
+            )
+            if not uploaded:
+                pass
+            else:
+                with st.spinner("📄 텍스트 추출 중..."):
+                    text = extract_text(uploaded)
+                if text:
+                    st.session_state.raw_text = text
+                    st.session_state['_uploaded_name'] = uploaded.name
+                    st.session_state['_uploaded_kb']   = round(len(uploaded.getvalue()) / 1024)
+                    st.session_state['_uploaded_chars'] = len(text)
+                    st.session_state['_uploaded_ready'] = True
+                    st.rerun()
+        else:
+            # 업로드 완료 → uploader 숨기고 파일 카드만 표시
+            fname  = st.session_state.get('_uploaded_name', '')
+            kb     = st.session_state.get('_uploaded_kb', 0)
+            chars  = st.session_state.get('_uploaded_chars', 0)
+            st.markdown(f"""
+            <div style="background:#EEF0FA;border:1px solid #C5D0F0;border-radius:12px;
+                        padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;gap:14px;">
+                <div style="font-size:2rem;">📄</div>
+                <div style="flex:1;">
+                    <div style="font-weight:800;color:#191970;font-size:0.95rem;">{safe(fname)}</div>
+                    <div style="font-size:0.8rem;color:#666;margin-top:3px;">{kb:,} KB · {chars:,}자 추출 완료</div>
+                </div>
+                <div style="background:#2EC484;color:#FFFFFF;padding:4px 12px;border-radius:20px;
+                            font-size:0.75rem;font-weight:800;">✓ 준비완료</div>
+            </div>
+            """, unsafe_allow_html=True)
+            col1, col2, col3 = st.columns([2, 1, 2])
+            with col2:
+                if st.button("🚀 분석 시작", use_container_width=True):
+                    st.session_state.step = 1
+                    st.session_state['_uploaded_ready'] = False
+                    st.rerun()
+            # 파일 다시 선택 링크
+            st.markdown('<div style="text-align:center;margin-top:8px;">', unsafe_allow_html=True)
+            if st.button("↩ 다른 파일 선택", use_container_width=False):
+                for k in ['_uploaded_ready','_uploaded_name','_uploaded_kb','_uploaded_chars']:
+                    st.session_state.pop(k, None)
+                st.session_state.raw_text = None
                 st.rerun()
-    with c2:
-        if st.button("◀ 입력으로 돌아가기", use_container_width=True):
-            st.session_state.step = 0
-            st.session_state.diagnose_result = None
-            st.rerun()
-
-
-def _priority_badge(priority: str) -> str:
-    """우선순위 배지 HTML."""
-    colors = {
-        "HIGH":   ("#E14444", "#FFFFFF"),
-        "MEDIUM": ("#FFCB05", "#191970"),
-        "LOW":    ("#8E8E99", "#FFFFFF"),
-    }
-    bg, fg = colors.get(priority, ("#8E8E99", "#FFFFFF"))
-    return f'<span style="display:inline-block; padding:2px 8px; background:{bg}; color:{fg}; border-radius:4px; font-size:0.72rem; font-weight:800; font-family:Paperlogy,sans-serif;">{priority}</span>'
-
-
-def _type_badge(t: str) -> str:
-    """작업 종류 배지 HTML."""
-    icons = {
-        "REWRITE": "✏️",
-        "ADD":     "➕",
-        "DELETE":  "🗑️",
-        "MERGE":   "🔗",
-        "SPLIT":   "✂️",
-    }
-    icon = icons.get(t, "📝")
-    return f'<span style="display:inline-block; padding:2px 8px; background:#EEEEF6; color:#191970; border-radius:4px; font-size:0.72rem; font-weight:700; margin-left:4px;">{icon} {t}</span>'
-
-
-def show_step_2_revise():
-    """Step 2: 배치 단위 순차 집필 UI."""
-    batches = st.session_state.revise_batches or []
-    batch_results = st.session_state.batch_results or {}
-
-    if not batches:
-        st.error("배치 정보가 없습니다. 진단 단계로 돌아가주세요.")
-        if st.button("◀ 진단으로 돌아가기"):
-            st.session_state.step = 1
-            st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
         return
 
-    total_batches = len(batches)
-    completed_count = sum(1 for i in range(1, total_batches + 1) if i in batch_results)
+    text = st.session_state.raw_text
 
-    # 전체 씬 개수 / 완료 씬 개수
-    total_scenes = sum(len(b["scenes"]) for b in batches)
-    completed_scenes = sum(
-        len(batch_results[i].get("revision_result", {}).get("revised_scenes", []))
-        for i in range(1, total_batches + 1)
-        if i in batch_results
-    )
+    # ── BLUE 비서 ──
+    def do_chris():
+        with st.spinner("🔍 Chris가 시나리오를 분석하고 있습니다... (약 30~60초 소요)"):
+            # API 키 확인
+            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                st.error("❌ ANTHROPIC_API_KEY가 Secrets에 없습니다. Streamlit Cloud → Settings → Secrets 확인")
+                return
+            r = run_blue(text, client)
+            if r:
+                st.session_state.analysis = r
+                st.session_state.step = 2
+                st.rerun()
+            else:
+                st.error("분석 실패. 위의 API 오류 메시지를 확인하세요.")
 
-    # ── 헤더 ──
-    st.markdown('<div class="rev-card-title">✍️ Stage 2: 배치 단위 집필 (REVISE)</div>',
-                unsafe_allow_html=True)
+    chris_st = 'done' if st.session_state.analysis else 'active'
+    agent_card("🔍", "CHRIS", "Senior Script Analyst",
+               "구조 분석 · 15-Beat Sheet · 서사동력 · 시각화 · 장르 진단",
+               chris_st, "chris", "🔍 Chris 분석 시작", do_chris,
+               render_analysis, st.session_state.analysis)
 
-    # 진행률 바
-    progress = completed_count / total_batches if total_batches else 0
-    st.progress(progress, text=f"배치 {completed_count} / {total_batches} 완료  ({completed_scenes} / {total_scenes} 씬)")
-
-    # ── 💾 진행 상황 자동 백업 / 복구 패널 ──
-    backup_col1, backup_col2 = st.columns([1, 1])
-
-    with backup_col1:
-        # 백업 다운로드 — 완료된 배치가 1개 이상 있을 때만
-        if batch_results:
-            import json as _json
-            from datetime import datetime as _dt
-            backup_data = {
-                "version": "v2.2",
-                "saved_at": _dt.now().isoformat(),
-                "title": st.session_state.title,
-                "genre": st.session_state.genre,
-                "total_batches": total_batches,
-                "completed_batches": completed_count,
-                "batch_results": batch_results,
-                "diagnose_result": st.session_state.diagnose_result,
-                # 구간 모드 정보 보존
-                "section_mode": st.session_state.section_mode,
-                "work_mode": st.session_state.work_mode,
-                "protected_ranges": st.session_state.protected_ranges,
-                "revision_ranges": st.session_state.revision_ranges,
-            }
-            backup_json = _json.dumps(backup_data, ensure_ascii=False, indent=2)
-            backup_filename = f"revise_backup_{st.session_state.title}_{completed_count}of{total_batches}_{_dt.now().strftime('%Y%m%d_%H%M')}.json"
-
-            st.download_button(
-                f"💾 진행 상황 백업 ({completed_count}/{total_batches} 배치)",
-                data=backup_json.encode("utf-8"),
-                file_name=backup_filename,
-                mime="application/json",
-                key="backup_progress",
-                help="에러 대비. 다음 배치 시작 전에 받아두세요.",
-                use_container_width=True,
-            )
-
-    with backup_col2:
-        # 백업 복구 업로드
-        with st.popover("📂 백업에서 복구", use_container_width=True):
-            st.caption("이전 작업 백업 JSON을 올리면 그 지점부터 이어서 작업할 수 있습니다.")
-            restore_file = st.file_uploader(
-                "백업 JSON 업로드",
-                type=["json"],
-                key="restore_uploader",
-            )
-            if restore_file:
-                try:
-                    import json as _json
-                    raw = restore_file.read().decode("utf-8")
-                    loaded = _json.loads(raw)
-
-                    if st.button("✅ 이 백업으로 복구", key="confirm_restore", type="primary"):
-                        # 핵심 상태 복구
-                        st.session_state.batch_results = {
-                            int(k): v for k, v in loaded.get("batch_results", {}).items()
-                        }
-                        if loaded.get("diagnose_result"):
-                            st.session_state.diagnose_result = loaded["diagnose_result"]
-                        if loaded.get("section_mode") is not None:
-                            st.session_state.section_mode = loaded["section_mode"]
-                        if loaded.get("work_mode"):
-                            st.session_state.work_mode = loaded["work_mode"]
-                        if loaded.get("protected_ranges"):
-                            st.session_state.protected_ranges = loaded["protected_ranges"]
-                        if loaded.get("revision_ranges"):
-                            st.session_state.revision_ranges = loaded["revision_ranges"]
-
-                        restored_count = len(st.session_state.batch_results)
-                        st.success(f"✅ 복구 완료: {restored_count}개 배치 결과 복원됨")
-                        st.rerun()
-                    else:
-                        st.info(
-                            f"📅 백업 시각: {loaded.get('saved_at', '?')[:16]}\n\n"
-                            f"📌 작품: {loaded.get('title', '?')}\n\n"
-                            f"📊 진행: {loaded.get('completed_batches', 0)} / {loaded.get('total_batches', 0)} 배치"
-                        )
-                except Exception as e:
-                    st.error(f"백업 파일 로드 실패: {e}")
-
-    # 배치 전략 안내
-    plan = st.session_state.diagnose_result.get("revision_plan", {})
-    strategy = plan.get("batch_strategy", "")
-    if strategy:
-        st.info(f"📋 **배치 전략:** {strategy}")
-
-    st.markdown("---")
-
-    # ── 배치 카드 목록 ──
-    for batch in batches:
-        bidx = batch["batch_index"]
-        scenes = batch["scenes"]
-        is_done = bidx in batch_results
-        is_current = (bidx == completed_count + 1) and not is_done
-
-        # 카드 헤더
-        if is_done:
-            status_icon = "✅"
-            status_color = "#2EC484"
-            status_text = "완료"
-        elif is_current:
-            status_icon = "▶️"
-            status_color = "#FFCB05"
-            status_text = "다음 배치"
-        else:
-            status_icon = "⏸️"
-            status_color = "#8E8E99"
-            status_text = "대기"
-
-        with st.container():
-            st.markdown(
-                f'<div style="background:#FFFFFF; border:2px solid {status_color}; '
-                f'border-radius:10px; padding:16px; margin-bottom:12px;">'
-                f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
-                f'<div style="font-family:Paperlogy,sans-serif; font-weight:800; font-size:1.05rem; color:#191970;">'
-                f'{status_icon} 배치 {bidx} / {total_batches}'
-                f'</div>'
-                f'<div style="color:{status_color}; font-weight:700; font-size:0.85rem;">{status_text}</div>'
-                f'</div>'
-                f'<div style="color:#8E8E99; font-size:0.85rem; margin-bottom:8px;">'
-                f'{batch["priority_summary"]}  ·  {batch["type_summary"]}  ·  씬 {len(scenes)}개'
-                f'</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-            # 씬 목록 (작은 expander)
-            with st.expander(f"씬 목록 ({len(scenes)}개)", expanded=is_current and not is_done):
-                for sc in scenes:
-                    sid = sc.get("scene_id", "")
-                    pri = sc.get("priority", "MEDIUM")
-                    typ = sc.get("type", "REWRITE")
-                    pos = sc.get("scene_position", "")
-                    func = sc.get("original_function", "")
-
-                    st.markdown(
-                        f'{_priority_badge(pri)} {_type_badge(typ)} '
-                        f'<b>{sid}</b>  '
-                        f'<span style="color:#8E8E99; font-size:0.85rem;">— {pos}</span>',
-                        unsafe_allow_html=True
-                    )
-                    if func:
-                        st.caption(f"플롯상 기능: {func}")
-
-                    # 수정 항목 요약
-                    items = sc.get("revision_items", [])
-                    for it in items[:3]:  # 최대 3개만 표시
-                        st.markdown(f"  └ *{it.get('issue','')}* → {it.get('proposed_direction','')}")
-                    st.markdown("")
-
-            # 배치 액션 버튼
-            bc1, bc2, bc3 = st.columns([2, 1, 1])
-            with bc1:
-                if is_done:
-                    # 완료된 배치 — 결과 미리보기 + 재집필
-                    btn_label = f"🔄 배치 {bidx} 재집필"
-                    if st.button(btn_label, key=f"rewrite_batch_{bidx}", use_container_width=True):
-                        client = get_client()
-                        if client:
-                            with st.spinner(f"✍️ 배치 {bidx} 재집필 중... (Opus 4.6)"):
-                                result = run_revise_batch(client, bidx, scenes, total_batches)
-                                if result:
-                                    st.session_state.batch_results[bidx] = result
-                                    st.success(f"✅ 배치 {bidx} 재집필 완료")
-                                    st.rerun()
-                                else:
-                                    st.error(f"배치 {bidx} 재집필 실패")
-                elif is_current:
-                    # 다음 차례 배치 — 집필 시작
-                    btn_label = f"▶️ 배치 {bidx} 집필 시작"
-                    if st.button(btn_label, key=f"run_batch_{bidx}", type="primary", use_container_width=True):
-                        client = get_client()
-                        if client:
-                            with st.spinner(f"✍️ 배치 {bidx} 집필 중... ({len(scenes)}개 씬, Opus 4.6, 1~3분 소요)"):
-                                result = run_revise_batch(client, bidx, scenes, total_batches)
-                                if result:
-                                    st.session_state.batch_results[bidx] = result
-                                    st.success(f"✅ 배치 {bidx} 완료")
-                                    # 다음 배치 들어가기 전 백업 권고
-                                    if bidx < total_batches:
-                                        st.info(
-                                            f"💡 **다음 배치 진행 전, 위쪽 [💾 진행 상황 백업] 버튼을 눌러 "
-                                            f"현재까지 결과({bidx}/{total_batches} 배치)를 다운로드해두세요. "
-                                            f"에러 발생 시 백업에서 복구할 수 있습니다.**"
-                                        )
-                                    st.rerun()
-                                else:
-                                    st.error(
-                                        f"❌ 배치 {bidx} 집필 실패. "
-                                        f"위쪽 [💾 진행 상황 백업]으로 지금까지 결과를 먼저 저장하세요. "
-                                        f"그 다음 다시 시도해주세요."
-                                    )
-                else:
-                    # 대기 중 (이전 배치 미완료)
-                    st.button(f"⏸️ 배치 {bidx} 대기 중", disabled=True, use_container_width=True,
-                              key=f"wait_batch_{bidx}")
-
-            with bc2:
-                if is_done:
-                    # 결과 미리보기 토글
-                    if st.button("👁️ 결과 보기", key=f"preview_batch_{bidx}", use_container_width=True):
-                        st.session_state[f"show_preview_{bidx}"] = not st.session_state.get(f"show_preview_{bidx}", False)
-                        st.rerun()
-
-            with bc3:
-                if is_done:
-                    if st.button("🗑️ 결과 삭제", key=f"delete_batch_{bidx}", use_container_width=True):
-                        del st.session_state.batch_results[bidx]
-                        # 이후 배치 결과도 삭제 (순차 의존성)
-                        for later_idx in range(bidx + 1, total_batches + 1):
-                            st.session_state.batch_results.pop(later_idx, None)
-                        st.rerun()
-
-            # 결과 미리보기 영역
-            if is_done and st.session_state.get(f"show_preview_{bidx}", False):
-                br = batch_results[bidx]
-                rr = br.get("revision_result", {})
-                with st.container():
-                    st.markdown(
-                        f'<div style="background:#F7F7F5; border-left:4px solid #2EC484; '
-                        f'padding:12px 16px; border-radius:0 8px 8px 0; margin-top:8px; margin-bottom:8px;">'
-                        f'<b style="color:#191970;">배치 {bidx} 결과 요약</b><br/>'
-                        f'<span style="color:#1A1A2E;">{rr.get("summary","(요약 없음)")}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True
-                    )
-
-                    revised_scenes = rr.get("revised_scenes", [])
-                    for sc in revised_scenes:
-                        header = sc.get("scene_header", "")
-                        pri = sc.get("priority", "MEDIUM")
-                        typ = sc.get("type", "REWRITE")
-                        with st.expander(f"{header}  [{pri} · {typ}]"):
-                            col_o, col_r = st.columns([1, 1])
-                            with col_o:
-                                st.markdown("**📄 원본 발췌**")
-                                excerpt = sc.get("original_excerpt", "")
-                                st.text(excerpt if excerpt else "(원본 없음 — 신규 추가/삭제)")
-                            with col_r:
-                                st.markdown("**✏️ 수정본**")
-                                content = sc.get("revised_content", "")
-                                st.text(content if content else "(삭제됨)")
-
-                            notes = sc.get("revision_notes", {})
-                            if notes:
-                                st.markdown("---")
-                                st.markdown(f"**변경:** {notes.get('what_changed','')}")
-                                st.markdown(f"**보존:** {notes.get('what_preserved','')}")
-
-    st.markdown("---")
-
-    # ── 모든 배치 완료 시 다음 단계 ──
-    all_done = (completed_count == total_batches)
-
-    if all_done:
-        st.success(f"🎉 모든 배치 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
-
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        if st.button("✅ Stage 3: 검증 시작 (VERIFY)",
-                     disabled=not all_done, use_container_width=True, type="primary"):
-            # 모든 배치 결과 통합
-            all_results = [batch_results[i] for i in range(1, total_batches + 1) if i in batch_results]
-            merged = merge_batch_results(all_results)
-            st.session_state.revise_result = merged
-
-            client = get_client()
-            if client:
-                with st.spinner("✅ 통합 수정본 검증 중... (Sonnet 4.6)"):
-                    result = run_verify(client)
-                    if result:
-                        st.session_state.verify_result = result
-                        st.session_state.step = 3
-                        st.rerun()
-                    else:
-                        st.error("검증 실패. 다시 시도해주세요.")
-    with c2:
-        # 모두 한 번에 (남은 배치 자동 순차 실행)
-        remaining = total_batches - completed_count
-        if remaining > 0:
-            if st.button(f"⏩ 남은 {remaining}개 자동 진행", use_container_width=True):
-                client = get_client()
-                if client:
-                    progress_bar = st.progress(0, text="배치 자동 실행 중...")
-                    for i, batch in enumerate(batches):
-                        bidx = batch["batch_index"]
-                        if bidx in batch_results:
-                            continue
-                        progress_bar.progress(
-                            (completed_count + (i - completed_count + 1)) / total_batches,
-                            text=f"배치 {bidx} 집필 중... ({len(batch['scenes'])}개 씬)"
-                        )
-                        result = run_revise_batch(client, bidx, batch["scenes"], total_batches)
-                        if result:
-                            st.session_state.batch_results[bidx] = result
-                        else:
-                            st.error(f"배치 {bidx}에서 실패. 중단합니다.")
-                            break
-                    progress_bar.empty()
-                    st.rerun()
-    with c3:
-        if st.button("◀ 진단으로", use_container_width=True):
-            st.session_state.step = 1
-            st.session_state.revise_batches = None
-            st.session_state.batch_results = {}
-            st.rerun()
-
-
-def show_step_3_verify():
-    """Step 3: VERIFY 결과 확인 + 완료 이동."""
-    vr = st.session_state.verify_result.get("verify_report", {})
-
-    verdict = vr.get("overall_verdict", "")
-    score = vr.get("overall_score", "")
-    reason = vr.get("verdict_reason", "")
-
-    verdict_class = "approved" if verdict == "APPROVED" else \
-                    "needs" if verdict == "NEEDS_REVISION" else "rejected"
-
-    st.markdown('<div class="rev-card-title">✅ Stage 3: 검증 결과</div>',
-                unsafe_allow_html=True)
-
-    # 판정
-    st.markdown(f'<div style="text-align:center; padding: 20px 0;">'
-                f'<span class="rev-verdict {verdict_class}">{verdict}</span>'
-                f'<div style="font-size:1.4rem; font-weight:900; color:#191970; margin-top:12px;">'
-                f'{score} / 10.0</div></div>', unsafe_allow_html=True)
-
-    if reason:
-        st.info(reason)
-
-    st.markdown("---")
-
-    # 4축 점수
-    def _show_section(title_text, key, icon):
-        block = vr.get(key, {})
-        sc = block.get("score", "")
-        st.markdown(f'<div class="rev-card-title">{icon} {title_text}  —  {sc}/10</div>',
-                    unsafe_allow_html=True)
-        return block
-
-    # 1. 지시사항 반영
-    block = _show_section("1. 지시사항 반영도", "instruction_compliance", "📝")
-    for item in block.get("items", []):
-        status = item.get("status", "")
-        inst = item.get("instruction_item", "")
-        ev = item.get("evidence", "")
-        if status == "Y":
-            st.success(f"✓ [Y] {inst}\n\n→ {ev}")
-        elif status == "Partial":
-            st.warning(f"△ [Partial] {inst}\n\n→ {ev}")
-        else:
-            st.error(f"✗ [N] {inst}\n\n→ {ev}")
-
-    # 2. LOCKED 보존
-    block = _show_section("2. LOCKED 보존도", "locked_preservation", "🔒")
-    for item in block.get("items", []):
-        status = item.get("status", "")
-        li = item.get("locked_item", "")
-        ev = item.get("evidence", "")
-        if status == "Preserved":
-            st.success(f"✓ [Preserved] {li}\n\n→ {ev}")
-        elif status == "N/A":
-            st.caption(f"— [N/A] {li}")
-        else:
-            st.error(f"✗ [Violated] {li}\n\n→ {ev}")
-
-    # 3. AI ESCAPE
-    block = _show_section("3. AI SCREENPLAY ESCAPE", "ai_escape_check", "🤖")
-    clean = block.get("clean_patterns", "")
-    if clean:
-        st.success(f"✓ 위반 없는 패턴: {clean} / 20")
-    violations = block.get("violations", [])
-    for v in violations:
-        pid = v.get("pattern_id", "")
-        pname = v.get("pattern_name", "")
-        scene = v.get("scene_id", "")
-        quote = v.get("quote", "")
-        sev = v.get("severity", "")
-        emoji = "🔴" if sev == "High" else "🟠" if sev == "Medium" else "🟡"
-        st.markdown(f"{emoji} **[{pid}] {pname}** — {scene} ({sev})")
-        if quote:
-            st.caption(f'→ "{quote}"')
-
-    # 4. 장르 준수도
-    block = _show_section("4. 장르 RULE PACK 준수도", "genre_compliance", "🎬")
-    st.markdown("**Must Have**")
-    for item in block.get("must_have_check", []):
-        stt = item.get("status", "")
-        emoji = "✓" if stt == "Met" else "△" if stt == "Partial" else "✗"
-        st.markdown(f"{emoji} [{stt}] {item.get('item','')}  —  *{item.get('note','')}*")
-    st.markdown("**Fails to Avoid**")
-    for item in block.get("fails_check", []):
-        stt = item.get("status", "")
-        emoji = "✓" if stt == "Avoided" else "△" if stt == "Improved" else "✗"
-        st.markdown(f"{emoji} [{stt}] {item.get('item','')}  —  *{item.get('note','')}*")
-
-    # 하이라이트
-    highlights = vr.get("side_by_side_highlights", [])
-    if highlights:
-        st.markdown("---")
-        st.markdown('<div class="rev-card-title">🌟 핵심 변화 요약</div>', unsafe_allow_html=True)
-        for h in highlights:
-            st.markdown(f"• **{h.get('scene_id','')}**: {h.get('key_change','')}")
-            st.caption(h.get("improvement_note", ""))
-
-    # 재수정 권고
-    recs = vr.get("recommendations", [])
-    if recs:
-        st.markdown("---")
-        st.markdown('<div class="rev-card-title" style="color:#E14444;">🔁 재수정 권고</div>',
-                    unsafe_allow_html=True)
-        for r in recs:
-            st.markdown(f"• {r}")
-
-    st.markdown("---")
-
-    # 완료로 이동
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🎉 완료 페이지로 (다운로드)", use_container_width=True):
-            st.session_state.step = 4
-            st.rerun()
-    with c2:
-        if st.button("◀ 집필 결과로 돌아가기", use_container_width=True):
-            st.session_state.step = 2
-            st.session_state.verify_result = None
-            st.rerun()
-
-
-def show_step_4_complete():
-    """Step 4: 다운로드 + 초기화."""
-    st.markdown('<div style="text-align:center; padding: 30px 0;">'
-                '<span style="font-size: 2.4rem; font-weight: 950; color: #2EC484;">'
-                '🎉 각색 완료!</span></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="rev-card-title">📥 다운로드</div>', unsafe_allow_html=True)
-
-    title = st.session_state.title or "수정본"
-    genre = st.session_state.genre
-
-    c1, c2 = st.columns(2)
-
-    # 수정본 DOCX
-    with c1:
+    # CHRIS 완료 시 분석 리포트 즉시 다운로드 (세션 캐시)
+    if st.session_state.analysis:
+        title = re.sub(r'[/*?:"<>|]', '_', st.session_state.analysis.get('title', '제목없음'))
+        cache_key = '_docx_chris_cache'
+        cache_id_key = '_docx_chris_id'
+        current_id = id(st.session_state.analysis)
         try:
-            is_historical = (st.session_state.period_key != "(현대)")
-            # v2.2 — 구간 모드 + 손본본 있으면 손본본을 베이스로 사용
-            base_text = st.session_state.raw_text
-            if (st.session_state.section_mode
-                    and st.session_state.diff_refined_text
-                    and st.session_state.section_input_method in ("auto", "hybrid")):
-                base_text = st.session_state.diff_refined_text
-
-            docx_bytes = create_revised_docx(
-                st.session_state.revise_result,
-                title=title,
-                genre=genre,
-                original_text=base_text,
-                fact_based=st.session_state.fact_based,
-                historical=is_historical,
-                historical_type=st.session_state.historical_type if is_historical else "",
-            )
-            st.download_button(
-                "📄 수정본 (DOCX)",
-                data=docx_bytes,
-                file_name=get_report_filename(title, "revised"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_revised",
-                help="원본 + 수정된 씬을 통합한 최종 시나리오 (한국 표준 서식)",
-                use_container_width=True,
-            )
+            if st.session_state.get(cache_id_key) != current_id:
+                st.session_state[cache_key] = create_docx(st.session_state.analysis, level="chris")
+                st.session_state[cache_id_key] = current_id
+            docx_chris = st.session_state.get(cache_key)
+            if docx_chris:
+                st.download_button(
+                    "📄 CHRIS 분석 리포트 다운로드 (DOCX)",
+                    data=docx_chris,
+                    file_name=f"시나리오분석_{title}_CHRIS.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="btn_download_chris",
+                    use_container_width=True,
+                    help="CHRIS 분석만 담긴 리포트 (섹션 1~8-B) — 초기 스크리닝/투자 검토용"
+                )
         except Exception as e:
-            st.error(f"수정본 DOCX 생성 오류: {e}")
+            st.caption(f"⚠️ CHRIS 리포트 생성 지연: {type(e).__name__}")
 
-    # 검증 보고서 DOCX
-    with c2:
-        try:
-            verify_bytes = create_verify_docx(
-                st.session_state.verify_result,
-                title=title,
-            )
-            st.download_button(
-                "✅ 검증 보고서 (DOCX)",
-                data=verify_bytes,
-                file_name=get_report_filename(title, "verify"),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_verify",
-                help="지시사항 반영 + LOCKED 보존 + AI ESCAPE + 장르 준수도 검증",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"검증 보고서 DOCX 생성 오류: {e}")
+    if not st.session_state.analysis:
+        agent_card("🧹", "SHIHO", "Script Doctor",
+                   "시퀀스 워싱 · 문제 유형 진단 · 처방 + Risk · 각색 제안 10가지",
+                   'waiting', "shiho", "", lambda: None, lambda x: None, None)
+        agent_card("✍️", "MOON", "Senior Screenwriter",
+                   "표준 각본 형식 · 10개 씬 리라이팅",
+                   'waiting', "moon", "", lambda: None, lambda x: None, None)
+        return
 
-    # JSON 백업 다운로드
-    st.markdown("---")
-    with st.expander("🗃️ 원본 JSON 백업 다운로드 (고급)"):
-        full_state = {
-            "meta": {
-                "title": title,
-                "genre": genre,
-                "intensity": st.session_state.intensity,
-                "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.2",
-            },
-            "input": {
-                "instruction": st.session_state.instruction,
-                "locked": st.session_state.locked,
-            },
-            "diagnose": st.session_state.diagnose_result,
-            "revise":   st.session_state.revise_result,
-            "verify":   st.session_state.verify_result,
+    # ── JEAN 비서 ──
+    def do_shiho():
+        with st.spinner("🧹 Shiho가 시퀀스를 워싱하고 있습니다... (약 30~60초 소요)"):
+            r = run_jean(text, st.session_state.analysis, client)
+            if r:
+                st.session_state.washing = r
+                st.session_state.step = 3
+                st.rerun()
+            else:
+                st.error("워싱 실패 — API 오류 메시지를 위에서 확인하세요.")
+
+    shiho_st = 'done' if st.session_state.washing else 'active'
+    agent_card("🧹", "SHIHO", "Script Doctor",
+               "시퀀스 워싱 · 문제 유형 진단 · 처방 + Risk · 각색 제안 10가지",
+               shiho_st, "shiho", "🧹 Shiho 워싱 시작", do_shiho,
+               render_washing, st.session_state.washing)
+
+    # SHIHO 완료 시 진단·처방 리포트 즉시 다운로드 (세션 캐시)
+    if st.session_state.washing:
+        # analysis + washing 병합본 생성 (CHRIS 결과 + SHIHO 결과)
+        merged_shiho = {
+            **st.session_state.analysis,
+            'washing_table':      st.session_state.washing.get('washing_table', []),
+            'dialogue_analysis':  st.session_state.washing.get('dialogue_analysis', {}),
+            'suggestions':        st.session_state.washing.get('suggestions', []),
+            'opening_rx':         st.session_state.washing.get('opening_rx', {}),
+            'genre_fun_recovery': st.session_state.washing.get('genre_fun_recovery', {})
         }
-        json_bytes = json.dumps(full_state, ensure_ascii=False, indent=2).encode("utf-8")
-        safe_title = re.sub(r'[/*?:"<>|]', '_', title)
-        date_str = datetime.now().strftime("%Y%m%d")
-        st.download_button(
-            "📋 전체 JSON 다운로드",
-            data=json_bytes,
-            file_name=f"{safe_title}_revise_full_{date_str}.json",
-            mime="application/json",
-            key="dl_json_full",
-            use_container_width=True,
+        title = re.sub(r'[/*?:"<>|]', '_', merged_shiho.get('title', '제목없음'))
+        current_id = id(st.session_state.washing)
+
+        # ── DOCX + JSON 두 가지 다운로드를 2-column으로 ──
+        d_col1, d_col2 = st.columns(2)
+
+        # DOCX (사람용 보고서)
+        with d_col1:
+            cache_key = '_docx_shiho_cache'
+            cache_id_key = '_docx_shiho_id'
+            try:
+                if st.session_state.get(cache_id_key) != current_id:
+                    st.session_state[cache_key] = create_docx(merged_shiho, level="shiho")
+                    st.session_state[cache_id_key] = current_id
+                docx_shiho = st.session_state.get(cache_key)
+                if docx_shiho:
+                    st.download_button(
+                        "📄 진단·처방 리포트 (DOCX)",
+                        data=docx_shiho,
+                        file_name=f"시나리오진단처방_{title}_CHRIS+SHIHO.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="btn_download_shiho_docx",
+                        use_container_width=True,
+                        help="사람이 읽는 형태의 보고서 — 작가 피드백·검토용"
+                    )
+            except Exception as e:
+                st.caption(f"⚠️ DOCX 생성 지연: {type(e).__name__}")
+
+        # JSON (Revise Engine 등 외부 엔진 입력용)
+        with d_col2:
+            json_cache_key = '_json_shiho_cache'
+            json_cache_id_key = '_json_shiho_id'
+            try:
+                if st.session_state.get(json_cache_id_key) != current_id:
+                    st.session_state[json_cache_key] = export_diagnosis_json(merged_shiho, level="shiho")
+                    st.session_state[json_cache_id_key] = current_id
+                json_shiho = st.session_state.get(json_cache_key)
+                if json_shiho:
+                    st.download_button(
+                        "📋 Revise 입력 데이터 (JSON · SHIHO 시점)",
+                        data=json_shiho,
+                        file_name=f"revise_input_{title}_SHIHO.json",
+                        mime="application/json",
+                        key="btn_download_shiho_json",
+                        use_container_width=True,
+                        help="Revise Engine v2.3 자동 흡수용 — SHIHO 워싱 제안을 휴리스틱 분류한 결과 + 원본 데이터 동시 수록. Revise에서 검토·수정 가능."
+                    )
+            except Exception as e:
+                st.caption(f"⚠️ JSON 생성 지연: {type(e).__name__}")
+
+    if not st.session_state.washing:
+        agent_card("✍️", "MOON", "Senior Screenwriter",
+                   "표준 각본 형식 · 10개 씬 리라이팅",
+                   'waiting', "moon", "", lambda: None, lambda x: None, None)
+        return
+
+    # ── PICTURES 비서 ──
+    def do_moon():
+        with st.spinner("✍️ Moon이 각색 원고를 작성하고 있습니다... (약 60~90초 소요)"):
+            r = run_pictures(text, st.session_state.washing, client)
+            if r:
+                st.session_state.rewriting = r
+                full = {
+                    **st.session_state.analysis,
+                    'washing_table':      st.session_state.washing.get('washing_table', []),
+                    'suggestions':        st.session_state.washing.get('suggestions', []),
+                    'dialogue_analysis':  st.session_state.washing.get('dialogue_analysis', {}),
+                    'opening_rx':         st.session_state.washing.get('opening_rx', {}),
+                    'genre_fun_recovery': st.session_state.washing.get('genre_fun_recovery', {}),
+                    'rewriting':          r.get('rewriting', {})
+                }
+                st.session_state.db.insert(0, full)
+                st.session_state.selected_item = full
+                st.session_state.step = 4
+                st.rerun()
+            else:
+                st.error("리라이팅 실패. 위의 API 오류 메시지를 확인하세요.")
+
+    moon_st = 'done' if st.session_state.rewriting else 'active'
+    agent_card("✍️", "MOON", "Senior Screenwriter",
+               "오프닝 훅 / 치명상 구간 선정 · 표준 각본 형식 · 10개 씬 리라이팅",
+               moon_st, "moon", "✍️ Moon 리라이팅 시작", do_moon,
+               render_rewriting, st.session_state.rewriting)
+
+    # ── 완료 ──
+    if st.session_state.step == 4 and st.session_state.selected_item:
+        st.markdown('<hr>', unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;padding:16px 0;"><span style="font-size:1.4rem;font-weight:900;color:#2EC484;">🎉 모든 분석 완료!</span></div>', unsafe_allow_html=True)
+        item = st.session_state.selected_item
+        title = re.sub(r'[/*?:"<>|]', '_', item.get('title', '제목없음'))
+
+        # ── 다운로드 버튼 행: DOCX + JSON 2개 ──
+        d_col1, d_col2 = st.columns(2)
+
+        # DOCX (최종 통합 보고서)
+        with d_col1:
+            try:
+                docx_bytes = create_docx(item, level="full")
+                st.download_button(
+                    "📄 최종 통합 보고서 (DOCX)",
+                    data=docx_bytes,
+                    file_name=f"시나리오최종보고서_{title}_Blue.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="btn_download_docx",
+                    use_container_width=True,
+                    help="CHRIS 분석 + SHIHO 진단 + MOON 리라이트 원고 (섹션 1~12) — 최종 전달물"
+                )
+            except Exception as e:
+                st.error(f"DOCX 생성 오류: {e}")
+
+        # JSON (Revise Engine 입력용 — 완전판)
+        with d_col2:
+            json_full_cache_key = '_json_full_cache'
+            json_full_cache_id_key = '_json_full_id'
+            current_full_id = id(item)
+            try:
+                if st.session_state.get(json_full_cache_id_key) != current_full_id:
+                    st.session_state[json_full_cache_key] = export_diagnosis_json(item, level="full")
+                    st.session_state[json_full_cache_id_key] = current_full_id
+                json_full = st.session_state.get(json_full_cache_key)
+                if json_full:
+                    st.download_button(
+                        "📋 Revise 입력 데이터 (JSON · 완전판)",
+                        data=json_full,
+                        file_name=f"revise_input_{title}_FULL.json",
+                        mime="application/json",
+                        key="btn_download_full_json",
+                        use_container_width=True,
+                        help="MOON 결과 포함 — Revise Engine 자동 흡수용 (rewrite_suggestions / add_suggestions 정확)"
+                    )
+            except Exception as e:
+                st.caption(f"⚠️ JSON 생성 지연: {type(e).__name__}")
+
+        # ── 네비게이션 행 ──
+        n_col1, n_col2 = st.columns(2)
+        with n_col1:
+            if st.button("🏠 목록으로 돌아가기", key="btn_to_index", use_container_width=True):
+                st.session_state.page = "index"
+                st.rerun()
+        with n_col2:
+            if st.button("🔄 새 시나리오 분석", key="btn_new_analysis", use_container_width=True):
+                for k in ['step', 'raw_text', 'analysis', 'washing', 'rewriting', 'selected_item']:
+                    st.session_state[k] = 0 if k == 'step' else None
+                # DOCX·JSON 세션 캐시 무효화
+                for k in ['_docx_chris_cache', '_docx_chris_id',
+                          '_docx_shiho_cache', '_docx_shiho_id',
+                          '_json_shiho_cache', '_json_shiho_id',
+                          '_json_full_cache', '_json_full_id']:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+# =================================================================
+# [12] 갤러리 페이지 (홈)
+# =================================================================
+def show_index():
+    st.markdown("""
+    <div style="text-align:center;padding:60px 0 36px;">
+        <div style="font-size:0.72rem;font-weight:900;letter-spacing:0.5em;color:#FFCB05;">BLUE JEANS PICTURES</div>
+        <div style="font-size:3.6rem;font-weight:950;color:#191970;line-height:1;letter-spacing:-0.03em;margin:10px 0;">REWRITE ENGINE</div>
+        <div style="font-size:0.78rem;letter-spacing:0.2em;color:#191970;opacity:0.35;">YOUNG · VINTAGE · FREE · INNOVATIVE</div>
+    </div>""", unsafe_allow_html=True)
+
+    _, c, _ = st.columns([1, 1, 1])
+    with c:
+        if st.button("+ 새 시나리오 분석하기", use_container_width=True):
+            for k in ['step', 'raw_text', 'analysis', 'washing', 'rewriting']:
+                st.session_state[k] = 0 if k == 'step' else None
+            # DOCX 세션 캐시 무효화
+            for k in ['_docx_chris_cache', '_docx_chris_id', '_docx_shiho_cache', '_docx_shiho_id', '_json_shiho_cache', '_json_shiho_id', '_json_full_cache', '_json_full_id']:
+                st.session_state.pop(k, None)
+            st.session_state.page = "workspace"
+            st.rerun()
+
+    st.markdown('<hr>', unsafe_allow_html=True)
+    st.markdown("### 📋 검토 보고서 아카이브")
+
+    if not st.session_state.db:
+        st.markdown(
+            '<div style="text-align:center;padding:60px 0;opacity:0.3;">'
+            '<div style="font-size:3rem;margin-bottom:10px;">🎬</div>'
+            '<div style="color:#191970;">아직 분석된 시나리오가 없습니다.</div></div>',
+            unsafe_allow_html=True
         )
-
-    st.markdown("---")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🔄 새 시나리오 각색 시작", use_container_width=True):
-            reset_workflow()
-            st.rerun()
-    with c2:
-        if st.button("◀ 검증 결과로 돌아가기", use_container_width=True):
-            st.session_state.step = 3
-            st.rerun()
-
+    else:
+        cols = st.columns(3)
+        for idx, item in enumerate(st.session_state.db):
+            with cols[idx % 3]:
+                img_url = get_genre_img_url(item)
+                genre_label = item.get('genre', {}).get('primary', '') if isinstance(item.get('genre'), dict) else str(item.get('genre', ''))
+                score_val = item.get('mark', {}).get('final', 0)
+                score_color = '#2EC484' if float(score_val) >= 7 else ('#FFCB05' if float(score_val) >= 5 else '#FF6432')
+                st.markdown(f"""
+                <div class="gallery-card">
+                    <img class="gallery-card-img" src="{img_url}"
+                         onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+                         alt="{safe(item.get('title',''))}">
+                    <div style="display:none;height:140px;background:linear-gradient(135deg,#191970,#3A3A8C);
+                                align-items:center;justify-content:center;font-size:2.8rem;">🎬</div>
+                    <div class="gallery-card-body">
+                        <div style="font-size:0.65rem;font-weight:700;color:#888;letter-spacing:0.1em;
+                                    text-transform:uppercase;margin-bottom:6px;">{safe(genre_label)}</div>
+                        <div style="font-weight:900;font-size:1rem;margin-bottom:10px;color:#191970;
+                                    line-height:1.3;">{safe(item.get('title', 'Untitled'))}</div>
+                        <div style="display:flex;align-items:center;justify-content:center;gap:6px;">
+                            <div style="font-size:1.6rem;font-weight:950;color:{score_color};">{score_val}</div>
+                            <div style="text-align:left;">
+                                <div style="font-size:0.65rem;color:#888;">/10.0</div>
+                                <div style="font-size:0.6rem;color:{score_color};font-weight:800;">
+                                    {"우수" if float(score_val) >= 8 else ("양호" if float(score_val) >= 6 else ("보통" if float(score_val) >= 4 else "미흡"))}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("보기", key=f"v_{idx}", use_container_width=True):
+                        st.session_state.selected_item = item
+                        st.session_state.analysis  = item
+                        st.session_state.washing   = {
+                            'washing_table':      item.get('washing_table', []),
+                            'dialogue_analysis':  item.get('dialogue_analysis', {}),
+                            'suggestions':        item.get('suggestions', []),
+                            'opening_rx':         item.get('opening_rx', {}),
+                            'genre_fun_recovery': item.get('genre_fun_recovery', {})
+                        }
+                        st.session_state.rewriting = {'rewriting': item.get('rewriting', {})}
+                        st.session_state.step = 4
+                        st.session_state.page = "workspace"
+                        st.rerun()
+                with c2:
+                    if st.button("삭제", key=f"d_{idx}", use_container_width=True):
+                        st.session_state.db.pop(idx)
+                        st.rerun()
 
 # =================================================================
-# [9] 메인 라우터
+# [13] 실행
 # =================================================================
-render_hero()
-render_stepbar()
+apply_design()
 
-step = st.session_state.step
-if step == 0:
-    show_step_0_input()
-elif step == 1:
-    show_step_1_diagnose()
-elif step == 2:
-    show_step_2_revise()
-elif step == 3:
-    show_step_3_verify()
-elif step == 4:
-    show_step_4_complete()
+if st.session_state.page == "index":
+    show_index()
+elif st.session_state.page == "workspace":
+    show_workspace()
 
-# ── 푸터 ──
-st.markdown("---")
 st.markdown(
-    '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.2  ·  '
-    'Powered by Claude Opus 4.6 + Sonnet 4.6'
-    '</div>',
-    unsafe_allow_html=True,
+    '<div style="text-align:center;font-size:0.65rem;padding:40px 0 16px;'
+    'letter-spacing:2px;color:#191970;opacity:0.25;">© 2026 BLUE JEANS PICTURES</div>',
+    unsafe_allow_html=True
 )
