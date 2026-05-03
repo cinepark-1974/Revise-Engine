@@ -46,6 +46,8 @@ from prompt import (
     build_genre_dna_extraction_prompt,
     # v2.2 신규
     build_section_detection_prompt,
+    build_section_detect_step1_prompt,
+    derive_section_ranges_from_step1,
     build_boundary_smoothness_block,
     build_cascade_analysis_prompt,
 )
@@ -1238,34 +1240,49 @@ def run_v2_pre_analyses(client) -> dict:
                     summary = gd.get("genre_dna", {}).get("summary", "장르 DNA 추출 완료")
                     st.success(f"✅ 장르 DNA 추출 완료: {summary[:120]}")
 
-    # 6. 구간 자동 감지 (v2.2 — 구간 모드 + auto/hybrid + 캐시 없을 때만)
+    # 6. 구간 자동 감지 (v2.2 — step1 가벼운 호출 + 코드 계산)
     if (st.session_state.section_mode
             and st.session_state.section_input_method in ("auto", "hybrid")
             and st.session_state.diff_refined_text
             and not st.session_state.section_detection):
-        with st.spinner("🔍 구간 자동 감지 중... 손본본과 원본 의미 매칭 (Sonnet 4.6)"):
-            prompt_text = build_section_detection_prompt(
+        with st.spinner("🔍 구간 자동 감지 (1단계: 새로 쓴 부분 식별)..."):
+            prompt_text = build_section_detect_step1_prompt(
                 refined_text=st.session_state.diff_refined_text,
                 original_text=st.session_state.raw_text,
             )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=6000)
+            # step1은 출력이 매우 짧음 — 2000 토큰이면 충분
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=2000)
             if raw:
-                sd = parse_json(raw)
-                if sd:
-                    st.session_state.section_detection = sd
-                    detection = sd.get("section_detection", {})
-                    rec_prot = detection.get("recommended_protected_range", [])
-                    rec_rev = detection.get("recommended_revision_range", [])
+                step1 = parse_json(raw)
+                if step1:
+                    # 코드로 protected/revision 범위 자동 계산 (API 호출 불필요)
+                    derived = derive_section_ranges_from_step1(
+                        step1_result=step1,
+                        refined_text=st.session_state.diff_refined_text,
+                        original_text=st.session_state.raw_text,
+                    )
+                    rec_prot = derived.get("protected_ranges", [])
+                    rec_rev = derived.get("revision_ranges", [])
 
-                    # auto + hybrid 모두 권장값 자동 적용
+                    # 캐시에 저장 (구버전 형식과 호환)
+                    st.session_state.section_detection = {
+                        "section_detection": {
+                            "summary": derived.get("continuation_point", {}).get("explanation", ""),
+                            "continuation_point": derived.get("continuation_point", {}),
+                            "recommended_protected_range": rec_prot,
+                            "recommended_revision_range": rec_rev,
+                        }
+                    }
+
+                    # auto + hybrid 모두 자동 적용
                     if st.session_state.section_input_method in ("auto", "hybrid"):
                         if rec_prot and not st.session_state.protected_ranges:
                             st.session_state.protected_ranges = rec_prot
                         if rec_rev and not st.session_state.revision_ranges:
                             st.session_state.revision_ranges = rec_rev
 
-                    cp = detection.get("continuation_point", {})
-                    if cp.get("detected") in (True, "true"):
+                    cp = derived.get("continuation_point", {})
+                    if cp.get("detected") == "true":
                         prot_str_log = ", ".join(
                             f"{r.get('from','')}~{r.get('to','')}" for r in rec_prot
                         )
@@ -1274,18 +1291,14 @@ def run_v2_pre_analyses(client) -> dict:
                         )
                         st.success(
                             f"✅ **이어쓰기 시작점 감지 완료**\n\n"
-                            f"🔒 보호 구간 (자동 적용): `{prot_str_log}`\n\n"
-                            f"✏️ 재집필 구간 (자동 적용): `{rev_str_log}`\n\n"
-                            f"→ 위 구간으로 진단/집필이 진행됩니다."
+                            f"🔒 보호 구간: `{prot_str_log}`\n\n"
+                            f"✏️ 재집필 구간: `{rev_str_log}`\n\n"
+                            f"→ {cp.get('explanation', '')[:200]}"
                         )
                     else:
-                        # 매칭 안 됨 — 손본본이 원본과 너무 달라 자동 감지 실패
                         st.warning(
-                            "⚠️ 자동 감지 결과 명확한 이어쓰기 시작점을 찾지 못했습니다.\n\n"
-                            "이유는 다음 중 하나일 수 있습니다:\n"
-                            "- 손본본과 원본이 너무 달라 의미 매칭이 안 됨\n"
-                            "- 손본본이 부분 수정만 한 케이스 (이어쓰기가 아님)\n\n"
-                            "→ 7번 처리 모드에서 **수동 지정**으로 재집필 구간을 직접 입력하세요."
+                            "⚠️ 자동 감지 결과가 명확하지 않습니다. "
+                            "**부분 수정 모드 + 직접 지정**으로 재집필 구간을 입력하세요."
                         )
 
     # 7. 연쇄 영향 분석 (v2.2 — 보호/재집필 영역 모두 있을 때)
