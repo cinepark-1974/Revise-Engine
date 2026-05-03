@@ -267,13 +267,15 @@ INIT_STATE = {
     # v2.1 — Diff 모드: Before로 원본을 자동 사용할지 옵션
     "diff_use_main_as_before": True,
     # v2.2 — 구간 지정 모드 (이어쓰기 + 부분 수정 통합)
-    "section_mode": False,           # 구간 모드 활성화
+    "work_mode": None,               # "full" / "continuation" / "partial" (카드로 선택)
+    "section_mode": False,           # 내부 호환 (continuation/partial일 때 자동 True)
     "section_input_method": "auto",  # auto (자동 감지) / manual (수동 지정) / hybrid
     "section_detection": None,       # 자동 감지 결과
     "protected_ranges": [],          # [{"from":"S#1","to":"S#25","reason":"..."}, ...]
     "revision_ranges": [],           # [{"from":"S#26","to":"S#71","reason":"..."}, ...]
     "cascade_analysis": None,        # 연쇄 영향 분석 결과
     "boundary_info": "",             # 경계 매끄러움 정보 (자동 계산)
+    "show_advanced": False,          # 고급 옵션 펼치기
 }
 
 for k, v in INIT_STATE.items():
@@ -1248,8 +1250,8 @@ def run_v2_pre_analyses(client) -> dict:
                     rec_prot = detection.get("recommended_protected_range", [])
                     rec_rev = detection.get("recommended_revision_range", [])
 
-                    # auto 모드면 권장값을 자동 적용
-                    if st.session_state.section_input_method == "auto":
+                    # auto + hybrid 모두 권장값 자동 적용
+                    if st.session_state.section_input_method in ("auto", "hybrid"):
                         if rec_prot and not st.session_state.protected_ranges:
                             st.session_state.protected_ranges = rec_prot
                         if rec_rev and not st.session_state.revision_ranges:
@@ -1257,9 +1259,27 @@ def run_v2_pre_analyses(client) -> dict:
 
                     cp = detection.get("continuation_point", {})
                     if cp.get("detected") in (True, "true"):
-                        st.success(f"✅ 이어쓰기 시작점 감지: {cp.get('explanation', '')[:200]}")
+                        prot_str_log = ", ".join(
+                            f"{r.get('from','')}~{r.get('to','')}" for r in rec_prot
+                        )
+                        rev_str_log = ", ".join(
+                            f"{r.get('from','')}~{r.get('to','')}" for r in rec_rev
+                        )
+                        st.success(
+                            f"✅ **이어쓰기 시작점 감지 완료**\n\n"
+                            f"🔒 보호 구간 (자동 적용): `{prot_str_log}`\n\n"
+                            f"✏️ 재집필 구간 (자동 적용): `{rev_str_log}`\n\n"
+                            f"→ 위 구간으로 진단/집필이 진행됩니다."
+                        )
                     else:
-                        st.success("✅ 구간 감지 완료. 권장 보호/재집필 영역이 적용되었습니다.")
+                        # 매칭 안 됨 — 손본본이 원본과 너무 달라 자동 감지 실패
+                        st.warning(
+                            "⚠️ 자동 감지 결과 명확한 이어쓰기 시작점을 찾지 못했습니다.\n\n"
+                            "이유는 다음 중 하나일 수 있습니다:\n"
+                            "- 손본본과 원본이 너무 달라 의미 매칭이 안 됨\n"
+                            "- 손본본이 부분 수정만 한 케이스 (이어쓰기가 아님)\n\n"
+                            "→ 7번 처리 모드에서 **수동 지정**으로 재집필 구간을 직접 입력하세요."
+                        )
 
     # 7. 연쇄 영향 분석 (v2.2 — 보호/재집필 영역 모두 있을 때)
     if (st.session_state.section_mode
@@ -1442,7 +1462,104 @@ def render_stepbar():
 # [8] Step 화면들
 # =================================================================
 def show_step_0_input():
-    """Step 0: 원본 업로드 + 지시문 + LOCKED + 옵션 입력."""
+    """Step 0: 작업 모드 선택 → 모드별 입력."""
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ① 작업 모드 선택 (카드 3개)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    st.markdown(
+        '<div style="text-align:center; margin:8px 0 16px;">'
+        '<div style="font-size:1.1rem; color:#191970; font-weight:700;">무엇을 하시겠습니까?</div>'
+        '<div style="font-size:0.85rem; color:#8E8E99; margin-top:4px;">'
+        '먼저 작업 종류를 선택하세요. 선택한 모드에 필요한 입력만 표시됩니다.'
+        '</div></div>',
+        unsafe_allow_html=True
+    )
+
+    # 카드 스타일 정의
+    st.markdown("""
+    <style>
+    .work-card-row { display: flex; gap: 12px; margin-bottom: 12px; }
+    .stButton > button.work-card {
+        height: auto !important;
+        padding: 18px 14px !important;
+        white-space: normal !important;
+        line-height: 1.45 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    cw1, cw2, cw3 = st.columns(3)
+
+    def _card(col, mode_id: str, emoji: str, title: str, sub: str, desc: str):
+        with col:
+            is_selected = (st.session_state.work_mode == mode_id)
+            label = f"{emoji}\n\n**{title}**\n\n{sub}\n\n{desc}"
+            btn_type = "primary" if is_selected else "secondary"
+            if st.button(
+                label,
+                key=f"card_{mode_id}",
+                use_container_width=True,
+                type=btn_type,
+                help=desc,
+            ):
+                st.session_state.work_mode = mode_id
+                # 모드 전환 시 구간 정보 초기화 (전체↔부분 수정 변경 시 혼선 방지)
+                if mode_id == "full":
+                    st.session_state.section_mode = False
+                    st.session_state.protected_ranges = []
+                    st.session_state.revision_ranges = []
+                else:
+                    st.session_state.section_mode = True
+                st.rerun()
+
+    _card(cw1, "full",
+          "📝", "전체 각색",
+          "시나리오 전체를 다시 씀",
+          "기본 모드. 시나리오 한 편을 통째로 진단하고 수정합니다.")
+
+    _card(cw2, "continuation",
+          "✍️", "이어쓰기",
+          "손본 부분 다음을 이어씀",
+          "1막은 이미 손봤고, 그 톤으로 나머지를 이어 쓰고 싶을 때.")
+
+    _card(cw3, "partial",
+          "✂️", "부분 수정",
+          "특정 구간만 다시 씀",
+          "2막 엔딩만 약하다 같은 경우. 일부 씬만 핀포인트로 수정.")
+
+    # 모드 선택 안 했으면 안내 후 종료
+    if not st.session_state.work_mode:
+        st.info("👆 위에서 작업 모드를 선택하세요.")
+        st.stop()
+
+    # 선택된 모드 표시 + 변경 버튼
+    mode_labels = {
+        "full": "📝 전체 각색",
+        "continuation": "✍️ 이어쓰기",
+        "partial": "✂️ 부분 수정",
+    }
+    cm1, cm2 = st.columns([5, 1])
+    with cm1:
+        st.markdown(
+            f'<div style="background:#EAF3DE; padding:10px 14px; border-radius:6px; '
+            f'border-left:3px solid #2EC484; margin:8px 0; font-size:0.9rem;">'
+            f'<b>선택된 모드: {mode_labels.get(st.session_state.work_mode, "")}</b>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    with cm2:
+        if st.button("🔄 모드 변경", key="change_mode", use_container_width=True):
+            st.session_state.work_mode = None
+            st.rerun()
+
+    st.markdown("---")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ② 모드별 입력 영역
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # 1. 시나리오 업로드 (모든 모드 공통)
     st.markdown('<div class="rev-card-title">1. 원본 시나리오 업로드 (DOCX 또는 PDF)</div>', unsafe_allow_html=True)
     st.markdown('<div class="rev-caption">Writer Engine 출력 DOCX, 외부 시나리오 PDF 모두 가능합니다.</div>', unsafe_allow_html=True)
 
@@ -1465,6 +1582,175 @@ def show_step_0_input():
                 st.text(text[:1000] + ("..." if len(text) > 1000 else ""))
         else:
             st.error("❌ 본문 추출 실패")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 모드별 추가 필수 입력 (시나리오 바로 아래)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # 이어쓰기 모드: 손본본 업로드
+    if st.session_state.work_mode == "continuation":
+        st.markdown("---")
+        st.markdown('<div class="rev-card-title">2. 손본 시나리오 업로드 ✍️</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="rev-caption">앞부분(예: 1막)을 직접 손보신 시나리오를 올리세요. '
+            'AI가 자동으로 손본 부분을 감지해 보호하고, 그 다음을 같은 톤으로 이어 씁니다.</div>',
+            unsafe_allow_html=True
+        )
+
+        ref_file = st.file_uploader(
+            "손본 시나리오 (DOCX 또는 PDF)",
+            type=["docx", "pdf"],
+            key="continuation_uploader",
+            help="예: v2_3 — 1막을 새로 쓴 PDF 또는 DOCX",
+        )
+        if ref_file:
+            _text = extract_text_from_uploaded_file(ref_file)
+            if _text:
+                # 이어쓰기 모드는 diff_refined_text를 손본본 베이스로 사용
+                st.session_state.diff_refined_text = _text
+                st.session_state.diff_refined_filename = ref_file.name
+                # 톤 학습용으로도 같이 등록
+                st.session_state.tone_ref_text = _text
+                st.session_state.tone_ref_filename = ref_file.name
+                # 자동 감지 모드로 설정
+                st.session_state.section_input_method = "auto"
+                st.session_state.diff_use_main_as_before = True
+
+                st.success(f"✅ 손본본 등록: {ref_file.name} ({len(_text):,}자)")
+
+                # 이미 자동 감지가 됐다면 결과 표시
+                if st.session_state.section_detection:
+                    detection = st.session_state.section_detection.get("section_detection", {})
+                    cp = detection.get("continuation_point", {})
+                    if cp.get("detected") in (True, "true"):
+                        prot_str = ", ".join(
+                            f"{r.get('from','')}~{r.get('to','')}"
+                            for r in st.session_state.protected_ranges
+                        )
+                        rev_str = ", ".join(
+                            f"{r.get('from','')}~{r.get('to','')}"
+                            for r in st.session_state.revision_ranges
+                        )
+                        st.info(
+                            f"✓ 자동 감지 완료\n\n"
+                            f"🔒 보호 (안 건드림): {prot_str}\n\n"
+                            f"✏️ 재집필 (이어 씀): {rev_str}"
+                        )
+                else:
+                    st.caption("→ 분석 시작 시 자동 감지가 진행됩니다.")
+        elif st.session_state.diff_refined_filename:
+            st.info(f"📎 등록됨: {st.session_state.diff_refined_filename} "
+                    f"({len(st.session_state.diff_refined_text):,}자)")
+            if st.button("🗑️ 손본본 제거", key="btn_clear_continuation"):
+                st.session_state.diff_refined_text = ""
+                st.session_state.diff_refined_filename = ""
+                st.session_state.tone_ref_text = ""
+                st.session_state.tone_ref_filename = ""
+                st.session_state.section_detection = None
+                st.session_state.protected_ranges = []
+                st.session_state.revision_ranges = []
+                st.rerun()
+
+    # 부분 수정 모드: 어디를 다시 쓸지 선택
+    elif st.session_state.work_mode == "partial":
+        st.markdown("---")
+        st.markdown('<div class="rev-card-title">2. 어디를 다시 쓸까요? ✂️</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="rev-caption">수정할 부분을 선택하세요. 나머지는 자동으로 보호됩니다.</div>',
+            unsafe_allow_html=True
+        )
+
+        # 막 단위 빠른 선택
+        st.markdown("**빠른 선택 (작품 분량에 따라 자동 계산):**")
+        scene_count = 0
+        if st.session_state.raw_text:
+            import re as _re
+            scene_count = len(_re.findall(r'^\s*\*?\*?S#?\d+', st.session_state.raw_text, _re.MULTILINE))
+
+        if scene_count > 0:
+            # 막 분할: 1막 = 1~25%, 2막 = 25~75%, 3막 = 75~100%
+            act1_end = max(1, int(scene_count * 0.25))
+            act2_start = act1_end + 1
+            act2_end = max(act2_start, int(scene_count * 0.75))
+            act3_start = act2_end + 1
+
+            cb1, cb2, cb3 = st.columns(3)
+            with cb1:
+                if st.button(f"1막 다시 쓰기\n(S#1~S#{act1_end})",
+                             key="act1_btn", use_container_width=True):
+                    st.session_state.revision_ranges = [{
+                        "from": "S#1", "to": f"S#{act1_end}", "reason": "1막 재집필"
+                    }]
+                    st.session_state.section_input_method = "manual"
+                    st.rerun()
+            with cb2:
+                if st.button(f"2막 다시 쓰기\n(S#{act2_start}~S#{act2_end})",
+                             key="act2_btn", use_container_width=True):
+                    st.session_state.revision_ranges = [{
+                        "from": f"S#{act2_start}", "to": f"S#{act2_end}", "reason": "2막 재집필"
+                    }]
+                    st.session_state.section_input_method = "manual"
+                    st.rerun()
+            with cb3:
+                if st.button(f"3막 다시 쓰기\n(S#{act3_start}~S#{scene_count})",
+                             key="act3_btn", use_container_width=True):
+                    st.session_state.revision_ranges = [{
+                        "from": f"S#{act3_start}", "to": f"S#{scene_count}", "reason": "3막 재집필"
+                    }]
+                    st.session_state.section_input_method = "manual"
+                    st.rerun()
+        else:
+            st.caption("⚠️ 1번 시나리오를 먼저 업로드하면 막 단위 빠른 선택이 활성화됩니다.")
+
+        # 직접 지정
+        st.markdown("**또는 직접 지정 (씬 번호 입력):**")
+        st.caption("형식: `S#41-S#55` 또는 여러 구간은 콤마로 `S#41-S#55, S#67-S#67`")
+
+        current_rev_str = ", ".join(
+            f"{r.get('from','')}-{r.get('to','')}"
+            for r in st.session_state.revision_ranges
+        ) if st.session_state.revision_ranges else ""
+
+        rev_input = st.text_input(
+            "재집필 구간 직접 지정",
+            value=current_rev_str,
+            placeholder="예: S#41-S#55",
+            key="manual_rev_ranges",
+            label_visibility="collapsed",
+        )
+
+        if rev_input.strip() and rev_input != current_rev_str:
+            try:
+                import re as _re
+                new_ranges = []
+                for piece in rev_input.split(","):
+                    piece = piece.strip()
+                    m = _re.match(r'(S#\d+)\s*[-~]\s*(S#\d+)', piece)
+                    if m:
+                        new_ranges.append({
+                            "from": m.group(1),
+                            "to": m.group(2),
+                            "reason": "직접 지정",
+                        })
+                if new_ranges:
+                    st.session_state.revision_ranges = new_ranges
+                    st.session_state.section_input_method = "manual"
+                    st.success(f"✅ 재집필 구간 {len(new_ranges)}개 등록됨")
+            except Exception as e:
+                st.error(f"구간 파싱 실패: {e}")
+
+        # 등록된 구간 표시
+        if st.session_state.revision_ranges:
+            rev_str = ", ".join(
+                f"{r.get('from','')}~{r.get('to','')}"
+                for r in st.session_state.revision_ranges
+            )
+            st.info(f"✏️ 재집필 구간: **{rev_str}** (나머지는 자동 보호)")
+
+            if st.button("🗑️ 구간 초기화", key="btn_clear_partial"):
+                st.session_state.revision_ranges = []
+                st.session_state.protected_ranges = []
+                st.rerun()
 
     st.markdown("---")
 
@@ -1659,359 +1945,237 @@ def show_step_0_input():
         help="실명 사용·특정 가능 디테일·실존 공인 악역화 등의 리스크를 자동 점검합니다",
     )
 
-    # ── v2.1 신규 — 작가 톤 학습 + 장르 DNA ──
-    st.markdown('<div class="rev-card-title">6. 작가 톤 학습 + 장르 DNA <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항 · 강력 추천)</span></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">손본 시나리오로 작가 톤을 학습시키거나, 같은 장르 명작으로 장르 DNA를 추출해 강제 적용합니다. 모두 자동 분석됩니다.</div>',
-                unsafe_allow_html=True)
+    # ── 6. 고급 옵션 (작가 톤 학습 + 장르 DNA) — 펼치기 ──
+    advanced_label = "🎛️ 고급 옵션 — 작가 톤 학습 + 장르 DNA (선택사항)"
+    if st.session_state.work_mode == "continuation":
+        advanced_label = "🎛️ 고급 옵션 — 장르 DNA로 톤 강화 (선택사항)"
 
-    tab_tone, tab_diff, tab_genre = st.tabs([
-        "📐 톤 레퍼런스 (작가 톤 1편)",
-        "🔬 Diff 학습 (Before vs After)",
-        "🎬 장르 DNA (참고작 1~3편)"
-    ])
+    with st.expander(advanced_label, expanded=False):
+        st.markdown('<div class="rev-caption">필요시 펼쳐서 추가 자료를 업로드하세요. 모두 선택사항입니다.</div>',
+                    unsafe_allow_html=True)
 
-    # 탭 1: 톤 레퍼런스 (작가 손본 1편)
-    with tab_tone:
-        st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 작가 고유의 톤 DNA를 자동 추출해 모든 새 각색에 강제 주입합니다.")
-        ref_file = st.file_uploader(
-            "작가가 손본 시나리오 (DOCX 또는 PDF)",
-            type=["docx", "pdf"],
-            key="tone_ref_uploader",
-            help="예: v2_3 같은 작가가 직접 다듬은 버전"
-        )
-        if ref_file:
-            _text = extract_text_from_uploaded_file(ref_file)
-            if _text:
-                st.session_state.tone_ref_text = _text
-                st.session_state.tone_ref_filename = ref_file.name
-                st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
-                if st.session_state.tone_dna:
-                    st.info("✓ 톤 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 톤이 시나리오 분석·집필에 자동 적용됩니다.")
-                else:
-                    st.caption("→ Stage 1 진단 시작 시 톤 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
-        elif st.session_state.tone_ref_filename:
-            st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
-            if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
-                st.session_state.tone_ref_text = ""
-                st.session_state.tone_ref_filename = ""
-                st.session_state.tone_dna = None
-                st.rerun()
+        tab_tone, tab_diff, tab_genre = st.tabs([
+            "📐 톤 레퍼런스 (작가 톤 1편)",
+            "🔬 Diff 학습 (Before vs After)",
+            "🎬 장르 DNA (참고작 1~3편)"
+        ])
 
-    # 탭 2: Diff 학습 (Before + After)
-    with tab_diff:
-        st.caption("이전 버전(Before) vs 작가 손본 최신(After) 두 개를 비교해 편집 패턴(삭제·압축·통합 기준)을 자동 학습합니다.")
-
-        use_main = st.checkbox(
-            "✅ Before로 1번 원본 시나리오를 자동 사용 (권장)",
-            value=st.session_state.diff_use_main_as_before,
-            key="diff_use_main_chk",
-            help="대부분의 경우 1번 원본을 Before로 쓰는 것이 자연스럽습니다."
-        )
-        st.session_state.diff_use_main_as_before = use_main
-
-        ref2_file = st.file_uploader(
-            "손본 최신 버전 (After · DOCX 또는 PDF)",
-            type=["docx", "pdf"],
-            key="diff_refined_uploader",
-            help="예: v2_3"
-        )
-        if ref2_file:
-            _text = extract_text_from_uploaded_file(ref2_file)
-            if _text:
-                st.session_state.diff_refined_text = _text
-                st.session_state.diff_refined_filename = ref2_file.name
-                st.success(f"✅ After 등록: {ref2_file.name} ({len(_text):,}자)")
-        elif st.session_state.diff_refined_filename:
-            st.info(f"📎 After: {st.session_state.diff_refined_filename}")
-
-        if not use_main:
-            st.markdown("**고급 옵션 — Before 별도 업로드:**")
-            orig_file = st.file_uploader(
-                "Before (별도 지정 · DOCX 또는 PDF)",
+        # 탭 1: 톤 레퍼런스 (작가 손본 1편)
+        with tab_tone:
+            st.caption("작가가 직접 손본 시나리오 1개를 업로드하면, 작가 고유의 톤 DNA를 자동 추출해 모든 새 각색에 강제 주입합니다.")
+            ref_file = st.file_uploader(
+                "작가가 손본 시나리오 (DOCX 또는 PDF)",
                 type=["docx", "pdf"],
-                key="diff_orig_uploader",
+                key="tone_ref_uploader",
+                help="예: v2_3 같은 작가가 직접 다듬은 버전"
             )
-            if orig_file:
-                _text = extract_text_from_uploaded_file(orig_file)
+            if ref_file:
+                _text = extract_text_from_uploaded_file(ref_file)
                 if _text:
-                    st.session_state.diff_orig_text = _text
-                    st.session_state.diff_orig_filename = orig_file.name
-                    st.success(f"✅ Before: {orig_file.name}")
+                    st.session_state.tone_ref_text = _text
+                    st.session_state.tone_ref_filename = ref_file.name
+                    st.success(f"✅ 톤 레퍼런스 로드: {ref_file.name} ({len(_text):,}자)")
+                    if st.session_state.tone_dna:
+                        st.info("✓ 톤 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 톤이 시나리오 분석·집필에 자동 적용됩니다.")
+                    else:
+                        st.caption("→ Stage 1 진단 시작 시 톤 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
+            elif st.session_state.tone_ref_filename:
+                st.info(f"📎 등록됨: {st.session_state.tone_ref_filename} ({len(st.session_state.tone_ref_text):,}자)")
+                if st.button("🗑️ 톤 레퍼런스 제거", key="btn_clear_tone_ref"):
+                    st.session_state.tone_ref_text = ""
+                    st.session_state.tone_ref_filename = ""
+                    st.session_state.tone_dna = None
+                    st.rerun()
 
-        if st.session_state.diff_refined_text:
-            if st.session_state.diff_analysis:
-                st.info("✓ Diff 학습 완료. **Stage 1 진단 시작** 버튼을 누르면 학습된 편집 패턴이 시나리오 분석·집필에 자동 적용됩니다.")
-            else:
-                st.caption("→ Stage 1 진단 시작 시 편집 패턴이 자동으로 먼저 학습되고, 그 결과로 시나리오를 진단합니다.")
-            if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
-                st.session_state.diff_refined_text = ""
-                st.session_state.diff_refined_filename = ""
-                st.session_state.diff_orig_text = ""
-                st.session_state.diff_orig_filename = ""
-                st.session_state.diff_analysis = None
-                st.rerun()
+        # 탭 2: Diff 학습 (Before + After)
+        with tab_diff:
+            st.caption("이전 버전(Before) vs 작가 손본 최신(After) 두 개를 비교해 편집 패턴(삭제·압축·통합 기준)을 자동 학습합니다.")
 
-    # 탭 3: 장르 DNA (참고작 1~3편)
-    with tab_genre:
-        st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
-        st.caption("📝 한국어·영문 시나리오 모두 가능. 영문 명작도 자유롭게 사용하세요 (출력은 항상 한국어).")
+            use_main = st.checkbox(
+                "✅ Before로 1번 원본 시나리오를 자동 사용 (권장)",
+                value=st.session_state.diff_use_main_as_before,
+                key="diff_use_main_chk",
+                help="대부분의 경우 1번 원본을 Before로 쓰는 것이 자연스럽습니다."
+            )
+            st.session_state.diff_use_main_as_before = use_main
 
-        # ─────────────────────────────────────────
-        # STEP 1. 참고작 업로드 (메인 동선)
-        # ─────────────────────────────────────────
-        st.markdown('<div style="background:#FFF8DD; padding:8px 12px; border-radius:6px; '
-                    'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
-                    '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → '
-                    'Stage 1 진단 시작 시 장르 DNA 자동 추출 → 그 DNA로 시나리오 진단'
-                    '</div>', unsafe_allow_html=True)
-
-        genre_files = st.file_uploader(
-            "참고작 시나리오 (1~3편 · 같은 장르 · DOCX 또는 PDF)",
-            type=["docx", "pdf"],
-            key="genre_ref_uploader",
-            accept_multiple_files=True,
-            help="한국·영문 모두 가능. 외부 시나리오는 보통 PDF로 유통됩니다 (IMSDb·SimplyScripts 등). "
-                 "예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
-                 "느와르 → 「Drive」+「No Country for Old Men」 / 호러 → 「Hereditary」+「Get Out」"
-        )
-        if genre_files:
-            texts = []
-            names = []
-            for gf in genre_files[:3]:
-                _text = extract_text_from_uploaded_file(gf)
+            ref2_file = st.file_uploader(
+                "손본 최신 버전 (After · DOCX 또는 PDF)",
+                type=["docx", "pdf"],
+                key="diff_refined_uploader",
+                help="예: v2_3"
+            )
+            if ref2_file:
+                _text = extract_text_from_uploaded_file(ref2_file)
                 if _text:
-                    texts.append(_text)
-                    names.append(gf.name)
-            if texts:
-                st.session_state.genre_ref_texts = texts
-                st.session_state.genre_ref_filenames = names
-                total_chars = sum(len(t) for t in texts)
-                st.success(f"✅ 참고작 {len(texts)}편 로드 (총 {total_chars:,}자): {', '.join(names)}")
-                if st.session_state.genre_dna:
-                    st.info("✓ 장르 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 DNA가 시나리오 분석·집필에 자동 적용됩니다.")
-                else:
-                    st.caption("→ Stage 1 진단 시작 시 장르 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
-        elif st.session_state.genre_ref_filenames:
-            st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
+                    st.session_state.diff_refined_text = _text
+                    st.session_state.diff_refined_filename = ref2_file.name
+                    st.success(f"✅ After 등록: {ref2_file.name} ({len(_text):,}자)")
+            elif st.session_state.diff_refined_filename:
+                st.info(f"📎 After: {st.session_state.diff_refined_filename}")
 
-        # ─────────────────────────────────────────
-        # STEP 2. 추출된 DNA 다운로드 (라이브러리 보관)
-        # ─────────────────────────────────────────
-        if st.session_state.genre_dna:
-            st.markdown('<div style="background:#EAF3DE; padding:8px 12px; border-radius:6px; '
-                        'border-left:3px solid #2EC484; margin:14px 0 8px; font-size:0.88rem;">'
-                        '<b>② 추출 완료 — 다음 작품에서 재사용하려면 JSON으로 보관하세요</b>'
-                        '</div>', unsafe_allow_html=True)
-            import json as _json
-            dna_json = _json.dumps(st.session_state.genre_dna, ensure_ascii=False, indent=2)
-            cdl1, cdl2 = st.columns([3, 1])
-            with cdl1:
-                st.download_button(
-                    "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
-                    data=dna_json.encode("utf-8"),
-                    file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
-                    mime="application/json",
-                    key="dl_genre_dna",
-                    help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요",
-                    use_container_width=True,
+            if not use_main:
+                st.markdown("**고급 옵션 — Before 별도 업로드:**")
+                orig_file = st.file_uploader(
+                    "Before (별도 지정 · DOCX 또는 PDF)",
+                    type=["docx", "pdf"],
+                    key="diff_orig_uploader",
                 )
-            with cdl2:
-                if st.button("🗑️ 제거", key="btn_clear_genre_dna", use_container_width=True):
-                    st.session_state.genre_ref_texts = []
-                    st.session_state.genre_ref_filenames = []
-                    st.session_state.genre_dna = None
+                if orig_file:
+                    _text = extract_text_from_uploaded_file(orig_file)
+                    if _text:
+                        st.session_state.diff_orig_text = _text
+                        st.session_state.diff_orig_filename = orig_file.name
+                        st.success(f"✅ Before: {orig_file.name}")
+
+            if st.session_state.diff_refined_text:
+                if st.session_state.diff_analysis:
+                    st.info("✓ Diff 학습 완료. **Stage 1 진단 시작** 버튼을 누르면 학습된 편집 패턴이 시나리오 분석·집필에 자동 적용됩니다.")
+                else:
+                    st.caption("→ Stage 1 진단 시작 시 편집 패턴이 자동으로 먼저 학습되고, 그 결과로 시나리오를 진단합니다.")
+                if st.button("🗑️ Diff 자료 제거", key="btn_clear_diff"):
+                    st.session_state.diff_refined_text = ""
+                    st.session_state.diff_refined_filename = ""
+                    st.session_state.diff_orig_text = ""
+                    st.session_state.diff_orig_filename = ""
+                    st.session_state.diff_analysis = None
                     st.rerun()
 
-        # ─────────────────────────────────────────
-        # STEP 3. 라이브러리 — 이전에 보관한 JSON 재사용 (반복 사용자)
-        # ─────────────────────────────────────────
-        st.markdown("---")
-        with st.expander("📚 장르 DNA 라이브러리 — 이전에 추출해둔 JSON 불러오기"):
-            st.caption("같은 장르로 작업한 적이 있다면, 이전에 다운로드해둔 JSON을 업로드해서 "
-                       "참고작 다시 안 올리고 바로 적용할 수 있습니다.")
-            dna_json_file = st.file_uploader(
-                "장르 DNA JSON 업로드",
-                type=["json"],
-                key="genre_dna_json_uploader"
+        # 탭 3: 장르 DNA (참고작 1~3편)
+        with tab_genre:
+            st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
+            st.caption("📝 한국어·영문 시나리오 모두 가능. 영문 명작도 자유롭게 사용하세요 (출력은 항상 한국어).")
+
+            # ─────────────────────────────────────────
+            # STEP 1. 참고작 업로드 (메인 동선)
+            # ─────────────────────────────────────────
+            st.markdown('<div style="background:#FFF8DD; padding:8px 12px; border-radius:6px; '
+                        'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
+                        '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → '
+                        'Stage 1 진단 시작 시 장르 DNA 자동 추출 → 그 DNA로 시나리오 진단'
+                        '</div>', unsafe_allow_html=True)
+
+            genre_files = st.file_uploader(
+                "참고작 시나리오 (1~3편 · 같은 장르 · DOCX 또는 PDF)",
+                type=["docx", "pdf"],
+                key="genre_ref_uploader",
+                accept_multiple_files=True,
+                help="한국·영문 모두 가능. 외부 시나리오는 보통 PDF로 유통됩니다 (IMSDb·SimplyScripts 등). "
+                     "예: 로코 → 「When Harry Met Sally」+「(500) Days of Summer」 / "
+                     "느와르 → 「Drive」+「No Country for Old Men」 / 호러 → 「Hereditary」+「Get Out」"
             )
-            if dna_json_file:
-                try:
-                    import json as _json
-                    raw = dna_json_file.read().decode("utf-8")
-                    loaded = _json.loads(raw)
-                    st.session_state.genre_dna = loaded
-                    summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
-                    st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
-                except Exception as e:
-                    st.error(f"JSON 로드 실패: {e}")
+            if genre_files:
+                texts = []
+                names = []
+                for gf in genre_files[:3]:
+                    _text = extract_text_from_uploaded_file(gf)
+                    if _text:
+                        texts.append(_text)
+                        names.append(gf.name)
+                if texts:
+                    st.session_state.genre_ref_texts = texts
+                    st.session_state.genre_ref_filenames = names
+                    total_chars = sum(len(t) for t in texts)
+                    st.success(f"✅ 참고작 {len(texts)}편 로드 (총 {total_chars:,}자): {', '.join(names)}")
+                    if st.session_state.genre_dna:
+                        st.info("✓ 장르 DNA 추출 완료. **Stage 1 진단 시작** 버튼을 누르면 이 DNA가 시나리오 분석·집필에 자동 적용됩니다.")
+                    else:
+                        st.caption("→ Stage 1 진단 시작 시 장르 DNA가 자동으로 먼저 추출되고, 그 결과로 시나리오를 진단합니다.")
+            elif st.session_state.genre_ref_filenames:
+                st.info(f"📎 등록된 참고작: {', '.join(st.session_state.genre_ref_filenames)}")
 
-    # ── v2.2 신규 — 7. 처리 모드 (구간 지정) ──
-    st.markdown('<div class="rev-card-title">7. 처리 모드 <span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(v2.2 신규 · 선택사항)</span></div>',
-                unsafe_allow_html=True)
-    st.markdown('<div class="rev-caption">기본은 전체 각색입니다. 일부 구간만 보호하거나 재집필하고 싶을 때 구간 모드를 켜세요.</div>',
-                unsafe_allow_html=True)
+            # ─────────────────────────────────────────
+            # STEP 2. 추출된 DNA 다운로드 (라이브러리 보관)
+            # ─────────────────────────────────────────
+            if st.session_state.genre_dna:
+                st.markdown('<div style="background:#EAF3DE; padding:8px 12px; border-radius:6px; '
+                            'border-left:3px solid #2EC484; margin:14px 0 8px; font-size:0.88rem;">'
+                            '<b>② 추출 완료 — 다음 작품에서 재사용하려면 JSON으로 보관하세요</b>'
+                            '</div>', unsafe_allow_html=True)
+                import json as _json
+                dna_json = _json.dumps(st.session_state.genre_dna, ensure_ascii=False, indent=2)
+                cdl1, cdl2 = st.columns([3, 1])
+                with cdl1:
+                    st.download_button(
+                        "💾 장르 DNA JSON 다운로드 (라이브러리 보관)",
+                        data=dna_json.encode("utf-8"),
+                        file_name=f"genre_dna_{st.session_state.genre.replace(' ','_')}.json",
+                        mime="application/json",
+                        key="dl_genre_dna",
+                        help="다음 프로젝트에서 재사용하려면 이 파일을 보관하세요",
+                        use_container_width=True,
+                    )
+                with cdl2:
+                    if st.button("🗑️ 제거", key="btn_clear_genre_dna", use_container_width=True):
+                        st.session_state.genre_ref_texts = []
+                        st.session_state.genre_ref_filenames = []
+                        st.session_state.genre_dna = None
+                        st.rerun()
 
-    mode_choice = st.radio(
-        "처리 방식",
-        options=["전체 각색", "구간 지정 (보호 + 재집필)"],
-        index=1 if st.session_state.section_mode else 0,
-        horizontal=True,
-        key="mode_radio",
-        help="전체 각색: 시나리오 전체를 다시 씀. 구간 지정: 일부는 보호, 일부만 재집필."
-    )
-    st.session_state.section_mode = (mode_choice == "구간 지정 (보호 + 재집필)")
-
-    if st.session_state.section_mode:
-        st.markdown(
-            '<div style="background:#FFF8DD; padding:10px 14px; border-radius:6px; '
-            'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
-            '<b>📌 구간 지정 모드 — 사용 케이스</b><br>'
-            '① <b>이어쓰기:</b> 일부분(예: 1막)은 손본 상태, 나머지를 v2_3 톤으로 이어쓰기<br>'
-            '② <b>부분 수정:</b> 2막 엔딩만 약해서 그 부분만 다시 쓰기<br>'
-            '③ <b>여러 구간 동시 수정:</b> 모니터 의견 반영해 여러 부분 한꺼번에 손보기'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-        method_choice = st.radio(
-            "구간 지정 방법",
-            options=[
-                "🤖 자동 감지 (이어쓰기 — 손본본이 있을 때)",
-                "✋ 수동 지정 (부분 수정 — 직접 구간 입력)",
-                "🔀 하이브리드 (자동 감지 + 수동 추가)"
-            ],
-            index={"auto": 0, "manual": 1, "hybrid": 2}.get(st.session_state.section_input_method, 0),
-            key="method_radio",
-        )
-        st.session_state.section_input_method = {
-            "🤖 자동 감지 (이어쓰기 — 손본본이 있을 때)": "auto",
-            "✋ 수동 지정 (부분 수정 — 직접 구간 입력)": "manual",
-            "🔀 하이브리드 (자동 감지 + 수동 추가)": "hybrid",
-        }[method_choice]
-
-        # 자동 감지 결과 표시
-        if st.session_state.section_input_method in ("auto", "hybrid"):
-            if not st.session_state.diff_refined_text:
-                st.warning("⚠️ 자동 감지를 위해 6번 'Diff 학습' 탭에서 손본본을 먼저 업로드하세요.")
-            else:
-                st.info(f"📎 손본본 등록됨: {st.session_state.diff_refined_filename}. "
-                        f"Stage 1 진단 시 자동으로 보호/재집필 영역이 감지됩니다.")
-                if st.session_state.section_detection:
-                    detection = st.session_state.section_detection.get("section_detection", {})
-                    cp = detection.get("continuation_point", {})
-                    if cp.get("detected") in (True, "true"):
-                        st.success(f"✓ 이어쓰기 시작점 감지됨")
-                        with st.expander("감지 결과 상세"):
-                            st.markdown(f"**설명:** {cp.get('explanation', '')}")
-                            prot_list = [
-                                f"{r.get('from','')}~{r.get('to','')}"
-                                for r in detection.get('recommended_protected_range', [])
-                            ]
-                            rev_list = [
-                                f"{r.get('from','')}~{r.get('to','')}"
-                                for r in detection.get('recommended_revision_range', [])
-                            ]
-                            st.markdown(f"**권장 보호 구간:** {prot_list}")
-                            st.markdown(f"**권장 재집필 구간:** {rev_list}")
-
-        # 수동 지정 + 하이브리드 — 구간 직접 입력
-        if st.session_state.section_input_method in ("manual", "hybrid"):
-            st.markdown("**재집필할 구간을 입력하세요** (나머지는 자동으로 보호됩니다):")
-            st.caption("형식: `S#41-S#55, S#67-S#67` (단일 씬은 같은 번호 두 번)")
-
-            # 현재 재집필 구간을 텍스트로 변환
-            current_rev_str = ", ".join(
-                f"{r.get('from','')}-{r.get('to','')}"
-                for r in st.session_state.revision_ranges
-            ) if st.session_state.revision_ranges else ""
-
-            rev_input = st.text_input(
-                "재집필 구간",
-                value=current_rev_str,
-                placeholder="예: S#41-S#55, S#67-S#67",
-                key="manual_rev_ranges",
-                label_visibility="collapsed"
-            )
-
-            if rev_input.strip() and rev_input != current_rev_str:
-                # 파싱
-                try:
-                    import re as _re
-                    new_ranges = []
-                    for piece in rev_input.split(","):
-                        piece = piece.strip()
-                        m = _re.match(r'(S#\d+)\s*[-~]\s*(S#\d+)', piece)
-                        if m:
-                            new_ranges.append({
-                                "from": m.group(1),
-                                "to": m.group(2),
-                                "reason": "수동 지정"
-                            })
-                    if new_ranges:
-                        st.session_state.revision_ranges = new_ranges
-                        # 보호 구간 자동 계산은 진단 시 처리
-                        st.success(f"✅ 재집필 구간 {len(new_ranges)}개 등록됨")
-                except Exception as e:
-                    st.error(f"구간 파싱 실패: {e}")
-
-        # 현재 등록된 구간 표시
-        if st.session_state.protected_ranges or st.session_state.revision_ranges:
-            with st.expander("📋 현재 등록된 구간"):
-                if st.session_state.protected_ranges:
-                    st.markdown("**🔒 보호 구간 (절대 안 건드림):**")
-                    for r in st.session_state.protected_ranges:
-                        st.markdown(f"  - {r.get('from','')} ~ {r.get('to','')}  *({r.get('reason','')})*")
-                if st.session_state.revision_ranges:
-                    st.markdown("**✏️ 재집필 구간 (다시 쓸 부분):**")
-                    for r in st.session_state.revision_ranges:
-                        st.markdown(f"  - {r.get('from','')} ~ {r.get('to','')}  *({r.get('reason','')})*")
-
-                if st.button("🗑️ 구간 초기화", key="btn_clear_sections"):
-                    st.session_state.protected_ranges = []
-                    st.session_state.revision_ranges = []
-                    st.session_state.section_detection = None
-                    st.session_state.cascade_analysis = None
-                    st.session_state.boundary_info = ""
-                    st.rerun()
-
-        # 연쇄 분석 결과 표시
-        if st.session_state.cascade_analysis:
-            with st.expander("🔬 연쇄 영향 분석 결과"):
-                ca = st.session_state.cascade_analysis.get("cascade_analysis", {})
-                st.markdown(f"**요약:** {ca.get('summary', '')}")
-                mp = ca.get("must_preserve", [])
-                if mp:
-                    st.markdown("**반드시 유지할 요소:**")
-                    for p in mp[:5]:
-                        st.markdown(f"  - [{p.get('category','')}] {p.get('item','')} ({p.get('where_in_protected','')})")
-                conflicts = ca.get("potential_conflicts", [])
-                if conflicts:
-                    st.markdown("**⚠️ 잠재 모순:**")
-                    for c in conflicts[:3]:
-                        st.markdown(f"  - {c.get('issue','')}")
+            # ─────────────────────────────────────────
+            # STEP 3. 라이브러리 — 이전에 보관한 JSON 재사용 (반복 사용자)
+            # ─────────────────────────────────────────
+            st.markdown("---")
+            with st.expander("📚 장르 DNA 라이브러리 — 이전에 추출해둔 JSON 불러오기"):
+                st.caption("같은 장르로 작업한 적이 있다면, 이전에 다운로드해둔 JSON을 업로드해서 "
+                           "참고작 다시 안 올리고 바로 적용할 수 있습니다.")
+                dna_json_file = st.file_uploader(
+                    "장르 DNA JSON 업로드",
+                    type=["json"],
+                    key="genre_dna_json_uploader"
+                )
+                if dna_json_file:
+                    try:
+                        import json as _json
+                        raw = dna_json_file.read().decode("utf-8")
+                        loaded = _json.loads(raw)
+                        st.session_state.genre_dna = loaded
+                        summary = loaded.get("genre_dna", {}).get("summary", "장르 DNA 로드됨")
+                        st.success(f"✅ 라이브러리에서 로드: {summary[:120]}")
+                    except Exception as e:
+                        st.error(f"JSON 로드 실패: {e}")
 
     # ── 실행 버튼 ──
     st.markdown("---")
 
-    # v2.1: 입력 검증 — 시나리오 + (피드백 자료 / 손본본 / Rewrite JSON / 장르 DNA 중 1개 이상)
+    # 모드별 입력 검증
     has_scenario = bool(st.session_state.raw_text)
-    aux_inputs = [
-        bool(st.session_state.instruction.strip()),
-        bool(st.session_state.diff_refined_text),
-        bool(st.session_state.rewrite_json_text.strip()),
-        bool(st.session_state.genre_dna or st.session_state.genre_ref_texts),
-        bool(st.session_state.tone_ref_text),
-    ]
-    has_aux = any(aux_inputs)
-    ready = has_scenario  # 시나리오만 있으면 자동 진단 모드로 진행 가능
+    work_mode = st.session_state.work_mode
+    ready = False
+    error_msg = None
+    info_msg = None
 
     if not has_scenario:
-        st.warning("⚠️ 1번 원본 시나리오 DOCX 업로드는 필수입니다.")
-    elif not has_aux:
-        st.info("ℹ️ 피드백·손본본·Rewrite JSON·장르 DNA 등 보조 자료가 없습니다. 시나리오 자체를 자동 진단해 약점을 찾습니다.")
+        error_msg = "⚠️ 1번 원본 시나리오 업로드는 필수입니다."
+    elif work_mode == "continuation":
+        if not st.session_state.diff_refined_text:
+            error_msg = "⚠️ 이어쓰기 모드는 2번 손본 시나리오 업로드가 필수입니다."
+        else:
+            ready = True
+    elif work_mode == "partial":
+        if not st.session_state.revision_ranges:
+            error_msg = ("⚠️ 부분 수정 모드는 재집필 구간 선택이 필수입니다. "
+                         "1막/2막/3막 버튼을 누르거나 직접 입력하세요.")
+        else:
+            ready = True
     else:
-        # 어떤 자료가 등록되어 있는지 한눈에
+        # 전체 각색 모드
+        ready = True
+        aux_inputs = [
+            bool(st.session_state.instruction.strip()),
+            bool(st.session_state.rewrite_json_text.strip()),
+            bool(st.session_state.genre_dna or st.session_state.genre_ref_texts),
+            bool(st.session_state.tone_ref_text),
+        ]
+        if not any(aux_inputs):
+            info_msg = "ℹ️ 보조 자료 없이 진행합니다. 시나리오 자체를 자동 진단해 약점을 찾습니다."
+
+    if error_msg:
+        st.warning(error_msg)
+    elif info_msg:
+        st.info(info_msg)
+    else:
+        # 등록된 자료 한눈에
         active = []
         if st.session_state.instruction.strip(): active.append("📝 피드백")
         if st.session_state.diff_refined_text: active.append("🔬 Diff")
@@ -2081,6 +2245,45 @@ def show_step_1_diagnose():
 
     st.markdown('<div class="rev-card-title">🔬 Stage 1: 진단 결과 (Revision Plan)</div>',
                 unsafe_allow_html=True)
+
+    # v2.2 — 구간 모드 상태 표시 (가장 위에)
+    if st.session_state.section_mode:
+        prot_str = ", ".join(
+            f"{r.get('from','')}~{r.get('to','')}"
+            for r in st.session_state.protected_ranges
+        ) or "(없음)"
+        rev_str = ", ".join(
+            f"{r.get('from','')}~{r.get('to','')}"
+            for r in st.session_state.revision_ranges
+        ) or "(없음)"
+
+        # 보호 구간이 비어 있으면 강한 경고
+        if not st.session_state.protected_ranges:
+            st.error(
+                "⚠️ **구간 모드 ON이지만 보호 구간이 등록되지 않았습니다.**\n\n"
+                "- 자동 감지 모드라면: 6번 Diff 학습 탭에 손본본을 올렸는지 확인하세요.\n"
+                "- 수동 모드라면: 7번 처리 모드에서 재집필 구간을 직접 입력하세요.\n\n"
+                "→ 입력으로 돌아가 7번 처리 모드를 다시 점검해주세요. "
+                "현재 진단은 전체 각색처럼 동작했습니다."
+            )
+        else:
+            st.markdown(
+                f'<div style="background:#EAF3DE; padding:10px 14px; border-radius:6px; '
+                f'border-left:3px solid #2EC484; margin:8px 0 16px; font-size:0.9rem;">'
+                f'<b>✂️ 구간 지정 모드 ON</b><br>'
+                f'🔒 보호 구간 (안 건드림): <code>{prot_str}</code><br>'
+                f'✏️ 재집필 구간 (다시 씀): <code>{rev_str}</code>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.markdown(
+            '<div style="background:#FFF8DD; padding:8px 14px; border-radius:6px; '
+            'border-left:3px solid #FFCB05; margin:8px 0 16px; font-size:0.85rem;">'
+            '<b>📝 전체 각색 모드</b> — 시나리오 전체가 진단·수정 대상입니다.'
+            '</div>',
+            unsafe_allow_html=True
+        )
 
     # 요약
     summary = dr.get("summary", "")
