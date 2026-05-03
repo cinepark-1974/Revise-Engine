@@ -623,6 +623,40 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
     style_action.paragraph_format.space_after = Pt(2)
     _set_eastasia_font(style_action.element.get_or_add_rPr())
 
+    # ★ Writer Engine v3.1.4 자산 — INSERT 전용 스타일 3종 이식
+    # [스타일 5] INSERT 헤더 — 작은 대문자 느낌, 중간 들여쓰기, 굵게
+    style_insert_header = doc.styles.add_style('인서트헤더', WD_STYLE_TYPE.PARAGRAPH)
+    style_insert_header.base_style = doc.styles['Normal']
+    style_insert_header.font.name = '함초롬바탕'
+    style_insert_header.font.size = Pt(9)
+    style_insert_header.font.bold = True
+    style_insert_header.paragraph_format.left_indent = Cm(2.55)
+    style_insert_header.paragraph_format.space_before = Pt(8)
+    style_insert_header.paragraph_format.space_after = Pt(2)
+    _set_eastasia_font(style_insert_header.element.get_or_add_rPr())
+
+    # [스타일 6] INSERT 본문 — 깊은 들여쓰기, 이탤릭
+    style_insert_body = doc.styles.add_style('인서트본문', WD_STYLE_TYPE.PARAGRAPH)
+    style_insert_body.base_style = doc.styles['Normal']
+    style_insert_body.font.name = '함초롬바탕'
+    style_insert_body.font.size = Pt(10)
+    style_insert_body.font.italic = True
+    style_insert_body.paragraph_format.left_indent = Cm(2.55)
+    style_insert_body.paragraph_format.space_before = Pt(2)
+    style_insert_body.paragraph_format.space_after = Pt(2)
+    style_insert_body.paragraph_format.line_spacing = 1.4
+    _set_eastasia_font(style_insert_body.element.get_or_add_rPr())
+
+    # [스타일 7] INSERT 라벨식 — 한 줄 짜리 [라벨] '본문' 형식
+    style_insert_label = doc.styles.add_style('인서트라벨', WD_STYLE_TYPE.PARAGRAPH)
+    style_insert_label.base_style = doc.styles['Normal']
+    style_insert_label.font.name = '함초롬바탕'
+    style_insert_label.font.size = Pt(10)
+    style_insert_label.paragraph_format.left_indent = Cm(1.42)
+    style_insert_label.paragraph_format.space_before = Pt(4)
+    style_insert_label.paragraph_format.space_after = Pt(4)
+    _set_eastasia_font(style_insert_label.element.get_or_add_rPr())
+
     # ── 헬퍼 ──
     def add_text(text, bold=False, size=None, color=None, align=None):
         p = doc.add_paragraph()
@@ -647,25 +681,122 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
         return p
 
     def add_dialogue(char_name, parenthetical, line, continuation=False):
+        """Writer Engine v3.1.3 자산 — 대사 본문 내 괄호 지시문은
+        run을 분할하여 bold를 해제. 화자 표기의 괄호(예: V.O.)는 유지."""
         if continuation:
             p = doc.add_paragraph(style='대사연속')
-            paren = f"({parenthetical}) " if parenthetical else ""
-            full = f"\t\t{paren}{line}"
+            speaker_part = "\t\t"
         else:
             p = doc.add_paragraph(style='대사')
-            paren = f"({parenthetical}) " if parenthetical else ""
-            full = f"{char_name}\t\t{paren}{line}"
-        r = p.add_run(full)
+            speaker_part = f"{char_name}\t\t"
+
+        # 대사 본문 영역 조립: parenthetical 인자 + 실제 대사
+        body_parts = []  # [(text, is_paren), ...]
+        if parenthetical:
+            body_parts.append((f"({parenthetical}) ", True))
+        if line:
+            import re as _re_dlg
+            chunks = _re_dlg.split(r'(\([^()]*\))', line)
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if chunk.startswith('(') and chunk.endswith(')'):
+                    body_parts.append((chunk, True))
+                else:
+                    body_parts.append((chunk, False))
+
+        # run 1: 화자 영역
+        r_speaker = p.add_run(speaker_part)
+        r_speaker.font.name = "함초롬바탕"
+        _set_eastasia_font(r_speaker._element.get_or_add_rPr())
+
+        # run 2~N: 대사 본문 — 괄호 부분은 bold=False
+        for text, is_paren in body_parts:
+            r = p.add_run(text)
+            r.font.name = "함초롬바탕"
+            _set_eastasia_font(r._element.get_or_add_rPr())
+            if is_paren:
+                r.bold = False
+
+        return p
+
+    def add_insert_block(header: str, body_lines: list):
+        """Writer Engine v3.1.4 자산 — INSERT 형식 A 렌더링.
+        헤더(작게·굵게·들여쓰기) + 본문(이탤릭·깊은 들여쓰기) + 자동 빈 줄.
+        """
+        doc.add_paragraph("")
+        first_p = doc.add_paragraph(style='인서트헤더')
+        r = first_p.add_run(header.strip())
         r.font.name = "함초롬바탕"
         _set_eastasia_font(r._element.get_or_add_rPr())
+
+        for line in body_lines:
+            line = line.strip()
+            if not line:
+                continue
+            p = doc.add_paragraph(style='인서트본문')
+            r = p.add_run(line)
+            r.font.name = "함초롬바탕"
+            r.italic = True
+            _set_eastasia_font(r._element.get_or_add_rPr())
+
+        close_p = doc.add_paragraph(style='인서트헤더')
+        cr = close_p.add_run('[/INSERT]')
+        cr.font.name = "함초롬바탕"
+        _set_eastasia_font(cr._element.get_or_add_rPr())
+        doc.add_paragraph("")
+        return first_p
+
+    def add_insert_label_paragraph(text: str):
+        """Writer Engine v3.1.4 자산 — 형식 B 라벨 한 줄 렌더링."""
+        label, body = _parse_insert_label(text)
+        p = doc.add_paragraph(style='인서트라벨')
+
+        r_label = p.add_run(label + ' ')
+        r_label.font.name = "함초롬바탕"
+        r_label.font.size = Pt(9)
+        r_label.bold = True
+        _set_eastasia_font(r_label._element.get_or_add_rPr())
+
+        if body:
+            r_body = p.add_run(body)
+            r_body.font.name = "함초롬바탕"
+            r_body.italic = True
+            _set_eastasia_font(r_body._element.get_or_add_rPr())
         return p
 
     def add_action(text):
-        p = doc.add_paragraph(style='지문')
-        r = p.add_run(text)
-        r.font.name = "함초롬바탕"
-        _set_eastasia_font(r._element.get_or_add_rPr())
-        return p
+        """Writer Engine v3.1.3+v3.1.4 자산 — 지문 출력.
+        - 긴 단락은 의미 비트 단위로 자동 분단 (_split_action_paragraph)
+        - INSERT 블록(형식 A·B) 자동 감지 → 전용 스타일로 분기
+        - AI 시적 의도 보존: 짧은 단락(150자 미만, 7문장 미만)은 그대로 둠
+        """
+        # PROP 메모·CHECK 태그 정제 (안전망)
+        text = _strip_prop_state_memos(text)
+
+        # INSERT 블록 우선 분리
+        items = _parse_insert_blocks(text)
+
+        first_p = None
+        for item in items:
+            if item['type'] == 'insert_block':
+                p = add_insert_block(item['data']['header'], item['data']['body'])
+            elif item['type'] == 'insert_label':
+                p = add_insert_label_paragraph(item['data'])
+            else:
+                # 일반 지문 — Writer Engine 분단 알고리즘 적용
+                sub_paragraphs = _split_action_paragraph(item['data'])
+                p = None
+                for sub in sub_paragraphs:
+                    sp = doc.add_paragraph(style='지문')
+                    r = sp.add_run(sub)
+                    r.font.name = "함초롬바탕"
+                    _set_eastasia_font(r._element.get_or_add_rPr())
+                    if p is None:
+                        p = sp
+            if first_p is None:
+                first_p = p
+        return first_p
 
     # ── 커버 페이지 ──
     for _ in range(6):
@@ -1761,11 +1892,340 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
     return parsed
 
 
+
+# ═══════════════════════════════════════════════════════════
+# ★ Writer Engine v3.1.3 자산 이식 — 지문 자동 분단 시스템
+# (Writer Engine main.py 63~204행 그대로 가져옴)
+# ═══════════════════════════════════════════════════════════
+
+# 분단 임계값 — Writer Engine 데이터 분석 기반 (실제 결과물 481개 단락 분포 검증)
+_ACTION_SPLIT_CHAR_THRESHOLD = 150     # 자수 임계
+_ACTION_SPLIT_SENTENCE_THRESHOLD = 7   # 문장수 임계
+_ACTION_SPLIT_HARD_CHARS = 240         # 하드 임계 (이 이상은 무조건 분단)
+_ACTION_SPLIT_HARD_SENTENCES = 9       # 하드 문장수 임계
+
+
+def _split_sentences(text: str):
+    """한국어 지문을 문장 단위로 쪼갠다. 마침표·물음표·느낌표 + 공백 기준.
+    문장 부호 뒤 공백이 없는 경우(약어 등)는 분리하지 않는다.
+    """
+    import re as _re
+    parts = _re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in parts if s.strip()]
+
+
+def _detect_paragraph_break_index(sentences: list) -> int:
+    """
+    문장 리스트에서 가장 자연스러운 분단 위치(인덱스)를 찾는다.
+    분단 트리거 4종에 따라 우선순위로 탐색.
+    찾지 못하면 -1 반환.
+
+    트리거 우선순위:
+      1) 시간 압축 종료: "수업이 진행된다" / "수업이 끝난다" 같은 큰 사건 변화
+      2) 동작 주체 변경: 단체 → 개인, 또는 인물 ↔ 다른 인물
+      3) 카메라 시점 변경: 인물 동작 ↔ 정물·공간 묘사 (지시 대명사 없는 명사구 시작)
+    """
+    import re as _re
+    n = len(sentences)
+    if n < 4:
+        return -1
+
+    candidates = []
+
+    for i in range(2, n - 1):
+        cur = sentences[i]
+        prev = sentences[i - 1]
+        score = 0
+
+        # 트리거 1: 시간 압축 / 큰 상황 전환 키워드
+        time_break_patterns = [
+            r'수업이?\s*(끝나|진행)',
+            r'시간이\s*(흐른|지난|경과)',
+            r'(다음\s*날|이튿날|새벽|아침|저녁|밤)',
+            r'몇\s*(분|시간|일)\s*(후|뒤)',
+            r'(직후|잠시\s*후|곧)',
+        ]
+        for pat in time_break_patterns:
+            if _re.search(pat, cur):
+                score += 10
+                break
+
+        # 트리거 2: 인물명 + 단독/혼자/홀로 (주체 전환 신호)
+        if _re.search(r'(혼자|홀로|단독)', cur):
+            score += 6
+
+        # 트리거 3: 정물·공간 묘사 시작 (인물 주어 없는 명사구)
+        space_patterns = [
+            r'^(긴\s|넓은\s|좁은\s|텅\s|빈\s|새|작은\s|커다란\s)',
+            r'^(테이블|벽|창|문|바닥|천장|복도|골목)\s',
+            r'^(아일랜드|카운터|책상|의자|침대|소파)\s',
+            r'^[가-힣]+\s위에',  # "~ 위에" 시작
+        ]
+        prev_has_actor = bool(_re.search(r'[가-힣]{2,4}이\s', prev) or _re.search(r'[가-힣]{2,4}가\s', prev))
+        cur_is_space = any(_re.search(pat, cur) for pat in space_patterns)
+        if prev_has_actor and cur_is_space:
+            score += 5
+
+        # 트리거 4: 인물 주체 변경 ("A가 ~한다." → "B가 ~한다.")
+        prev_actor = _re.match(r'^([가-힣]{2,4})(이|가)\s', prev)
+        cur_actor = _re.match(r'^([가-힣]{2,4})(이|가)\s', cur)
+        if prev_actor and cur_actor and prev_actor.group(1) != cur_actor.group(1):
+            score += 4
+
+        # 위치 보정: 단락의 정중앙 근처가 가장 자연스러운 분단 위치
+        center_distance = abs(i - n // 2)
+        position_bonus = max(0, 3 - center_distance)
+        score += position_bonus
+
+        if score >= 5:
+            candidates.append((i, score))
+
+    if not candidates:
+        return -1
+
+    candidates.sort(key=lambda x: -x[1])
+    return candidates[0][0]
+
+
+def _split_action_paragraph(text: str) -> list:
+    """
+    지문 단락이 임계값을 넘으면 의미 비트 단위로 분할.
+    임계값 미만이거나 적절한 분단 지점을 못 찾으면 [text] 그대로 반환.
+
+    분단 조건 (둘 중 하나 충족):
+      - 자수 >= 150자
+      - 자수 >= 100자 AND 문장수 >= 7 (단문 리듬 보존을 위한 하한)
+
+    Returns:
+        분할된 단락 리스트 (1개 또는 그 이상)
+    """
+    text = text.strip()
+    if not text:
+        return [text]
+
+    char_len = len(text)
+    sentences = _split_sentences(text)
+    sent_count = len(sentences)
+
+    triggered_by_length = char_len >= _ACTION_SPLIT_CHAR_THRESHOLD
+    triggered_by_sentence = (char_len >= 100 and sent_count >= _ACTION_SPLIT_SENTENCE_THRESHOLD)
+
+    if not (triggered_by_length or triggered_by_sentence):
+        return [text]
+
+    split_idx = _detect_paragraph_break_index(sentences)
+
+    if split_idx < 0:
+        if char_len < _ACTION_SPLIT_HARD_CHARS and sent_count < _ACTION_SPLIT_HARD_SENTENCES:
+            return [text]
+        split_idx = sent_count // 2
+
+    part1 = ' '.join(sentences[:split_idx])
+    part2 = ' '.join(sentences[split_idx:])
+    result = [part1] + _split_action_paragraph(part2)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# ★ Writer Engine v3.1.5 자산 이식 — PROP 메모·CHECK 태그 정제
+# ═══════════════════════════════════════════════════════════
+
+def _strip_prop_state_memos(text: str) -> str:
+    """
+    [소품 상태 / S#N 종료 시점] / GENRE_BOOSTER_CHECK / HELPER_CHARACTER_CHECK
+    같은 INTERNAL 메모 블록을 본문에서 제거.
+
+    AI가 비트 끝에 작성한 자가 검증 메모는 본문 노출 금지.
+    """
+    import re as _re_prop
+    if not text:
+        return text
+
+    # 패턴 1: 코드블록 안 [소품 상태 ...] (```으로 감싼 형태)
+    pattern_codeblock = _re_prop.compile(
+        r'```[^\n]*\n\[소품\s*상태[^\]]*\][\s\S]*?```',
+        _re_prop.MULTILINE
+    )
+    text = pattern_codeblock.sub('', text)
+
+    # 패턴 2: 일반 텍스트 안의 [소품 상태] 블록
+    pattern_inline = _re_prop.compile(
+        r'\n*\[소품\s*상태[^\]]*\]\s*\n'
+        r'(?:[\s]*[-•·][^\n]*\n?)+',
+        _re_prop.MULTILINE
+    )
+    text = pattern_inline.sub('\n', text)
+
+    # 패턴 3: INTERNAL / 작가 노트 / 소품 추적
+    pattern_internal = _re_prop.compile(
+        r'\n*\[?(?:INTERNAL|작가\s*노트|작가노트|소품\s*추적)[^\]]*\]?\s*\n'
+        r'(?:\[소품\s*상태[^\]]*\]\s*\n)?'
+        r'(?:[\s]*[-•·][^\n]*\n?)+',
+        _re_prop.IGNORECASE | _re_prop.MULTILINE
+    )
+    text = pattern_internal.sub('\n', text)
+
+    # 패턴 4: GENRE_BOOSTER_CHECK 태그
+    pattern_booster = _re_prop.compile(
+        r'\n*<GENRE_BOOSTER_CHECK>[\s\S]*?</GENRE_BOOSTER_CHECK>\n*',
+        _re_prop.IGNORECASE
+    )
+    text = pattern_booster.sub('\n', text)
+
+    # 패턴 5: HELPER_CHARACTER_CHECK 태그
+    pattern_helper = _re_prop.compile(
+        r'\n*<HELPER_CHARACTER_CHECK>[\s\S]*?</HELPER_CHARACTER_CHECK>\n*',
+        _re_prop.IGNORECASE
+    )
+    text = pattern_helper.sub('\n', text)
+
+    # 패턴 6: 닫기 태그 없이 떠도는 자가 검증 헤더
+    pattern_check_header = _re_prop.compile(
+        r'\n*\[★?\s*비트\s*종료[^\]]*GENRE_BOOSTER_CHECK[^\]]*\][\s\S]*?(?=\n\[|\nS#|\n$|\Z)',
+        _re_prop.IGNORECASE
+    )
+    text = pattern_check_header.sub('\n', text)
+
+    # 연속된 빈 줄 정리 (3개 이상 → 2개)
+    text = _re_prop.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
+
+
+# ═══════════════════════════════════════════════════════════
+# ★ Writer Engine v3.1.4 자산 이식 — INSERT 시스템
+# 카톡·문자·이메일·유튜브·뉴스 등 화면 인서트 자동 감지
+# ═══════════════════════════════════════════════════════════
+
+_INSERT_LABEL_KEYWORDS = [
+    '카톡', '메신저', '라인', '디스코드', '카카오톡',
+    '문자', 'SMS', 'MMS',
+    '이메일', '메일',
+    '유튜브', 'YouTube', 'youtube', 'TV', '뉴스', '방송',
+    'SNS', '인스타', '인스타그램', '페이스북', '트위터', 'X', '틱톡', 'DM',
+    '검색', '구글', '네이버', '다음',
+    '노트', '일기', '메모', '편지', '손글씨', '쪽지',
+    '신문', '잡지', '기사', '헤드라인',
+    '자막',
+    '알림',
+    '핸드폰', '핸드폰 화면', '폰', '폰 화면', '화면',
+]
+
+
+def _is_insert_label(text: str) -> bool:
+    """[...] 형식 라벨인지 판단 — 형식 B 감지."""
+    import re as _re_insert
+    text = text.strip()
+    if not (text.startswith('[') and ']' in text):
+        return False
+    label_match = _re_insert.match(r'^\[([^\]]+)\]', text)
+    if not label_match:
+        return False
+    label_inner = label_match.group(1)
+    return any(kw in label_inner for kw in _INSERT_LABEL_KEYWORDS)
+
+
+def _parse_insert_blocks(text: str) -> list:
+    """
+    여러 줄 텍스트를 받아 INSERT 블록과 일반 텍스트로 분리.
+
+    Returns:
+        [{'type': 'action'|'insert_block'|'insert_label', 'data': ...}, ...]
+    """
+    import re as _re_insert
+    if not text or not text.strip():
+        return []
+
+    lines = text.split('\n')
+    items = []
+    i = 0
+    n = len(lines)
+    accumulated_action = []
+
+    def flush_action():
+        if accumulated_action:
+            joined = '\n'.join(accumulated_action).strip()
+            if joined:
+                items.append({'type': 'action', 'data': joined})
+            accumulated_action.clear()
+
+    while i < n:
+        line = lines[i]
+        line_stripped = line.strip()
+
+        # 형식 A: INSERT — / INSERT - / INSERT:
+        if _re_insert.match(r'^INSERT\s*[—\-:]', line_stripped, _re_insert.IGNORECASE):
+            flush_action()
+            header = line_stripped
+            body_lines = []
+            i += 1
+            while i < n:
+                bl = lines[i].strip()
+                if _re_insert.match(r'^\[/INSERT\]?$', bl, _re_insert.IGNORECASE):
+                    i += 1
+                    break
+                if not bl:
+                    j = i + 1
+                    while j < n and not lines[j].strip():
+                        j += 1
+                    if j >= n:
+                        i = j
+                        break
+                    next_line = lines[j].strip()
+                    if _re_insert.match(r'^\[/INSERT\]?$', next_line, _re_insert.IGNORECASE):
+                        i = j + 1
+                        break
+                    if not _re_insert.match(r"^['\"\u2018\u2019\u201C\u201D]", next_line):
+                        i = j
+                        break
+                    i += 1
+                    continue
+                body_lines.append(bl)
+                i += 1
+            items.append({
+                'type': 'insert_block',
+                'data': {'header': header, 'body': body_lines}
+            })
+            continue
+
+        # 형식 B: [...] 라벨
+        if _is_insert_label(line_stripped):
+            flush_action()
+            items.append({'type': 'insert_label', 'data': line_stripped})
+            i += 1
+            continue
+
+        # 떠도는 [/INSERT] 단독 라인 무시
+        if _re_insert.match(r'^\[/INSERT\]?$', line_stripped, _re_insert.IGNORECASE):
+            i += 1
+            continue
+
+        accumulated_action.append(line)
+        i += 1
+
+    flush_action()
+    return items
+
+
+def _parse_insert_label(text: str) -> tuple:
+    """
+    형식 B 라벨 한 줄을 (label, body)로 분리.
+    예: "[핸드폰 / 카톡] '아빠: 임대료 30프로 올린다.'"
+        → ("[핸드폰 / 카톡]", "'아빠: 임대료 30프로 올린다.'")
+    """
+    import re as _re_insert
+    m = _re_insert.match(r'^(\[[^\]]+\])\s*(.*)$', text.strip())
+    if m:
+        return m.group(1), m.group(2).strip()
+    return text, ""
+
+
+# ═══════════════════════════════════════════════════════════
+# 씬 헤더 시간 표기 정규화 (Revise Engine 전용)
+# ═══════════════════════════════════════════════════════════
+
 def _normalize_scene_time_marker(content: str) -> str:
     """씬 헤더 시간 표기를 DAY/NIGHT 표준으로 정규화.
-
-    한국 시나리오 표준에 따라 씬 헤더는 INT./EXT. 장소 — DAY 또는 NIGHT 형식.
-    요일(월~일)·디테일 시간(아침/오전/오후/저녁/밤/낮/이른 아침/야경 등)은 모두 제거.
 
     매핑:
       아침 / 이른 아침 / 오전 / 낮 / 오후 / 정오 → DAY
@@ -1774,82 +2234,126 @@ def _normalize_scene_time_marker(content: str) -> str:
     """
     import re as _re
 
-    # 시간 키워드 매핑
     day_keywords = ['이른 아침', '아침', '오전', '낮', '오후', '정오', '대낮']
     night_keywords = ['이른 저녁', '저녁', '밤', '야경', '새벽', '자정', '한밤', '심야']
     weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
 
     def fix_header(match):
-        full = match.group(0)
         scene_num = match.group(1)
         in_ex = match.group(2)
         location = match.group(3).strip()
         time_part = match.group(4).strip()
-
-        # location 끝에 시간 키워드가 끼어든 경우 제거 (예: "한남동 골목 야경" → "한남동 골목")
-        for kw in ['야경', '새벽', '낮', '밤', '아침', '저녁']:
+        for kw in ['야경', '새벽']:
             if location.endswith(' ' + kw):
                 location = location[:-len(kw)].rstrip()
-                # 시간 정보가 location에 있었으니 time_part에 합산해서 판정
                 time_part = kw + ' ' + time_part
-
-        # 우선순위 1: NIGHT 키워드 우선 검사 (저녁/밤은 강한 신호)
         is_night = any(kw in time_part for kw in night_keywords)
         is_day = any(kw in time_part for kw in day_keywords)
-
+        has_weekday = any(wd in time_part for wd in weekdays)
         if is_night:
             time_normalized = "NIGHT"
         elif is_day:
             time_normalized = "DAY"
+        elif has_weekday:
+            time_normalized = "DAY"
         else:
-            # 요일만 적힌 경우 — 보수적으로 DAY
-            has_weekday = any(wd in time_part for wd in weekdays)
-            if has_weekday:
-                time_normalized = "DAY"
-            else:
-                # 알 수 없는 표기 — 원본 유지
-                return full
-
+            return match.group(0)
         return f"S#{scene_num}. {in_ex}. {location} — {time_normalized}"
 
-    # S#숫자. INT./EXT. 장소 — 시간표기 패턴
-    # 시간 표기는 — 뒤부터 줄바꿈 또는 다음 큰 구분까지
     pattern = _re.compile(
         r'S#(\d+(?:-\d+)?)\.\s*(INT|EXT)\.\s*([^\n—]+?)\s*—\s*([^\n]{1,40}?)(?=\n|$|\.\s+[가-힣A-Z])',
         _re.MULTILINE
     )
-    content = pattern.sub(fix_header, content)
+    return pattern.sub(fix_header, content)
 
-    # INT./EXT. 누락된 헤더도 시간 부분만 정규화 (장소만 있는 경우)
-    pattern_no_inext = _re.compile(
-        r'(S#\d+(?:-\d+)?\.\s+)([^\n]+?)\s+—\s+([^\n]{1,30}?)(?=\n|$)',
-        _re.MULTILINE
-    )
 
-    def fix_no_inext(match):
-        prefix = match.group(1)
-        location = match.group(2).strip()
-        time_part = match.group(3).strip()
+# ═══════════════════════════════════════════════════════════
+# 대사·지문 융합 분리 (A22 위반 자동 수정)
+# ═══════════════════════════════════════════════════════════
 
-        # 이미 DAY/NIGHT면 건드리지 않음
-        if time_part in ('DAY', 'NIGHT'):
-            return match.group(0)
+def _split_dialog_action_fusion(content: str, char_names_pattern: str) -> tuple:
+    """A22 위반 — 대사 라인에 지문이 따라붙은 경우 분리.
 
-        is_night = any(kw in time_part for kw in night_keywords)
-        is_day = any(kw in time_part for kw in day_keywords)
-        has_weekday = any(wd in time_part for wd in weekdays)
+    예:
+      유진\t\t자, 면수 버리지 마세요. 지난번에도 말씀드렸죠? 수업이 진행된다. 토마토가...
+                                                              ↑ 종결문 후 지문 시작 → 분리
+    """
+    import re as _re
+    fusion_count = 0
+    lines = content.split('\n')
+    new_lines = []
 
-        if is_night:
-            time_normalized = "NIGHT"
-        elif is_day or has_weekday:
-            time_normalized = "DAY"
+    action_indicators = [
+        r'수업이\s+(?:진행|시작|끝)',
+        r'(?:유진|진호|세웅|다은|강회장|지우|여름|최여름|조민준|최상진|집배원)이?\s+(?:웃|보|돈|섰|들|놓|떨|넘|건|받|먹|쳐|일어|앉|걷|뛰|달|들어|나|덮|연|닫|꺾)',
+        r'(?:토마토|면|접시|냄비|국|된장|소스)가?\s+(?:끓|졸|담|풀)',
+        r'(?:바람|음악|가로등|시계|핸드폰|폰|문|커튼|불|조명)이?\s+(?:불|울|흐|들|나|꺼|켜|보)',
+        r'CUT\s+TO:', r'DISSOLVE\s+TO:', r'FADE\s+(?:IN|OUT)', r'\[인서트', r'INSERT\s*[—\-:]',
+    ]
+    action_pattern = _re.compile('|'.join(f'({p})' for p in action_indicators))
+    char_line_pattern = _re.compile(rf'^({char_names_pattern})\t\t(.+)$')
+
+    for line in lines:
+        m = char_line_pattern.match(line)
+        if m:
+            speaker = m.group(1)
+            dialog_text = m.group(2)
+            split_match = _re.search(
+                r'([\.\?\!…])\s+(?=' + action_pattern.pattern + ')',
+                dialog_text
+            )
+            if split_match:
+                cut_pos = split_match.end(1)
+                pure_dialog = dialog_text[:cut_pos].rstrip()
+                trailing_action = dialog_text[cut_pos:].strip()
+                if pure_dialog and trailing_action:
+                    new_lines.append(f"{speaker}\t\t{pure_dialog}")
+                    new_lines.append("")
+                    new_lines.append(trailing_action)
+                    fusion_count += 1
+                    continue
+        new_lines.append(line)
+    return '\n'.join(new_lines), fusion_count
+
+
+# ═══════════════════════════════════════════════════════════
+# 통짜 지문 자동 분단 (Writer Engine _split_action_paragraph 활용)
+# ═══════════════════════════════════════════════════════════
+
+def _split_clumping_action_lines(content: str) -> tuple:
+    """REVISE 결과 본문 전체에 Writer Engine의 _split_action_paragraph 적용.
+
+    문단 단위로 분리한 다음, 각 문단을 _split_action_paragraph로 검사.
+    임계값 (150자/7문장 또는 240자/9문장 하드)을 넘으면 자동 분단.
+    """
+    import re as _re
+    paragraphs = _re.split(r'\n\n+', content)
+    new_paragraphs = []
+    clump_count = 0
+
+    for para in paragraphs:
+        # 대사 라인이거나 씬 헤더면 통과
+        if '\t\t' in para or _re.match(r'^S#\d+\.', para.strip()):
+            new_paragraphs.append(para)
+            continue
+        # INSERT 블록도 통과 (자체 처리됨)
+        if _re.match(r'^INSERT\s*[—\-:]', para.strip(), _re.IGNORECASE):
+            new_paragraphs.append(para)
+            continue
+        if _re.match(r'^\[', para.strip()) and _is_insert_label(para.strip().split('\n')[0]):
+            new_paragraphs.append(para)
+            continue
+
+        # Writer Engine 정품 분단 알고리즘 호출
+        sub_paragraphs = _split_action_paragraph(para)
+        if len(sub_paragraphs) > 1:
+            new_paragraphs.extend(sub_paragraphs)
+            clump_count += 1
         else:
-            return match.group(0)
+            new_paragraphs.append(para)
 
-        return f"{prefix}{location} — {time_normalized}"
+    return '\n\n'.join(new_paragraphs), clump_count
 
-    content = pattern_no_inext.sub(fix_no_inext, content)
-    return content
 
 
 def _validate_and_fix_revised_format(revise_result: dict) -> dict:
@@ -1857,7 +2361,10 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
 
     AI가 한 줄 통짜로 출력한 경우를 감지해 자동 줄바꿈 삽입.
     Writer Engine 표준에 맞춰 캐릭터명 + 탭2 + 대사 형식 강제.
-    씬 헤더 시간 표기를 DAY/NIGHT 표준으로 정규화.
+    추가:
+      - 씬 헤더 시간 표기 → DAY/NIGHT 정규화
+      - A22 위반(대사·지문 융합) 자동 분리
+      - A21 위반(통짜 지문) 자동 비트 분리
     """
     if not isinstance(revise_result, dict):
         return revise_result
@@ -1881,6 +2388,10 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
 
     fixed_count = 0
     time_normalized_count = 0
+    fusion_split_count = 0
+    clump_split_count = 0
+    prop_strip_count = 0
+    
     for scene in revised_scenes:
         if not isinstance(scene, dict):
             continue
@@ -1888,15 +2399,27 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
         if not content or len(content) < 100:
             continue
 
-        # ★ 모든 씬에 시간 표기 정규화 적용 (요일·디테일 시간 → DAY/NIGHT)
-        before_norm = content
-        content = _normalize_scene_time_marker(content)
-        if content != before_norm:
-            time_normalized_count += 1
+        # ★ 1. PROP 메모·CHECK 태그 정제 (Writer Engine v3.1.5 / v3.2.0 자산)
+        before_prop = content
+        content = _strip_prop_state_memos(content)
+        if content != before_prop:
+            prop_strip_count += 1
 
-        # scene_header 필드도 함께 정규화
+        # ★ 2. 씬 헤더 시간 표기 정규화 (DAY/NIGHT)
+        before = content
+        content = _normalize_scene_time_marker(content)
+        if content != before:
+            time_normalized_count += 1
         if "scene_header" in scene and isinstance(scene["scene_header"], str):
             scene["scene_header"] = _normalize_scene_time_marker(scene["scene_header"])
+
+        # ★ 3. A22 — 대사·지문 융합 분리
+        content, fcount = _split_dialog_action_fusion(content, char_names_pattern)
+        fusion_split_count += fcount
+
+        # ★ 4. A21 — 통짜 지문 비트 분리 (Writer Engine v3.1.3 분단 알고리즘)
+        content, ccount = _split_clumping_action_lines(content)
+        clump_split_count += ccount
 
         # 줄바꿈 비율 체크
         line_count = content.count('\n')
@@ -1936,14 +2459,21 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
             # 7. 연속 빈 줄 정리
             content = _re.sub(r'\n{3,}', '\n\n', content)
 
-            scene["revised_content"] = content
             fixed_count += 1
+        
+        # ★ A21/A22/시간 정규화로 변경된 내용도 무조건 저장
+        scene["revised_content"] = content
 
     if fixed_count > 0:
-        # 메타 정보로 자동 보강 사실 기록
         rr["_format_auto_fixed"] = fixed_count
     if time_normalized_count > 0:
         rr["_time_marker_normalized"] = time_normalized_count
+    if fusion_split_count > 0:
+        rr["_dialog_action_fusion_split"] = fusion_split_count
+    if clump_split_count > 0:
+        rr["_clumping_action_split"] = clump_split_count
+    if prop_strip_count > 0:
+        rr["_prop_memo_stripped"] = prop_strip_count
 
     return revise_result
 
