@@ -1477,23 +1477,219 @@ def _build_auto_diagnose_for_section_mode() -> dict:
     }
 
 
+def _build_auto_diagnose_from_rewrite_metadata(rewrite_metadata: dict) -> dict:
+    """Rewrite Engine JSON 메타데이터로부터 Stage 1 진단을 코드로 자동 생성.
+
+    REWRITE 제안 6개 + ADD 제안 4개 + MOON 의견을 받아
+    AI 호출 없이 즉시 revision_plan을 완성한다.
+
+    토큰 절감 + 잘림 방지 + 즉시 응답.
+    """
+    import re as _re
+
+    target_scenes = []
+    raw = st.session_state.raw_text or ""
+
+    # 원본 시나리오에서 모든 씬 헤더 추출 (insert_after 검증용)
+    scene_pattern = _re.compile(r'^\s*\*?\*?S#?(\d+)[\.\s]([^\n]*)', _re.MULTILINE)
+    all_scenes = {int(m.group(1)): m.group(2).strip() for m in scene_pattern.finditer(raw)}
+
+    # ── 1. REWRITE 제안 → priority HIGH로 자동 등록 ──
+    rewrite_suggestions = rewrite_metadata.get("rewrite_suggestions", [])
+    for item in rewrite_suggestions:
+        scene_id = item.get("scene_id", "")
+        what = item.get("what_to_change", "")
+        why = item.get("why", "")
+
+        # scene_id에서 숫자 추출
+        m = _re.search(r'\d+', scene_id)
+        if not m:
+            continue
+        scene_num = int(m.group())
+        header = f"S#{scene_num}. {all_scenes.get(scene_num, '')[:80]}"
+
+        target_scenes.append({
+            "scene_id": f"S#{scene_num}",
+            "header": header,
+            "priority": "HIGH",
+            "type": "REWRITE",
+            "what_to_change": [what] if what else ["Rewrite Engine 처방 적용"],
+            "preservation_notes": [
+                "원본 씬의 핵심 사건·인물·장소 유지",
+                "캐릭터 정체성·관계 변경 금지"
+            ],
+            "rewrite_engine_reason": why,
+            "rewrite_engine_source": "rewrite_suggestions",
+        })
+
+    # ── 2. ADD 제안 → type=ADD로 자동 등록 ──
+    add_suggestions = rewrite_metadata.get("add_suggestions", [])
+    add_counter = 0
+    for item in add_suggestions:
+        insert_after = item.get("insert_after", "")
+        scene_type = item.get("type", "추가 시퀀스")
+        content_plan = item.get("content_plan", "")
+        why = item.get("why", "")
+
+        m = _re.search(r'\d+', insert_after)
+        if not m:
+            continue
+        after_num = int(m.group())
+        add_counter += 1
+
+        target_scenes.append({
+            "scene_id": f"(NEW) ADD-{add_counter}",
+            "header": f"(NEW) S#{after_num}-{add_counter} [{scene_type}]",
+            "priority": "HIGH",
+            "type": "ADD",
+            "insert_after": f"S#{after_num}",
+            "what_to_change": [content_plan] if content_plan else [f"{scene_type} 추가"],
+            "preservation_notes": [
+                "기존 씬과 자연스럽게 연결",
+                "보호 구간의 톤·캐릭터 정체성 유지",
+                "헐리우드 작법 표준 시퀀스 구성"
+            ],
+            "context_before": f"S#{after_num} 직후",
+            "context_after": f"S#{after_num + 1}" if (after_num + 1) in all_scenes else "(다음 씬)",
+            "rewrite_engine_reason": why,
+            "rewrite_engine_source": "add_suggestions",
+        })
+
+    # ── 3. weak_zone 시퀀스 → priority HIGH로 추가 등록 ──
+    weak_zones = rewrite_metadata.get("weak_zone_scenes", [])
+    for zone in weak_zones:
+        seq_ref = zone.get("seq_ref", "")
+        m = _re.search(r'\d+', seq_ref)
+        if not m:
+            continue
+        scene_num = int(m.group())
+        # 이미 REWRITE에 있으면 스킵
+        if any(s.get("scene_id") == f"S#{scene_num}" for s in target_scenes):
+            continue
+
+        header = f"S#{scene_num}. {all_scenes.get(scene_num, '')[:80]}"
+        hook = zone.get("hook_suggestion", "")
+        punch = zone.get("punch_suggestion", "")
+
+        target_scenes.append({
+            "scene_id": f"S#{scene_num}",
+            "header": header,
+            "priority": "HIGH",
+            "type": "REWRITE",
+            "what_to_change": [
+                f"훅 강화: {hook[:80]}" if hook else "약점 영역 강화",
+                f"펀치 보강: {punch[:80]}" if punch else "장르 재미 회복"
+            ],
+            "preservation_notes": ["원본 핵심 보존", "캐릭터 일관성 유지"],
+            "rewrite_engine_source": "weak_zones",
+        })
+
+    # ── 4. MOON 의견 → summary에 통합 ──
+    moon_text = rewrite_metadata.get("moon_opinion_text", "")
+    moon_market = rewrite_metadata.get("moon_market_direction", "")
+    moon_genre = rewrite_metadata.get("moon_genre_strengthening", "")
+    moon_unique = rewrite_metadata.get("moon_unique_value", "")
+
+    moon_parts = []
+    if moon_text:
+        moon_parts.append(f"전체 방향: {moon_text}")
+    if moon_market:
+        moon_parts.append(f"시장: {moon_market}")
+    if moon_genre:
+        moon_parts.append(f"장르 강화: {moon_genre}")
+    if moon_unique:
+        moon_parts.append(f"차별성: {moon_unique}")
+    moon_summary = " / ".join(moon_parts) if moon_parts else ""
+
+    # ── 5. LOCKED 인식 ──
+    locked_text = (st.session_state.locked or "").strip()
+    locked_recognition = []
+    if locked_text:
+        for line in locked_text.split("\n"):
+            line = line.strip()
+            if line:
+                locked_recognition.append({
+                    "category": "사용자 명시",
+                    "item": line,
+                    "scope": "전체"
+                })
+
+    # ── 6. summary 생성 ──
+    rewrite_count = len([s for s in target_scenes if s.get("type") == "REWRITE"])
+    add_count = len([s for s in target_scenes if s.get("type") == "ADD"])
+
+    summary = (
+        f"Rewrite Engine 처방 자동 흡수 — REWRITE {rewrite_count}개 씬 수정 + ADD {add_count}개 씬 추가. "
+        f"AI 호출 없이 코드로 진단 즉시 생성. "
+        f"MOON 의견 → 전체 방향에 강제 반영. "
+        f"보호 구간(작가가 손본 부분)은 그대로 유지하며, 위 처방대로 정밀 수정·추가 진행."
+    )
+    if moon_summary:
+        summary += f"\n\n[MOON 처방] {moon_summary}"
+
+    return {
+        "revision_plan": {
+            "summary": summary,
+            "estimated_scene_count": len(target_scenes),
+            "confidence": 9,
+            "auto_generated": True,
+            "auto_generation_reason": "Rewrite Engine JSON 메타데이터로부터 코드로 즉시 생성 (토큰 절약·잘림 방지)",
+            "locked_recognition": locked_recognition,
+            "locked_conflicts": [],
+            "target_scenes": target_scenes,
+            "out_of_scope": [],
+            "moon_directives": {
+                "overall": moon_text,
+                "market": moon_market,
+                "genre": moon_genre,
+                "unique": moon_unique,
+            },
+            "rewrite_engine_absorbed": True,
+        }
+    }
+
+
 def run_diagnose(client):
     """Stage 1: 진단 + 수정 플랜 생성.
 
-    구간 모드(이어쓰기/부분수정): 코드로 자동 생성 (Fast Path).
-    전체 각색 모드: AI에게 진단 시킴.
+    Fast Path 우선순위:
+    1. 구간 모드(이어쓰기/부분수정) → 코드 자동 생성
+    2. Rewrite JSON 있음 (REWRITE/ADD 제안) → 코드 자동 생성
+    3. 그 외 (순수 전체 각색) → AI 진단
     """
 
     # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱)
     pre_results = run_v2_pre_analyses(client)
 
-    # ★ Fast Path — 구간 모드에서는 진단을 코드로 자동 생성
+    # ★ Fast Path 1 — 구간 모드 (이어쓰기/부분수정)
     if (st.session_state.section_mode
             and st.session_state.revision_ranges):
         st.success("⚡ 구간 모드 — 진단 자동 생성 (AI 호출 없이 즉시 완료)")
         return _build_auto_diagnose_for_section_mode()
 
-    # 전체 각색 모드만 AI 진단
+    # ★ Fast Path 2 — Rewrite Engine JSON 흡수 시
+    rewrite_meta = pre_results.get("rewrite_metadata") or st.session_state.rewrite_metadata
+    if rewrite_meta and isinstance(rewrite_meta, dict):
+        has_rewrite = bool(rewrite_meta.get("rewrite_suggestions"))
+        has_add = bool(rewrite_meta.get("add_suggestions"))
+        has_weak = bool(rewrite_meta.get("weak_zone_scenes"))
+        has_moon = bool(rewrite_meta.get("moon_opinion_text"))
+
+        # REWRITE 제안 또는 ADD 제안 또는 weak_zone 중 하나라도 있으면 Fast Path 사용
+        if has_rewrite or has_add or has_weak:
+            r_count = len(rewrite_meta.get("rewrite_suggestions", []))
+            a_count = len(rewrite_meta.get("add_suggestions", []))
+            w_count = len(rewrite_meta.get("weak_zone_scenes", []))
+            st.success(
+                f"⚡ Rewrite Engine 처방 자동 흡수 — 진단 즉시 완료 (AI 호출 없이)\n\n"
+                f"  • REWRITE 제안 {r_count}개 → priority HIGH 자동 등록\n"
+                f"  • ADD 제안 {a_count}개 → type=ADD 자동 등록\n"
+                f"  • weak_zone {w_count}개 → priority HIGH 자동 격상\n"
+                f"  • MOON 의견 {'반영됨' if has_moon else '없음'}"
+            )
+            return _build_auto_diagnose_from_rewrite_metadata(rewrite_meta)
+
+    # ★ Fast Path 3 — 일반 전체 각색 (AI 진단)
     prompt_text = build_diagnose_prompt(
         raw_text=st.session_state.raw_text,
         instruction=st.session_state.instruction,
