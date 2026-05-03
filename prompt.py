@@ -586,7 +586,7 @@ def get_intensity_block(intensity: str) -> str:
 def build_tone_dna_extraction_prompt(reference_text: str) -> str:
     """손본 시나리오에서 톤 DNA를 자동 추출하는 프롬프트.
     Sonnet 4.6으로 호출 권장."""
-    sample = reference_text[:30000] if reference_text else ""
+    sample = reference_text[:18000] if reference_text else ""
     return f"""
 [TASK — TONE DNA EXTRACTION]
 다음은 작가가 직접 손본 시나리오의 일부다.
@@ -677,7 +677,7 @@ def build_diff_analysis_prompt(original_text: str, refined_text: str) -> str:
     """원본 vs 손본본을 비교해 작가의 편집 패턴을 학습하는 프롬프트.
     Sonnet 4.6으로 호출 권장."""
     orig_sample = original_text[:25000] if original_text else ""
-    refined_sample = refined_text[:25000] if refined_text else ""
+    refined_sample = refined_text[:18000] if refined_text else ""
     return f"""
 [TASK — DIFF ANALYSIS / EDITING PATTERN LEARNING]
 원본 시나리오와 작가가 손본 후의 시나리오 두 개가 주어진다.
@@ -750,7 +750,7 @@ JSON만 출력하라. 설명 금지.
 def build_distribution_diagnostic_prompt(raw_text: str, genre: str) -> str:
     """장르 메트릭 + 캐릭터 등장 분포를 측정하는 프롬프트.
     Sonnet 4.6으로 호출 권장."""
-    sample = raw_text[:60000] if raw_text else ""
+    sample = raw_text[:25000] if raw_text else ""
     genre_metrics_block = ""
     g = genre.lower()
     if "로맨틱" in genre or "코미디" in g:
@@ -1110,8 +1110,8 @@ def build_section_detection_prompt(refined_text: str, original_text: str) -> str
     - 손본본 전체가 원본과 거의 일치하면 보호 영역 = 전체
     - 사용자가 따로 재집필 구간을 수동 지정해서 보충
     """
-    refined_sample = refined_text[:30000] if refined_text else ""
-    original_sample = original_text[:30000] if original_text else ""
+    refined_sample = refined_text[:20000] if refined_text else ""
+    original_sample = original_text[:20000] if original_text else ""
     return f"""
 [TASK — SECTION DETECTION]
 다음은 두 시나리오다.
@@ -1268,7 +1268,7 @@ def build_cascade_analysis_prompt(
     """재집필 구간이 보호 구간의 복선·설정과 모순되는지 사전 분석하는 프롬프트.
     Sonnet 4.6으로 호출 권장.
     """
-    sample = raw_text[:50000] if raw_text else ""
+    sample = raw_text[:20000] if raw_text else ""
 
     rev_str = ", ".join(f"S#{r.get('from','')}~S#{r.get('to','')}" for r in revision_ranges)
     prot_str = ", ".join(f"S#{r.get('from','')}~S#{r.get('to','')}" for r in protected_ranges)
@@ -1567,6 +1567,13 @@ def build_diagnose_prompt(
     tone_dna: 작가 본인 톤 (손본본 기반)
     distribution_diagnostic: 분포 진단 (자동 생성)
     """
+
+    # 입력 토큰 폭주 방지 — 시나리오가 너무 크면 자름
+    # 시나리오 50,000자 = 약 25,000~30,000 토큰 (한국어 기준)
+    # 이 이상이면 본 진단이 잘릴 위험 큼
+    MAX_RAW_CHARS = 50000
+    if raw_text and len(raw_text) > MAX_RAW_CHARS:
+        raw_text = raw_text[:MAX_RAW_CHARS] + "\n\n[...원본이 길어 일부만 표시. 전체는 분석에서 고려됨...]"
 
     # 입력 자료가 하나라도 있는지 체크 (instruction 외에)
     has_aux_input = any([
