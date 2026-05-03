@@ -10,7 +10,9 @@
 # v2.8 (2026-05-03)  ★ Beat-Aware Diagnose — 15-Beat 구조 인식 + 약점 비트 보강 ADD 자동 분배.
 #                    71→100씬 확장 같은 대규모 작업 지원.
 # v2.9 (2026-05-03)  ★ 비트 보강 확장 모드 (4번째 작업 모드) — Beat-Aware + LOCKED 강제 차단.
-#                    보호 구간 침범 자동 차단 + ADD 위치 자동 우회.
+# v3.0 (2026-05-03)  ★ 라우팅 버그 수정 — 모드 전환 시 잔존 데이터 강제 초기화.
+#                    Fast Path 0 조건 강화 (work_mode in {expansion} only).
+#                    진단 직전 모드 미리보기 박스 + 라우팅 디버그 표시.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -2716,22 +2718,50 @@ def run_diagnose(client):
     pre_results = run_v2_pre_analyses(client)
 
     work_mode = st.session_state.get("work_mode", "")
-    target_added = st.session_state.get("target_added_scenes", 0)
+    target_added_raw = st.session_state.get("target_added_scenes", 0)
+    try:
+        target_added = int(target_added_raw) if target_added_raw else 0
+    except (ValueError, TypeError):
+        target_added = 0
     batch_size = st.session_state.get("diagnose_batch_size", 12)
 
-    # ★ Fast Path 0 — v2.9 비트 보강 확장 모드 (최우선)
+    # ★★★ v3.0 라우팅 디버그 안내 — 어느 Fast Path를 탔는지 명시
+    st.markdown(
+        f'<div style="background:#F3F4F6; padding:8px 12px; border-radius:4px; '
+        f'border-left:3px solid #6B7280; margin:6px 0; font-size:0.82rem; color:#374151;">'
+        f'🔍 <b>라우팅 상태:</b> work_mode=<code>{work_mode}</code>, '
+        f'target_added=<code>{target_added}</code>, '
+        f'section_mode=<code>{st.session_state.get("section_mode", False)}</code>, '
+        f'protected={len(st.session_state.get("protected_ranges", []))}건, '
+        f'revision={len(st.session_state.get("revision_ranges", []))}건'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+    # ★ Fast Path 0 — v3.0 비트 보강 확장 모드 (최우선, 강화 조건)
     if work_mode == "expansion" and target_added > 0:
+        st.markdown(
+            '<div style="background:#FCE7F3; padding:8px 12px; border-radius:4px; '
+            'border-left:3px solid #EC4899; margin:6px 0; font-size:0.85rem;">'
+            '🎯 <b>Fast Path 0 진입:</b> v3.0 비트 보강 확장 모드 → run_diagnose_beat_expansion()'
+            '</div>',
+            unsafe_allow_html=True
+        )
         return run_diagnose_beat_expansion(
             client,
             batch_size=batch_size,
             target_added_scenes=target_added,
         )
 
-    # ★ Fast Path 1 — 구간 모드 (이어쓰기/부분수정)
+    # ★ Fast Path 1 — 구간 모드 (이어쓰기/부분수정만)
+    # ★ v3.0: expansion 모드는 절대 여기로 떨어지지 않도록 명시 차단
     if (st.session_state.section_mode
             and st.session_state.revision_ranges
-            and work_mode != "expansion"):  # expansion은 위에서 처리됨
-        st.success("⚡ 구간 모드 — 진단 자동 생성 (AI 호출 없이 즉시 완료)")
+            and work_mode in ("continuation", "partial")):
+        st.success(
+            f"⚡ Fast Path 1 진입: 구간 모드(<b>{work_mode}</b>) — "
+            f"진단 자동 생성 (AI 호출 없이 즉시 완료)"
+        )
         return _build_auto_diagnose_for_section_mode()
 
     # ★ Fast Path 2 — Rewrite Engine JSON 흡수 시
@@ -3440,7 +3470,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.9</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.0</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -3512,19 +3542,25 @@ def show_step_0_input():
                 type=btn_type,
                 help=desc,
             ):
+                # ★★★ v3.0: 모드 전환 시 이전 모드의 잔존 데이터 완전 초기화 ★★★
+                # (이전 이어쓰기 세션의 자동 감지 결과가 expansion 모드에 잔존하던 버그 수정)
                 st.session_state.work_mode = mode_id
-                # 모드 전환 시 구간 정보 초기화 (전체↔부분 수정 변경 시 혼선 방지)
+                st.session_state.section_detection = None
+                st.session_state.protected_ranges = []
+                st.session_state.revision_ranges = []
+                st.session_state.cascade_analysis = None
+                st.session_state.boundary_info = ""
+
                 if mode_id == "full":
                     st.session_state.section_mode = False
-                    st.session_state.protected_ranges = []
-                    st.session_state.revision_ranges = []
                     st.session_state.target_added_scenes = 0
                 elif mode_id == "expansion":
-                    # 비트 보강 확장: section_mode 켜되 target_added_scenes 활성화
+                    # 비트 보강 확장: section_mode 켜되 revision_ranges는 사용자 입력 후 채워짐
                     st.session_state.section_mode = True
                     if st.session_state.target_added_scenes <= 0:
                         st.session_state.target_added_scenes = 29  # 기본값
                 else:
+                    # continuation / partial
                     st.session_state.section_mode = True
                     st.session_state.target_added_scenes = 0
                 st.rerun()
@@ -4487,9 +4523,78 @@ def show_step_0_input():
                         f"💡 추가 씬 0 = 일반 진단 모드 (v2.7). 비트 매핑 단계 생략."
                     )
 
+    # ★★★ v3.0: 진단 직전 라우팅 미리보기 — 어느 모드로 진단할지 명확히 ★★★
+    work_mode_v30 = st.session_state.get("work_mode", "")
+    target_added_v30 = st.session_state.get("target_added_scenes", 0)
+
+    if work_mode_v30 == "expansion" and target_added_v30 > 0:
+        st.markdown(
+            f'<div style="background:#FCE7F3; padding:14px 18px; border-radius:8px; '
+            f'border-left:4px solid #EC4899; margin:12px 0;">'
+            f'<b style="font-size:1rem;">🎯 진단 모드: 비트 보강 확장 (v3.0)</b><br>'
+            f'<span style="font-size:0.88rem; color:#374151;">'
+            f'• 추가할 씬 수: <b>+{target_added_v30}씬</b><br>'
+            f'• 보호 구간(LOCKED): <b>'
+            + (", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in st.session_state.get("protected_ranges", [])) or "(미설정)")
+            + f'</b><br>'
+            f'• 작업 영역: <b>'
+            + (", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in st.session_state.get("revision_ranges", [])) or "(자동 산출)")
+            + f'</b><br>'
+            f'<br>'
+            f'진단 시 Phase 1(15-Beat 매핑) → Phase 2(비트 인식 진단) → Phase 5(LOCKED 차단)이 자동 진행됩니다.'
+            f'</span></div>',
+            unsafe_allow_html=True
+        )
+    elif work_mode_v30 == "continuation":
+        st.markdown(
+            '<div style="background:#DBEAFE; padding:12px 16px; border-radius:8px; '
+            'border-left:4px solid #3B82F6; margin:12px 0;">'
+            '<b>📝 진단 모드: 이어쓰기 (Fast Path 1)</b> — '
+            '손본 시나리오의 톤을 학습해 재집필 구간을 같은 결로 다시 씁니다. '
+            '<span style="color:#666;">(AI 진단 호출 없이 즉시 완료)</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    elif work_mode_v30 == "partial":
+        st.markdown(
+            '<div style="background:#DCFCE7; padding:12px 16px; border-radius:8px; '
+            'border-left:4px solid #22C55E; margin:12px 0;">'
+            '<b>✂️ 진단 모드: 부분 수정 (Fast Path 1)</b> — '
+            '지정 구간만 재집필. 나머지는 보호.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+    elif work_mode_v30 == "full":
+        if target_added_v30 > 0:
+            st.markdown(
+                f'<div style="background:#FEF3C7; padding:12px 16px; border-radius:8px; '
+                f'border-left:4px solid #F59E0B; margin:12px 0;">'
+                f'<b>🎯 진단 모드: 전체 각색 + Beat-Aware (v2.8)</b> — '
+                f'+{target_added_v30}씬 추가 모드'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div style="background:#F3F4F6; padding:12px 16px; border-radius:8px; '
+                'border-left:4px solid #6B7280; margin:12px 0;">'
+                '<b>📝 진단 모드: 전체 각색 (v2.7)</b> — 자동 배치 분할 진단'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
     c1, c2 = st.columns([1, 1])
     with c1:
-        if st.button("🔬 Stage 1: 진단 시작 (DIAGNOSE)",
+        # ★ v3.0: 버튼 라벨에 현재 모드 명시
+        btn_label_map = {
+            "expansion": "🎯 비트 보강 확장 진단 시작",
+            "continuation": "📝 이어쓰기 진단 시작",
+            "partial": "✂️ 부분 수정 진단 시작",
+            "full": "📝 전체 각색 진단 시작",
+        }
+        btn_label = btn_label_map.get(work_mode_v30, "🔬 Stage 1: 진단 시작 (DIAGNOSE)")
+
+        if st.button(btn_label,
                      disabled=not ready, use_container_width=True):
             client = get_client()
             if client:
@@ -5195,7 +5300,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.9",
+                "engine": "BLUE JEANS REVISE ENGINE v3.0",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -5252,11 +5357,12 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.9  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.0  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
-    '<span style="color:#EC4899;">Beat Expansion Mode</span>'
+    '<span style="color:#EC4899;">Beat Expansion Mode</span>  ·  '
+    '<span style="color:#6B7280;">Routing Hardened</span>'
     '</div>',
     unsafe_allow_html=True,
 )
