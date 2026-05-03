@@ -351,8 +351,11 @@ def get_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def call_claude(client, prompt_text: str, model: str, max_tokens: int = 32000, retries: int = 2):
-    """Claude API 스트리밍 호출 + max_tokens 잘림 시 자동 증량 재시도.
+def call_claude(client, prompt_text: str, model: str, max_tokens: int = 32000, retries: int = 1):
+    """Claude API 스트리밍 호출 + max_tokens 잘림 시 1회만 자동 증량 재시도.
+
+    재시도 제한: 기본 1회 (토큰 낭비 방지).
+    잘림이 반복되면 사용자에게 알리고 중단하여 결과를 그대로 반환.
 
     모델별 한도:
     - Sonnet 4.6: 최대 64,000 토큰
@@ -385,18 +388,20 @@ def call_claude(client, prompt_text: str, model: str, max_tokens: int = 32000, r
                 if attempt < retries and current_tokens < absolute_cap:
                     next_tokens = min(int(current_tokens * 1.5), absolute_cap)
                     if next_tokens == current_tokens:
-                        # 이미 한도에 도달
-                        st.warning(f"⚠️ 모델 한도({absolute_cap} 토큰)에서 응답이 잘렸습니다. "
-                                   "결과가 불완전할 수 있습니다. 시나리오를 더 짧게 분할하거나 "
-                                   "지시문을 간소화하는 것을 권장합니다.")
+                        # 이미 한도에 도달 — 즉시 중단
+                        st.warning(f"⚠️ 모델 한도({absolute_cap:,} 토큰)에서 응답이 잘렸습니다. "
+                                   "지금 결과로 진행합니다. 이상하면 시나리오를 더 짧게 분할하거나 "
+                                   "지시문을 간소화하세요.")
                         return collected
                     st.info(f"🔄 응답이 {current_tokens:,} 토큰에서 잘렸습니다. "
-                            f"{next_tokens:,} 토큰으로 재시도합니다... ({attempt+2}/{1+retries})")
+                            f"{next_tokens:,} 토큰으로 1회만 재시도합니다.")
                     current_tokens = next_tokens
                     continue
                 else:
-                    st.warning(f"⚠️ {retries}회 재시도 후에도 {current_tokens:,} 토큰에서 잘렸습니다. "
-                               "결과가 불완전할 수 있습니다.")
+                    # 1회 재시도 후에도 잘렸으면 그대로 진행 (추가 재시도 안 함)
+                    st.warning(f"⚠️ 재시도 후에도 응답이 잘렸습니다 ({current_tokens:,} 토큰). "
+                               "지금 결과로 진행합니다 — 추가 재시도는 토큰 낭비입니다. "
+                               "결과가 불완전하면 입력을 간소화하세요.")
             return collected
         except Exception as e:
             st.error(f"❌ API 오류: {type(e).__name__} — {e}")
@@ -1154,7 +1159,7 @@ def run_v2_pre_analyses(client) -> dict:
             and not st.session_state.tone_dna):
         with st.spinner("📐 톤 DNA 자동 추출 중... (Sonnet 4.6)"):
             prompt_text = build_tone_dna_extraction_prompt(st.session_state.tone_ref_text)
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
             if raw:
                 tone_dna = parse_json(raw)
                 if tone_dna:
@@ -1184,21 +1189,23 @@ def run_v2_pre_analyses(client) -> dict:
                     summary = diff.get("diff_analysis", {}).get("summary", "편집 패턴 학습 완료")
                     st.success(f"✅ Diff 학습 완료: {summary[:120]}")
 
-    # 3. 분포 진단 (항상 실행)
-    with st.spinner("📊 장르 메트릭 + 캐릭터 분포 진단 중... (Sonnet 4.6)"):
-        prompt_text = build_distribution_diagnostic_prompt(
-            st.session_state.raw_text,
-            st.session_state.genre
-        )
-        raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
-        if raw:
-            dist = parse_json(raw)
-            if dist:
-                results["distribution_diagnostic"] = dist
-                st.session_state.distribution_diagnostic = dist
-                summary = dist.get("distribution_diagnostic", {}).get("summary", "분포 진단 완료")
-                upgrades = dist.get("distribution_diagnostic", {}).get("auto_priority_upgrades", [])
-                st.success(f"✅ 분포 진단 완료: {summary[:100]}  (자동 격상 {len(upgrades)}개)")
+    # 3. 분포 진단 (전체 각색 모드에서만 실행 — 구간 모드는 보호 영역이 이미 OK라 불필요)
+    if (not st.session_state.section_mode
+            and not st.session_state.distribution_diagnostic):
+        with st.spinner("📊 장르 메트릭 + 캐릭터 분포 진단 중... (Sonnet 4.6)"):
+            prompt_text = build_distribution_diagnostic_prompt(
+                st.session_state.raw_text,
+                st.session_state.genre
+            )
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
+            if raw:
+                dist = parse_json(raw)
+                if dist:
+                    results["distribution_diagnostic"] = dist
+                    st.session_state.distribution_diagnostic = dist
+                    summary = dist.get("distribution_diagnostic", {}).get("summary", "분포 진단 완료")
+                    upgrades = dist.get("distribution_diagnostic", {}).get("auto_priority_upgrades", [])
+                    st.success(f"✅ 분포 진단 완료: {summary[:100]}  (자동 격상 {len(upgrades)}개)")
 
     # 4. Rewrite 메타 흡수
     if st.session_state.rewrite_json_text and st.session_state.rewrite_json_text.strip():
@@ -1222,7 +1229,7 @@ def run_v2_pre_analyses(client) -> dict:
                 st.session_state.genre_ref_texts,
                 st.session_state.genre
             )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
             if raw:
                 gd = parse_json(raw)
                 if gd:
@@ -1241,7 +1248,7 @@ def run_v2_pre_analyses(client) -> dict:
                 refined_text=st.session_state.diff_refined_text,
                 original_text=st.session_state.raw_text,
             )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=10000)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=6000)
             if raw:
                 sd = parse_json(raw)
                 if sd:
@@ -1292,7 +1299,7 @@ def run_v2_pre_analyses(client) -> dict:
                 protected_ranges=st.session_state.protected_ranges,
                 raw_text=st.session_state.raw_text,
             )
-            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=8000)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=5000)
             if raw:
                 ca = parse_json(raw)
                 if ca:
@@ -2043,16 +2050,30 @@ def show_step_0_input():
 
         # 탭 3: 장르 DNA (참고작 1~3편)
         with tab_genre:
-            st.caption("같은 장르 명작 시나리오 1~3편을 업로드하면 장르의 본질(코믹 폭발·정보 비대칭·일상 균열 등)을 정량 메트릭으로 추출해 집필 시 강제 룰로 적용합니다.")
+            # 가장 위에 '선택사항' 강조
+            st.markdown(
+                '<div style="background:#EEF3FB; padding:10px 14px; border-radius:6px; '
+                'border-left:3px solid #4A6CF7; margin:8px 0; font-size:0.88rem;">'
+                '<b>💡 장르 DNA는 100% 선택사항입니다.</b><br>'
+                '없어도 엔진은 정상 작동합니다 (일반 장르 룰 적용).<br>'
+                '있으면 같은 장르 명작들의 본질(코믹 폭발·정보 비대칭 등)을 정량적으로 강제할 수 있습니다.'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
             st.caption("📝 한국어·영문 시나리오 모두 가능. 영문 명작도 자유롭게 사용하세요 (출력은 항상 한국어).")
 
             # ─────────────────────────────────────────
             # STEP 1. 참고작 업로드 (메인 동선)
             # ─────────────────────────────────────────
-            st.markdown('<div style="background:#FFF8DD; padding:8px 12px; border-radius:6px; '
-                        'border-left:3px solid #FFCB05; margin:8px 0; font-size:0.88rem;">'
-                        '<b>① 처음 사용</b> — 같은 장르 명작 1~3편 업로드 → '
-                        'Stage 1 진단 시작 시 장르 DNA 자동 추출 → 그 DNA로 시나리오 진단'
+            st.markdown('<div style="background:#FFF8DD; padding:10px 14px; border-radius:6px; '
+                        'border-left:3px solid #FFCB05; margin:12px 0 8px; font-size:0.88rem;">'
+                        '<b>① 처음 사용 — 참고작이 없으면?</b><br>'
+                        '아래 사이트에서 무료로 다운로드 가능합니다:<br>'
+                        '• <b>IMSDb</b> (imsdb.com) — Hollywood 명작 다수<br>'
+                        '• <b>SimplyScripts</b> (simplyscripts.com) — 장르별 정리<br>'
+                        '• <b>Script Slug</b> (scriptslug.com) — 최신작<br>'
+                        '같은 장르 명작 1~3편 다운 → 아래 업로드 → 분석 시 장르 DNA 자동 추출'
                         '</div>', unsafe_allow_html=True)
 
             genre_files = st.file_uploader(
