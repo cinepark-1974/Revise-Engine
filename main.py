@@ -4,7 +4,12 @@
 # =================================================================
 # © 2026 BLUE JEANS PICTURES. All rights reserved.
 #
-# v1.0 (2026-04-21)
+# v1.0 (2026-04-21)  초기 릴리스
+# v2.6 (2026-04-30)  헐리우드 작법 A25~A28 추가
+# v2.7 (2026-05-03)  ★ 자동 배치 분할 시스템 — 토큰 잘림 결함 해결
+#                    71씬 같은 대형 시나리오를 자동으로 N씬 단위 배치 분할 →
+#                    배치별 별도 LLM 호출 → 결과 병합 → 통합 DOCX 출력.
+#                    헐리우드 형식(EXT./INT.)도 자동 인식.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -247,7 +252,8 @@ INIT_STATE = {
     "revise_batches": None,     # 배치 분할 결과 (list)
     "batch_results": {},        # {batch_index: revise_result, ...}
     "current_batch": 0,         # 현재 처리 중인 배치 (1부터)
-    "batch_size": 6,            # 한 배치당 씬 개수
+    "batch_size": 6,            # 한 배치당 씬 개수 (REVISE 단계, 수정 대상 씬 기준)
+    "diagnose_batch_size": 12,  # ★ v2.7 — DIAGNOSE 자동 분할 배치 사이즈 (시나리오 씬 기준)
     "revise_result": None,      # Stage 2 통합 결과
     "verify_result": None,      # Stage 3 JSON 결과
     # v2.0 — 톤 레퍼런스 + Diff 학습 + Rewrite 메타
@@ -1780,6 +1786,364 @@ def _build_auto_diagnose_from_rewrite_metadata(rewrite_metadata: dict) -> dict:
     }
 
 
+# =================================================================
+# ★★★ v2.7 자동 배치 분할 시스템 ★★★
+# 71씬 같은 대형 시나리오를 자동으로 N씬 단위로 쪼개
+# 각 배치를 별도 LLM 호출로 진단·집필 후 결과 병합
+# =================================================================
+
+import re as _re_v27
+
+
+def _detect_scene_count(scenario_text: str) -> int:
+    """시나리오에서 씬 헤더 패턴을 카운트하여 총 씬 수 반환.
+
+    인식 패턴 (우선순위):
+    1. 'S#숫자.' 한국 시나리오 표준 형식 (S#1., S#1, S# 1 등)
+    2. 'EXT./INT. 장소 — DAY/NIGHT' 헐리우드 형식 (테이스티 러브 v3.2 같은 케이스)
+    3. '씬 숫자' 또는 'Scene 숫자' 폴백
+
+    Returns:
+        총 씬 개수 (정수). 인식 실패 시 0.
+    """
+    if not scenario_text:
+        return 0
+
+    # 패턴 1: 'S#숫자' (가장 흔한 한국 시나리오 형식)
+    pattern_a = r'(?:^|\n)\s*S\s*#\s*(\d+)\b'
+    matches = _re_v27.findall(pattern_a, scenario_text, flags=_re_v27.MULTILINE)
+    if matches:
+        nums = sorted(set(int(m) for m in matches))
+        return len(nums)
+
+    # 패턴 2: 'EXT./INT. ... — DAY/NIGHT' 헐리우드 형식
+    # 예: "EXT. 한남시장 (한남동 재래시장) — DAY"
+    #     "INT. 카페 - 낮"
+    pattern_b = r'(?:^|\n)\s*(?:EXT|INT|EXT\./INT|I/E)\.\s+\S'
+    matches_b = _re_v27.findall(pattern_b, scenario_text, flags=_re_v27.MULTILINE | _re_v27.IGNORECASE)
+    if matches_b:
+        return len(matches_b)
+
+    # 패턴 3: 폴백 — '씬 숫자' 또는 'Scene 숫자'
+    pattern_c = r'(?:^|\n)\s*(?:씬|Scene)\s*(\d+)'
+    matches_c = _re_v27.findall(pattern_c, scenario_text, flags=_re_v27.MULTILINE | _re_v27.IGNORECASE)
+    if matches_c:
+        nums = sorted(set(int(m) for m in matches_c))
+        return len(nums)
+
+    return 0
+
+
+def _split_scenario_by_scenes(scenario_text: str, batch_size: int = 12) -> list:
+    """시나리오 본문을 N씬 단위로 분할.
+
+    인식 형식:
+    - 'S#숫자' 한국 시나리오 표준 (씬 번호 사용)
+    - 'EXT./INT. ... — DAY/NIGHT' 헐리우드 (순서 인덱스 사용)
+    - '씬/Scene 숫자' 폴백
+
+    Args:
+        scenario_text: 전체 시나리오 텍스트
+        batch_size: 한 배치당 씬 개수 (기본 12)
+
+    Returns:
+        [
+            {
+                "batch_index": 1,
+                "first_scene": 1,
+                "last_scene": 12,
+                "scene_range": "S#1~S#12",
+                "scenario_chunk": "...",
+                "scene_count": 12,
+                "scene_format": "S#" | "EXT/INT" | "FALLBACK"
+            },
+            ...
+        ]
+    """
+    if not scenario_text:
+        return []
+
+    scene_positions = []  # [(scene_label, scene_num, start_char_index), ...]
+    scene_format = None
+
+    # ─────────────────────────────────────────
+    # 1차 시도: 'S#숫자' 한국 시나리오 형식
+    # ─────────────────────────────────────────
+    pattern_a = r'(?:^|\n)\s*S\s*#\s*(\d+)\b'
+    for m in _re_v27.finditer(pattern_a, scenario_text, flags=_re_v27.MULTILINE):
+        scene_num = int(m.group(1))
+        actual_start = m.start()
+        if actual_start < len(scenario_text) and scenario_text[actual_start] == '\n':
+            actual_start += 1
+        scene_positions.append((f"S#{scene_num}", scene_num, actual_start))
+
+    if scene_positions:
+        scene_format = "S#"
+    else:
+        # ─────────────────────────────────────────
+        # 2차 시도: 'EXT./INT.' 헐리우드 형식 (순서 인덱스 사용)
+        # ─────────────────────────────────────────
+        pattern_b = r'(?:^|\n)\s*(?:EXT|INT|EXT\./INT|I/E)\.\s+\S'
+        seq_idx = 0
+        for m in _re_v27.finditer(pattern_b, scenario_text, flags=_re_v27.MULTILINE | _re_v27.IGNORECASE):
+            seq_idx += 1
+            actual_start = m.start()
+            if actual_start < len(scenario_text) and scenario_text[actual_start] == '\n':
+                actual_start += 1
+            scene_positions.append((f"S#{seq_idx}", seq_idx, actual_start))
+
+        if scene_positions:
+            scene_format = "EXT/INT"
+        else:
+            # ─────────────────────────────────────────
+            # 3차 시도: '씬/Scene 숫자' 폴백
+            # ─────────────────────────────────────────
+            pattern_c = r'(?:^|\n)\s*(?:씬|Scene)\s*(\d+)'
+            for m in _re_v27.finditer(pattern_c, scenario_text, flags=_re_v27.MULTILINE | _re_v27.IGNORECASE):
+                scene_num = int(m.group(1))
+                actual_start = m.start()
+                if actual_start < len(scenario_text) and scenario_text[actual_start] == '\n':
+                    actual_start += 1
+                scene_positions.append((f"S#{scene_num}", scene_num, actual_start))
+            if scene_positions:
+                scene_format = "FALLBACK"
+
+    if not scene_positions:
+        # 그래도 못 찾음 → 단일 배치로 반환
+        return [{
+            "batch_index": 1,
+            "first_scene": 0,
+            "last_scene": 0,
+            "scene_range": "(씬 인식 실패)",
+            "scenario_chunk": scenario_text,
+            "scene_count": 0,
+            "scene_format": "NONE",
+        }]
+
+    # 위치 기준 정렬 후 중복 제거 (S#숫자 모드에서만 의미 있음)
+    scene_positions.sort(key=lambda x: x[2])
+
+    # S# 모드일 때만 동일 번호 중복 제거 (EXT/INT는 모든 출현이 별개 씬)
+    if scene_format in ("S#", "FALLBACK"):
+        seen_nums = set()
+        unique_positions = []
+        for label, num, pos in scene_positions:
+            if num not in seen_nums:
+                seen_nums.add(num)
+                unique_positions.append((label, num, pos))
+        scene_positions = unique_positions
+
+    # 배치 분할
+    batches = []
+    n_scenes = len(scene_positions)
+    n_batches = (n_scenes + batch_size - 1) // batch_size
+
+    for batch_idx in range(n_batches):
+        start_i = batch_idx * batch_size
+        end_i = min(start_i + batch_size, n_scenes)
+
+        first_label, first_scene_num, first_pos = scene_positions[start_i]
+        last_label, last_scene_num, _ = scene_positions[end_i - 1]
+
+        if end_i < n_scenes:
+            _, _, chunk_end_pos = scene_positions[end_i]
+        else:
+            chunk_end_pos = len(scenario_text)
+
+        chunk = scenario_text[first_pos:chunk_end_pos].strip()
+
+        batches.append({
+            "batch_index": batch_idx + 1,
+            "first_scene": first_scene_num,
+            "last_scene": last_scene_num,
+            "scene_range": f"{first_label}~{last_label}",
+            "scenario_chunk": chunk,
+            "scene_count": end_i - start_i,
+            "scene_format": scene_format,
+        })
+
+    return batches
+
+
+def run_diagnose_with_auto_batch(client, batch_size: int = 12):
+    """v2.7 — 시나리오를 자동 분할하여 배치별 진단 후 결과 병합.
+
+    호출 흐름:
+    1. _detect_scene_count로 총 씬 수 파악
+    2. _split_scenario_by_scenes로 청크 분할
+    3. 각 청크마다 build_diagnose_prompt(batch_info=...) 호출
+    4. revision_items[]를 모두 병합하여 통합 diagnose_result 반환
+
+    Args:
+        client: Anthropic 클라이언트
+        batch_size: 한 배치당 씬 개수 (기본 12)
+
+    Returns:
+        통합된 diagnose_result dict, 실패 시 None
+    """
+    # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱)
+    pre_results = run_v2_pre_analyses(client)
+
+    raw_text = st.session_state.raw_text
+    if not raw_text:
+        st.error("원본 시나리오가 비어 있습니다.")
+        return None
+
+    # 씬 수 감지
+    scene_count = _detect_scene_count(raw_text)
+
+    # 분할
+    batches = _split_scenario_by_scenes(raw_text, batch_size=batch_size)
+    n_batches = len(batches)
+
+    if n_batches == 0:
+        st.error("씬 인식에 실패했습니다. 'S#숫자' 형식이 시나리오에 있어야 합니다.")
+        return None
+
+    # 단일 배치면 기존 방식과 동일 (배치 정보 없이 호출)
+    if n_batches == 1:
+        st.info(f"🔍 시나리오 분석: {scene_count}씬 → 단일 배치 처리 (분할 불필요)")
+        return _run_diagnose_single(client, raw_text, pre_results, batch_info=None)
+
+    # 다중 배치 처리
+    st.info(
+        f"🔍 시나리오 분석: **{scene_count}씬** → "
+        f"**{n_batches}배치**로 자동 분할 (배치당 약 {batch_size}씬)"
+    )
+
+    progress_bar = st.progress(0.0, text="진단 준비 중...")
+    merged_target_scenes = []
+    summaries = []
+    out_of_scope_all = []
+    confidences = []
+    locked_summaries = []
+    conflicts_all = []
+
+    for i, batch in enumerate(batches, start=1):
+        progress_bar.progress(
+            (i - 1) / n_batches,
+            text=f"🔬 배치 {i}/{n_batches} 진단 중... ({batch['scene_range']})"
+        )
+
+        batch_info = {
+            "batch_index": i,
+            "total_batches": n_batches,
+            "scene_range": batch["scene_range"],
+            "first_scene": batch["first_scene"],
+            "last_scene": batch["last_scene"],
+            "scene_format": batch.get("scene_format", "S#"),
+        }
+
+        result = _run_diagnose_single(
+            client,
+            raw_text=batch["scenario_chunk"],
+            pre_results=pre_results,
+            batch_info=batch_info,
+            retry_count=3,
+        )
+
+        if not result:
+            st.warning(
+                f"⚠️ 배치 {i}/{n_batches} ({batch['scene_range']}) 진단 실패. "
+                f"이 배치는 빈 결과로 처리됩니다."
+            )
+            continue
+
+        rp = result.get("revision_plan", {})
+        merged_target_scenes.extend(rp.get("target_scenes", []))
+        s = rp.get("summary", "").strip()
+        if s:
+            summaries.append(f"[{batch['scene_range']}] {s}")
+        oos = rp.get("out_of_scope", [])
+        if oos:
+            out_of_scope_all.extend(oos)
+        c = rp.get("confidence")
+        if isinstance(c, (int, float)):
+            confidences.append(c)
+        ls = rp.get("locked_summary", "").strip()
+        if ls:
+            locked_summaries.append(ls)
+        confs = rp.get("conflicts", [])
+        if confs:
+            conflicts_all.extend(confs)
+
+    progress_bar.progress(1.0, text="✅ 모든 배치 진단 완료. 결과 통합 중...")
+
+    # 통합 결과 구성
+    avg_confidence = round(sum(confidences) / len(confidences), 1) if confidences else 7.0
+    merged_result = {
+        "revision_plan": {
+            "summary": "\n\n".join(summaries) if summaries else "자동 배치 진단 완료.",
+            "locked_summary": "\n".join(locked_summaries) if locked_summaries else "",
+            "conflicts": conflicts_all,
+            "target_scenes": merged_target_scenes,
+            "out_of_scope": out_of_scope_all,
+            "confidence": avg_confidence,
+            "estimated_scene_count": str(len(merged_target_scenes)),
+            "total_scenes": len(merged_target_scenes),
+            "recommended_batches": max(1, (len(merged_target_scenes) + 9) // 10),
+            "batch_strategy": (
+                f"v2.7 자동 분할 진단: 총 {n_batches}개 진단 배치를 통합 → "
+                f"수정 대상 {len(merged_target_scenes)}개 씬 식별. "
+                f"REVISE 단계는 별도 배치 정책 적용."
+            ),
+            "auto_batch_diagnose": {
+                "diagnose_batch_count": n_batches,
+                "diagnose_batch_size": batch_size,
+                "total_scenes_detected": scene_count,
+            }
+        }
+    }
+
+    progress_bar.empty()
+    st.success(
+        f"✅ 자동 배치 진단 완료 — {n_batches}배치 → "
+        f"수정 대상 **{len(merged_target_scenes)}개 씬** 식별"
+    )
+    return merged_result
+
+
+def _run_diagnose_single(client, raw_text: str, pre_results: dict,
+                         batch_info: dict = None, retry_count: int = 1):
+    """단일 진단 호출 (배치 단위 또는 비배치). 재시도 로직 포함."""
+    prompt_text = build_diagnose_prompt(
+        raw_text=raw_text,
+        instruction=st.session_state.instruction,
+        locked=st.session_state.locked,
+        genre=st.session_state.genre,
+        intensity=st.session_state.intensity,
+        profession_input=st.session_state.profession_input,
+        period_key=st.session_state.period_key,
+        historical_type=st.session_state.historical_type,
+        fact_based=st.session_state.fact_based,
+        tone_dna=pre_results.get("tone_dna"),
+        diff_analysis=pre_results.get("diff_analysis"),
+        distribution_diagnostic=pre_results.get("distribution_diagnostic"),
+        rewrite_metadata=pre_results.get("rewrite_metadata"),
+        genre_dna=pre_results.get("genre_dna"),
+        section_mode=st.session_state.section_mode,
+        protected_ranges=st.session_state.protected_ranges,
+        revision_ranges=st.session_state.revision_ranges,
+        cascade_analysis=st.session_state.cascade_analysis,
+        boundary_info=st.session_state.boundary_info,
+        batch_info=batch_info,
+    )
+
+    for attempt in range(retry_count):
+        raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
+        if not raw:
+            continue
+        parsed = parse_json(raw)
+        if parsed:
+            return parsed
+        if attempt < retry_count - 1:
+            # 재시도 전 잠깐 대기 (rate limit 대비)
+            import time as _t
+            _t.sleep(1.5)
+
+    return None
+
+
 def run_diagnose(client):
     """Stage 1: 진단 + 수정 플랜 생성.
 
@@ -1820,32 +2184,10 @@ def run_diagnose(client):
             )
             return _build_auto_diagnose_from_rewrite_metadata(rewrite_meta)
 
-    # ★ Fast Path 3 — 일반 전체 각색 (AI 진단)
-    prompt_text = build_diagnose_prompt(
-        raw_text=st.session_state.raw_text,
-        instruction=st.session_state.instruction,
-        locked=st.session_state.locked,
-        genre=st.session_state.genre,
-        intensity=st.session_state.intensity,
-        profession_input=st.session_state.profession_input,
-        period_key=st.session_state.period_key,
-        historical_type=st.session_state.historical_type,
-        fact_based=st.session_state.fact_based,
-        tone_dna=pre_results.get("tone_dna"),
-        diff_analysis=pre_results.get("diff_analysis"),
-        distribution_diagnostic=pre_results.get("distribution_diagnostic"),
-        rewrite_metadata=pre_results.get("rewrite_metadata"),
-        genre_dna=pre_results.get("genre_dna"),
-        section_mode=st.session_state.section_mode,
-        protected_ranges=st.session_state.protected_ranges,
-        revision_ranges=st.session_state.revision_ranges,
-        cascade_analysis=st.session_state.cascade_analysis,
-        boundary_info=st.session_state.boundary_info,
-    )
-    raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=32000)
-    if not raw:
-        return None
-    return parse_json(raw)
+    # ★ Fast Path 3 — 일반 전체 각색
+    # v2.7: 자동 배치 분할로 라우팅 (단일 배치면 자동으로 단일 호출 모드로 동작)
+    batch_size = st.session_state.get("diagnose_batch_size", 12)
+    return run_diagnose_with_auto_batch(client, batch_size=batch_size)
 
 
 def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches: int):
@@ -2519,7 +2861,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE</div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.7</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -3321,13 +3663,58 @@ def show_step_0_input():
                 unsafe_allow_html=True
             )
 
+    # ★ v2.7 자동 배치 분할 정보 박스 + 슬라이더
+    if st.session_state.raw_text:
+        _detected_scene_count = _detect_scene_count(st.session_state.raw_text)
+        if _detected_scene_count > 0:
+            _current_bs = st.session_state.get("diagnose_batch_size", 12)
+            _expected_batches = max(1, (_detected_scene_count + _current_bs - 1) // _current_bs)
+            _batch_color = "#10B981" if _expected_batches > 1 else "#6B7280"
+            _batch_msg = (
+                f"감지된 씬 수 <b>{_detected_scene_count}씬</b> → "
+                f"진단 시 <b>{_expected_batches}배치</b>로 자동 분할 처리됩니다."
+                if _expected_batches > 1 else
+                f"감지된 씬 수 <b>{_detected_scene_count}씬</b> → 단일 배치 처리 (분할 불필요)."
+            )
+            st.markdown(
+                f'<div style="background:#F0FDF4; padding:10px 14px; border-radius:6px; '
+                f'border-left:3px solid {_batch_color}; margin:8px 0; font-size:0.88rem;">'
+                f'<b>📦 v2.7 자동 배치 분할:</b> {_batch_msg}<br>'
+                f'<span style="color:#666; font-size:0.82rem;">'
+                f'토큰 잘림 방지를 위해 시나리오를 자동으로 N씬 단위로 쪼개 진단합니다. '
+                f'사용자는 별도로 자를 필요 없이 버튼 한 번만 누르면 됩니다.</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            with st.expander("⚙️ 자동 배치 분할 — 고급 옵션", expanded=False):
+                new_bs = st.slider(
+                    "DIAGNOSE 배치당 씬 개수",
+                    min_value=8, max_value=15,
+                    value=_current_bs,
+                    step=1,
+                    help=(
+                        "한 배치에 포함할 씬 개수. 숫자가 작을수록 안전 마진은 커지지만 "
+                        "API 호출 횟수가 늘어납니다. 기본 12 권장. "
+                        "장르 룰이 무거운 경우(헐리우드 작법, 직업 Pack, 시대 Pack 동시) 10 권장."
+                    ),
+                    key="diagnose_batch_size_slider"
+                )
+                if new_bs != _current_bs:
+                    st.session_state.diagnose_batch_size = new_bs
+                    st.rerun()
+                st.caption(
+                    f"💡 토큰 안전 마진: 배치당 약 {new_bs}씬 → 입력 18~24K + 출력 6~8K = 안전 영역. "
+                    f"71씬 시나리오 → {(_detected_scene_count + new_bs - 1) // new_bs}배치 (예상)."
+                )
+
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("🔬 Stage 1: 진단 시작 (DIAGNOSE)",
                      disabled=not ready, use_container_width=True):
             client = get_client()
             if client:
-                with st.spinner("🔬 사전 분석 + 수정 플랜 생성 중... (Sonnet 4.6)"):
+                # 자동 배치 분할이 진행률을 직접 표시하므로 spinner는 짧게만
+                with st.spinner("🔬 사전 분석 중... (Sonnet 4.6)"):
                     result = run_diagnose(client)
                     if result:
                         st.session_state.diagnose_result = result
@@ -4028,7 +4415,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.2",
+                "engine": "BLUE JEANS REVISE ENGINE v2.7",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -4085,8 +4472,9 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.2  ·  '
-    'Powered by Claude Opus 4.6 + Sonnet 4.6'
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.7  ·  '
+    'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
+    '<span style="color:#10B981;">Auto Batch Split System</span>'
     '</div>',
     unsafe_allow_html=True,
 )

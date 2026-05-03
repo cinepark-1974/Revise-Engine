@@ -2001,7 +2001,8 @@ def build_diagnose_prompt(
     protected_ranges: list = None,
     revision_ranges: list = None,
     cascade_analysis: dict = None,
-    boundary_info: str = ""
+    boundary_info: str = "",
+    batch_info: dict = None
 ) -> str:
     """Stage 1: 원본 + 자료(들)을 분석해 수정 플랜(JSON)을 생성.
     Sonnet 4.6 사용 권장 (구조 분석).
@@ -2020,13 +2021,71 @@ def build_diagnose_prompt(
     profession_input, period_key, historical_type, fact_based: 작품 컨텍스트
     tone_dna: 작가 본인 톤 (손본본 기반)
     distribution_diagnostic: 분포 진단 (자동 생성)
+
+    [v2.7 자동 배치 분할]
+    batch_info: 배치 진단 모드 사용 시
+        {
+            "batch_index": 1,
+            "total_batches": 6,
+            "scene_range": "S#1~S#12",
+            "first_scene": 1,
+            "last_scene": 12
+        }
+        None이면 단일 호출 모드 (구버전 호환).
+        배치 모드일 때 raw_text는 해당 배치 씬들의 청크여야 함.
     """
+
+    # ─────────────────────────────────────────────────
+    # v2.7 자동 배치 분할 — batch_info 처리
+    # ─────────────────────────────────────────────────
+    is_batch_mode = bool(batch_info)
+    batch_section = ""
+    if is_batch_mode:
+        b_idx = batch_info.get("batch_index", 1)
+        b_total = batch_info.get("total_batches", 1)
+        b_range = batch_info.get("scene_range", "")
+        b_first = batch_info.get("first_scene", "")
+        b_last = batch_info.get("last_scene", "")
+        b_format = batch_info.get("scene_format", "S#")
+
+        format_note = ""
+        if b_format == "EXT/INT":
+            format_note = (
+                f"\n※ 이 시나리오는 헐리우드 형식(EXT./INT. 장소 — DAY/NIGHT)으로 작성되었다. "
+                f"씬 번호 S#{b_first}, S#{b_last} 등은 이 시스템이 출현 순서대로 부여한 라벨이며, "
+                f"target_scenes의 scene_id 필드에는 실제 씬 헤더(예: 'EXT. 한남시장 — DAY')를 그대로 적되 "
+                f"배치 식별을 위해 'S#{b_first} EXT. 한남시장 — DAY' 형식으로 시작 라벨을 prepend하라."
+            )
+        elif b_format == "S#":
+            format_note = "\n※ 이 시나리오는 한국 시나리오 표준(S#숫자.) 형식이다. scene_id에 원본 씬 번호를 그대로 사용하라."
+
+        batch_section = f"""
+
+[★★★ 자동 배치 분할 진단 모드 ★★★]
+━━━━━━━━━━━━━━━━━━━━━━━━
+이번 호출은 전체 {b_total}개 배치 중 **{b_idx}번째** 배치에 대한 진단이다.
+이번 배치 범위: **{b_range}** (씬 인덱스 {b_first}번째 ~ {b_last}번째){format_note}
+
+위 [원본 시나리오] 영역에는 **이번 배치 범위에 해당하는 씬들만** 포함되어 있다.
+(전체 시나리오의 일부분이며, 다른 배치는 별도 호출에서 처리된다.)
+
+▣ 진단 규칙 (반드시 준수):
+1. 이번 배치 범위 내의 씬에 대해서만 target_scenes를 생성하라.
+2. 이번 배치 외(범위 밖)의 씬은 진단 결과에 포함하지 마라. 언급 자체 금지.
+3. 인접 배치(앞·뒤 배치)와의 연결은 신경 쓰지 말고, 이번 배치 내부의 결함과 개선 방향만 진단하라.
+   (배치 간 일관성·연쇄 영향은 별도 통합 단계에서 처리한다.)
+4. revision_items[]는 이번 배치 씬들의 항목만 출력하라.
+5. estimated_scene_count, total_scenes는 **이번 배치 기준**으로 산정하라.
+6. recommended_batches는 1로 설정하라 (이미 분할된 상태).
+━━━━━━━━━━━━━━━━━━━━━━━━
+"""
 
     # 입력 토큰 폭주 방지 — 시나리오가 너무 크면 자름
     # 시나리오 50,000자 = 약 25,000~30,000 토큰 (한국어 기준)
     # 이 이상이면 본 진단이 잘릴 위험 큼
+    # ★ v2.7 — 배치 모드에서는 청크가 이미 작으므로 자르지 않음
     MAX_RAW_CHARS = 50000
-    if raw_text and len(raw_text) > MAX_RAW_CHARS:
+    if not is_batch_mode and raw_text and len(raw_text) > MAX_RAW_CHARS:
         raw_text = raw_text[:MAX_RAW_CHARS] + "\n\n[...원본이 길어 일부만 표시. 전체는 분석에서 고려됨...]"
 
     # 입력 자료가 하나라도 있는지 체크 (instruction 외에)
@@ -2116,7 +2175,7 @@ def build_diagnose_prompt(
 [TASK — Stage 1: DIAGNOSE]
 원본 시나리오와 수정 지시문을 분석하여, 실제 수정 작업을 위한 "수정 플랜(Revision Plan)"을 JSON으로 생성하라.
 이 단계는 집필이 아니다. 어디를, 왜, 어떻게 수정할 것인지의 "지도"를 그리는 단계다.
-
+{batch_section}
 [원본 시나리오]
 ━━━━━━━━━━━━━━━━━━━━━━━━
 {raw_text}
