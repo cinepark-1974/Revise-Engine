@@ -9,6 +9,8 @@
 # v2.7 (2026-05-03)  ★ 자동 배치 분할 시스템 — 토큰 잘림 결함 해결
 # v2.8 (2026-05-03)  ★ Beat-Aware Diagnose — 15-Beat 구조 인식 + 약점 비트 보강 ADD 자동 분배.
 #                    71→100씬 확장 같은 대규모 작업 지원.
+# v2.9 (2026-05-03)  ★ 비트 보강 확장 모드 (4번째 작업 모드) — Beat-Aware + LOCKED 강제 차단.
+#                    보호 구간 침범 자동 차단 + ADD 위치 자동 우회.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -2476,21 +2478,259 @@ def run_diagnose_with_beat_aware_batch(client, batch_size: int = 12,
     return merged_result
 
 
+# =================================================================
+# ★★★ v2.9 BEAT EXPANSION MODE ★★★
+# 비트 보강 확장 모드 = Beat-Aware Diagnose + LOCKED 영역 강제 차단
+# 71→100씬 같은 작업: 보호 구간(S#1~S#25)은 진단·집필에서 완전 제외
+# =================================================================
+
+def _parse_scene_range_to_int(range_str: str) -> int:
+    """'S#25' → 25 같은 변환. 실패 시 0 반환."""
+    if not range_str:
+        return 0
+    import re as _re_temp
+    m = _re_temp.search(r'\d+', str(range_str))
+    return int(m.group()) if m else 0
+
+
+def _filter_target_scenes_against_protected(target_scenes: list,
+                                              protected_ranges: list) -> tuple:
+    """target_scenes에서 LOCKED 영역에 속하는 씬을 필터링.
+
+    Args:
+        target_scenes: 진단 결과의 target_scenes 리스트
+        protected_ranges: [{"from":"S#1","to":"S#25",...}, ...]
+
+    Returns:
+        (filtered_scenes, removed_scenes) 튜플
+    """
+    if not protected_ranges:
+        return target_scenes, []
+
+    # 보호 범위를 (from_int, to_int) 튜플로 변환
+    prot_intervals = []
+    for pr in protected_ranges:
+        f = _parse_scene_range_to_int(pr.get("from", ""))
+        t = _parse_scene_range_to_int(pr.get("to", ""))
+        if f > 0 and t > 0:
+            prot_intervals.append((min(f, t), max(f, t)))
+
+    if not prot_intervals:
+        return target_scenes, []
+
+    filtered = []
+    removed = []
+    for ts in target_scenes:
+        scene_id = ts.get("scene_id", "")
+        ts_type = ts.get("type", "REWRITE")
+
+        # ADD의 경우 insert_after 기준
+        if ts_type == "ADD":
+            # ADD는 "이 씬 뒤에 삽입"이므로 insert_after 위치가 LOCKED 끝 이전이면 작업 영역 첫 씬으로 우회
+            ia = ts.get("insert_after", "")
+            ia_num = _parse_scene_range_to_int(ia)
+            if ia_num <= 0:
+                # insert_after 인식 못 함 → 일단 통과
+                filtered.append(ts)
+                continue
+            # 보호 구간 내부에 ADD 위치가 있으면 → 보호 끝 직후로 우회
+            in_protected = False
+            max_prot_end = 0
+            for f_int, t_int in prot_intervals:
+                if f_int <= ia_num <= t_int:
+                    in_protected = True
+                    max_prot_end = max(max_prot_end, t_int)
+            if in_protected:
+                # 우회: insert_after를 보호 영역 마지막 씬으로 변경
+                ts = dict(ts)
+                ts["insert_after"] = f"S#{max_prot_end}"
+                ts["_redirected_from_locked"] = ia
+                filtered.append(ts)
+            else:
+                filtered.append(ts)
+        else:
+            # REWRITE/DELETE/MERGE/SPLIT: scene_id 위치가 LOCKED 영역 내면 차단
+            sid_num = _parse_scene_range_to_int(scene_id)
+            if sid_num <= 0:
+                filtered.append(ts)
+                continue
+            in_protected = any(f_int <= sid_num <= t_int for f_int, t_int in prot_intervals)
+            if in_protected:
+                removed.append(ts)
+            else:
+                filtered.append(ts)
+
+    return filtered, removed
+
+
+def run_diagnose_beat_expansion(client, batch_size: int = 12,
+                                 target_added_scenes: int = 0):
+    """v2.9 비트 보강 확장 모드 — Beat-Aware Diagnose + LOCKED 강제 차단.
+
+    동작:
+    1. v2.8 run_diagnose_with_beat_aware_batch 호출
+    2. 결과의 target_scenes에서 protected_ranges 영역 침범 항목 필터링
+    3. ADD 위치가 LOCKED 영역이면 작업 영역 시작점으로 자동 우회
+    4. REWRITE/DELETE 등이 LOCKED 영역이면 out_of_scope로 이동
+
+    Args:
+        client: Anthropic 클라이언트
+        batch_size: DIAGNOSE 배치 사이즈
+        target_added_scenes: 추가할 총 씬 수
+
+    Returns:
+        통합된 diagnose_result dict (LOCKED 영역 침범 차단됨)
+    """
+    protected_ranges = st.session_state.get("protected_ranges", []) or []
+    revision_ranges = st.session_state.get("revision_ranges", []) or []
+
+    # 보호/작업 영역 안내
+    if protected_ranges:
+        prot_str = ", ".join(
+            f"{r.get('from','')}~{r.get('to','')}" for r in protected_ranges
+        )
+    else:
+        prot_str = "(없음)"
+
+    if revision_ranges:
+        rev_str = ", ".join(
+            f"{r.get('from','')}~{r.get('to','')}" for r in revision_ranges
+        )
+    else:
+        rev_str = "(자동 산출)"
+
+    st.info(
+        f"🎯 **v2.9 비트 보강 확장 모드 시작**\n\n"
+        f"🔒 보호 구간: {prot_str} (진단·집필 완전 제외)\n\n"
+        f"✏️ 작업 영역: {rev_str} (ADD/REWRITE 가능)\n\n"
+        f"➕ 추가 목표: +{target_added_scenes}씬"
+    )
+
+    # ─────────────────────────────────────────────────
+    # Phase 1~4: v2.8 Beat-Aware Diagnose 호출
+    # ─────────────────────────────────────────────────
+    base_result = run_diagnose_with_beat_aware_batch(
+        client=client,
+        batch_size=batch_size,
+        target_added_scenes=target_added_scenes,
+    )
+
+    if not base_result:
+        st.error("❌ Beat-Aware 진단 실패. v2.8 모드로 폴백합니다.")
+        return None
+
+    # ─────────────────────────────────────────────────
+    # Phase 5: LOCKED 영역 강제 차단
+    # ─────────────────────────────────────────────────
+    rp = base_result.get("revision_plan", {})
+    target_scenes = rp.get("target_scenes", []) or []
+
+    if not protected_ranges:
+        # 보호 구간 없으면 그대로 반환
+        return base_result
+
+    filtered, removed = _filter_target_scenes_against_protected(
+        target_scenes, protected_ranges
+    )
+
+    # 우회된 ADD 카운트
+    redirected_count = sum(
+        1 for s in filtered if s.get("_redirected_from_locked")
+    )
+
+    # 통계
+    original_count = len(target_scenes)
+    final_count = len(filtered)
+    removed_count = len(removed)
+
+    # 결과 반영
+    rp["target_scenes"] = filtered
+
+    # out_of_scope에 차단된 항목 추가
+    out_of_scope = rp.get("out_of_scope", []) or []
+    for r in removed:
+        out_of_scope.append(
+            f"⚠️ LOCKED 영역 침범 차단: {r.get('scene_id', '')} "
+            f"({r.get('type', '')}) — {r.get('preservation_notes', '')[:80]}"
+        )
+    rp["out_of_scope"] = out_of_scope
+
+    # 메타데이터 업데이트
+    rp["total_scenes"] = final_count
+    rp["estimated_scene_count"] = str(final_count)
+
+    # v2.9 메타 추가
+    rp["beat_expansion"] = {
+        "mode": "expansion",
+        "protected_ranges": protected_ranges,
+        "revision_ranges": revision_ranges,
+        "target_added_scenes": target_added_scenes,
+        "original_target_scenes_count": original_count,
+        "filtered_target_scenes_count": final_count,
+        "removed_count_due_to_locked": removed_count,
+        "redirected_count_due_to_locked": redirected_count,
+    }
+
+    # 최종 ADD/REWRITE 카운트
+    add_count = sum(1 for s in filtered if s.get("type") == "ADD")
+    rewrite_count = sum(1 for s in filtered if s.get("type") == "REWRITE")
+
+    # 사용자 안내
+    if removed_count > 0 or redirected_count > 0:
+        msg_parts = []
+        if removed_count > 0:
+            msg_parts.append(f"🚫 LOCKED 침범 차단: {removed_count}건 (out_of_scope 이동)")
+        if redirected_count > 0:
+            msg_parts.append(f"↪️ ADD 위치 자동 우회: {redirected_count}건 (작업 영역 시작점으로 이동)")
+        st.info("**v2.9 LOCKED 차단 결과**\n\n" + "\n\n".join(msg_parts))
+
+    if add_count == target_added_scenes:
+        st.success(
+            f"✅ v2.9 비트 보강 확장 진단 완료 — ADD **{add_count}씬** "
+            f"(목표 정확 일치) + REWRITE {rewrite_count}씬"
+        )
+    else:
+        diff = add_count - target_added_scenes
+        st.success(
+            f"✅ v2.9 비트 보강 확장 진단 완료 — ADD **{add_count}씬** "
+            f"(목표 {target_added_scenes}씬, 차이 {diff:+d}) "
+            f"+ REWRITE {rewrite_count}씬"
+        )
+
+    return base_result
+
+
 def run_diagnose(client):
     """Stage 1: 진단 + 수정 플랜 생성.
 
-    Fast Path 우선순위:
+    Fast Path 우선순위 (v2.9 업데이트):
+    0. ★ v2.9 expansion 모드 (비트 보강 확장) → Beat-Aware + LOCKED 차단
     1. 구간 모드(이어쓰기/부분수정) → 코드 자동 생성
     2. Rewrite JSON 있음 (REWRITE/ADD 제안) → 코드 자동 생성
     3. 그 외 (순수 전체 각색) → AI 진단
+       - target_added_scenes > 0 → v2.8 Beat-Aware
+       - target_added_scenes == 0 → v2.7 자동 배치
     """
 
     # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱)
     pre_results = run_v2_pre_analyses(client)
 
+    work_mode = st.session_state.get("work_mode", "")
+    target_added = st.session_state.get("target_added_scenes", 0)
+    batch_size = st.session_state.get("diagnose_batch_size", 12)
+
+    # ★ Fast Path 0 — v2.9 비트 보강 확장 모드 (최우선)
+    if work_mode == "expansion" and target_added > 0:
+        return run_diagnose_beat_expansion(
+            client,
+            batch_size=batch_size,
+            target_added_scenes=target_added,
+        )
+
     # ★ Fast Path 1 — 구간 모드 (이어쓰기/부분수정)
     if (st.session_state.section_mode
-            and st.session_state.revision_ranges):
+            and st.session_state.revision_ranges
+            and work_mode != "expansion"):  # expansion은 위에서 처리됨
         st.success("⚡ 구간 모드 — 진단 자동 생성 (AI 호출 없이 즉시 완료)")
         return _build_auto_diagnose_for_section_mode()
 
@@ -2517,10 +2757,6 @@ def run_diagnose(client):
             return _build_auto_diagnose_from_rewrite_metadata(rewrite_meta)
 
     # ★ Fast Path 3 — 일반 전체 각색
-    # v2.8: target_added_scenes > 0이면 비트 인식 진단, 아니면 v2.7 자동 배치
-    batch_size = st.session_state.get("diagnose_batch_size", 12)
-    target_added = st.session_state.get("target_added_scenes", 0)
-
     if target_added > 0:
         # v2.8 Beat-Aware Diagnose 모드
         return run_diagnose_with_beat_aware_batch(
@@ -3204,7 +3440,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.8</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v2.9</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -3262,7 +3498,7 @@ def show_step_0_input():
     </style>
     """, unsafe_allow_html=True)
 
-    cw1, cw2, cw3 = st.columns(3)
+    cw1, cw2, cw3, cw4 = st.columns(4)
 
     def _card(col, mode_id: str, emoji: str, title: str, sub: str, desc: str):
         with col:
@@ -3282,8 +3518,15 @@ def show_step_0_input():
                     st.session_state.section_mode = False
                     st.session_state.protected_ranges = []
                     st.session_state.revision_ranges = []
+                    st.session_state.target_added_scenes = 0
+                elif mode_id == "expansion":
+                    # 비트 보강 확장: section_mode 켜되 target_added_scenes 활성화
+                    st.session_state.section_mode = True
+                    if st.session_state.target_added_scenes <= 0:
+                        st.session_state.target_added_scenes = 29  # 기본값
                 else:
                     st.session_state.section_mode = True
+                    st.session_state.target_added_scenes = 0
                 st.rerun()
 
     _card(cw1, "full",
@@ -3301,6 +3544,11 @@ def show_step_0_input():
           "특정 구간만 다시 씀",
           "2막 엔딩만 약하다 같은 경우. 일부 씬만 핀포인트로 수정.")
 
+    _card(cw4, "expansion",
+          "🎯", "비트 보강 확장",
+          "씬 추가로 분량 확장",
+          "71→100씬처럼 약점 비트에 ADD 씬 자동 분배. 보호 구간 LOCKED.")
+
     # 모드 선택 안 했으면 안내 후 종료
     if not st.session_state.work_mode:
         st.info("👆 위에서 작업 모드를 선택하세요.")
@@ -3311,6 +3559,7 @@ def show_step_0_input():
         "full": "📝 전체 각색",
         "continuation": "✍️ 이어쓰기",
         "partial": "✂️ 부분 수정",
+        "expansion": "🎯 비트 보강 확장",
     }
     cm1, cm2 = st.columns([5, 1])
     with cm1:
@@ -3423,6 +3672,134 @@ def show_step_0_input():
                 st.session_state.protected_ranges = []
                 st.session_state.revision_ranges = []
                 st.rerun()
+
+    # 비트 보강 확장 모드: LOCKED 범위 + 추가 씬 수
+    elif st.session_state.work_mode == "expansion":
+        st.markdown("---")
+        st.markdown('<div class="rev-card-title">2. 비트 보강 확장 설정 🎯</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="rev-caption">'
+            '약점 비트에 ADD 씬을 자동 분배하여 분량을 확장합니다. '
+            '보호 구간(LOCKED)은 한 글자도 건드리지 않습니다.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        # 안내 박스
+        st.markdown(
+            '<div style="background:#FEF3C7; padding:12px 16px; border-radius:6px; '
+            'border-left:3px solid #F59E0B; margin:12px 0; font-size:0.88rem;">'
+            '<b>🎯 비트 보강 확장이란?</b><br>'
+            '시나리오 전체를 15-Beat 구조에 매핑 → 약점 비트(deficit) 진단 → '
+            '추가할 씬 수를 비트별로 자동 분배 → ADD 위치 자동 산출.<br>'
+            '<span style="color:#666;">예시: 71씬 → 100씬 확장 시 +29씬을 약점 비트에 자동 배치</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        # ① 추가 씬 수 입력
+        col_t1, col_t2 = st.columns([1, 1])
+        with col_t1:
+            current_target = st.session_state.get("target_added_scenes", 29)
+            new_target = st.number_input(
+                "🎯 추가할 씬 수",
+                min_value=1,
+                max_value=200,
+                value=max(1, current_target),
+                step=1,
+                help="예: 71씬 → 100씬 = 29 입력",
+                key="expansion_target_scenes",
+            )
+            if new_target != current_target:
+                st.session_state.target_added_scenes = new_target
+                st.rerun()
+
+        with col_t2:
+            # 현재 시나리오 씬 수 자동 계산
+            if st.session_state.raw_text:
+                current_scenes = _detect_scene_count(st.session_state.raw_text)
+                if current_scenes > 0:
+                    expected_total = current_scenes + new_target
+                    st.metric(
+                        "확장 후 총 씬 수",
+                        f"{expected_total}씬",
+                        delta=f"+{new_target}씬"
+                    )
+
+        # ② LOCKED 보호 구간 입력
+        st.markdown("**🔒 보호 구간 (LOCKED) 설정**")
+        st.caption("이 범위는 진단·집필에서 절대 변경하지 않습니다.")
+
+        # 기존 protected_ranges 확인
+        if st.session_state.protected_ranges:
+            current_protected = st.session_state.protected_ranges[0]
+            default_from = current_protected.get("from", "S#1")
+            default_to = current_protected.get("to", "S#25")
+        else:
+            default_from = "S#1"
+            default_to = "S#25"
+
+        col_p1, col_p2 = st.columns([1, 1])
+        with col_p1:
+            prot_from = st.text_input(
+                "보호 시작",
+                value=default_from,
+                key="expansion_prot_from",
+                placeholder="S#1",
+                help="예: S#1"
+            )
+        with col_p2:
+            prot_to = st.text_input(
+                "보호 끝",
+                value=default_to,
+                key="expansion_prot_to",
+                placeholder="S#25",
+                help="예: S#25"
+            )
+
+        # 자동으로 protected_ranges 갱신
+        if prot_from and prot_to:
+            new_protected = [{"from": prot_from, "to": prot_to,
+                              "reason": "비트 보강 확장 모드 — 사용자 지정 보호 구간"}]
+            if st.session_state.protected_ranges != new_protected:
+                st.session_state.protected_ranges = new_protected
+
+            # 작업 영역 자동 산출 (보호 끝 다음 ~ 마지막 씬)
+            try:
+                # S#숫자 형식에서 숫자만 추출
+                import re as _re_temp
+                m = _re_temp.search(r'\d+', prot_to)
+                if m and st.session_state.raw_text:
+                    prot_end_num = int(m.group())
+                    total_scenes = _detect_scene_count(st.session_state.raw_text)
+                    if total_scenes > prot_end_num:
+                        rev_from = f"S#{prot_end_num + 1}"
+                        rev_to = f"S#{total_scenes}"
+                        new_revision = [{"from": rev_from, "to": rev_to,
+                                         "reason": "비트 보강 확장 모드 — 자동 산출 작업 영역"}]
+                        if st.session_state.revision_ranges != new_revision:
+                            st.session_state.revision_ranges = new_revision
+
+                        st.success(
+                            f"✅ 자동 설정 완료\n\n"
+                            f"🔒 보호 구간: {prot_from} ~ {prot_to}\n\n"
+                            f"✏️ 작업 영역: {rev_from} ~ {rev_to} (ADD/REWRITE 가능)\n\n"
+                            f"➕ 추가 목표: +{new_target}씬"
+                        )
+            except Exception as e:
+                st.warning(f"보호 구간 형식을 확인해주세요: {e}")
+
+        # ③ 진단 미리보기
+        if st.session_state.raw_text and new_target > 0:
+            current_scenes = _detect_scene_count(st.session_state.raw_text)
+            if current_scenes > 0:
+                bs = st.session_state.get("diagnose_batch_size", 12)
+                expected_batches = max(1, (current_scenes + bs - 1) // bs)
+                st.caption(
+                    f"🔬 진단 시 진행: Phase 1(15-Beat 매핑, 단일 호출) → "
+                    f"Phase 2(비트 인식 배치 진단, {expected_batches}배치). "
+                    f"보호 구간은 진단 결과에서 자동 제외됩니다."
+                )
 
     # 부분 수정 모드: 어디를 다시 쓸지 선택
     elif st.session_state.work_mode == "partial":
@@ -3945,6 +4322,20 @@ def show_step_0_input():
                          "1막/2막/3막 버튼을 누르거나 직접 입력하세요.")
         else:
             ready = True
+    elif work_mode == "expansion":
+        # ★ v2.9 비트 보강 확장 모드
+        if st.session_state.target_added_scenes <= 0:
+            error_msg = "⚠️ 비트 보강 확장 모드는 추가할 씬 수가 1 이상이어야 합니다."
+        elif not st.session_state.protected_ranges:
+            error_msg = "⚠️ 비트 보강 확장 모드는 보호 구간(LOCKED) 설정이 필수입니다."
+        else:
+            ready = True
+            current_scenes = _detect_scene_count(st.session_state.raw_text)
+            target = st.session_state.target_added_scenes
+            info_msg = (
+                f"🎯 비트 보강 확장: {current_scenes}씬 → "
+                f"{current_scenes + target}씬 (+{target}씬)"
+            )
     else:
         # 전체 각색 모드
         ready = True
@@ -4050,48 +4441,51 @@ def show_step_0_input():
                     f"71씬 시나리오 → {(_detected_scene_count + new_bs - 1) // new_bs}배치 (예상)."
                 )
 
-            # ★ v2.8 Beat-Aware Diagnose 입력 박스
-            _current_target = st.session_state.get("target_added_scenes", 0)
-            st.markdown(
-                f'<div style="background:#FEF3C7; padding:10px 14px; border-radius:6px; '
-                f'border-left:3px solid #F59E0B; margin:8px 0; font-size:0.88rem;">'
-                f'<b>🎯 v2.8 Beat-Aware Diagnose:</b> '
-                f'시나리오 확장(예: 71씬 → 100씬) 시 사용. '
-                f'15-Beat 구조 매핑 → 약점 비트 진단 → 자동 분배.<br>'
-                f'<span style="color:#666; font-size:0.82rem;">'
-                f'추가할 씬 수를 0보다 크게 설정하면 비트 인식 모드가 활성화됩니다. '
-                f'0이면 v2.7 일반 진단 모드.</span>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            new_target = st.number_input(
-                "🎯 추가할 씬 수 (Target Added Scenes)",
-                min_value=0,
-                max_value=200,
-                value=_current_target,
-                step=1,
-                help=(
-                    "0: 일반 진단 (v2.7 모드)\n"
-                    "1~200: Beat-Aware Diagnose 활성화 — 15-Beat 구조 진단 후 약점 비트에 ADD 자동 분배.\n\n"
-                    "예시: 71씬 → 100씬 확장 시 29 입력."
-                ),
-                key="target_added_scenes_input"
-            )
-            if new_target != _current_target:
-                st.session_state.target_added_scenes = new_target
-                st.rerun()
+            # ★ v2.8 Beat-Aware Diagnose 입력 박스 (expansion 모드 외에서만 표시)
+            if st.session_state.work_mode != "expansion":
+                _current_target = st.session_state.get("target_added_scenes", 0)
+                st.markdown(
+                    f'<div style="background:#FEF3C7; padding:10px 14px; border-radius:6px; '
+                    f'border-left:3px solid #F59E0B; margin:8px 0; font-size:0.88rem;">'
+                    f'<b>🎯 v2.8 Beat-Aware Diagnose:</b> '
+                    f'시나리오 확장(예: 71씬 → 100씬) 시 사용. '
+                    f'15-Beat 구조 매핑 → 약점 비트 진단 → 자동 분배.<br>'
+                    f'<span style="color:#666; font-size:0.82rem;">'
+                    f'추가할 씬 수를 0보다 크게 설정하면 비트 인식 모드가 활성화됩니다. '
+                    f'0이면 v2.7 일반 진단 모드.<br>'
+                    f'※ 더 정밀한 보호 구간 LOCKED가 필요하면 작업 모드를 '
+                    f'<b>🎯 비트 보강 확장</b>으로 선택하세요.</span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+                new_target = st.number_input(
+                    "🎯 추가할 씬 수 (Target Added Scenes)",
+                    min_value=0,
+                    max_value=200,
+                    value=_current_target,
+                    step=1,
+                    help=(
+                        "0: 일반 진단 (v2.7 모드)\n"
+                        "1~200: Beat-Aware Diagnose 활성화 — 15-Beat 구조 진단 후 약점 비트에 ADD 자동 분배.\n\n"
+                        "예시: 71씬 → 100씬 확장 시 29 입력."
+                    ),
+                    key="target_added_scenes_input"
+                )
+                if new_target != _current_target:
+                    st.session_state.target_added_scenes = new_target
+                    st.rerun()
 
-            if new_target > 0:
-                _expected_total = _detected_scene_count + new_target
-                st.caption(
-                    f"📈 확장 목표: {_detected_scene_count}씬 → **{_expected_total}씬** "
-                    f"(+{new_target}씬 추가). "
-                    f"진단 시 Phase 1(비트 매핑) → Phase 2(비트 인식 배치 진단) 순으로 진행됩니다."
-                )
-            else:
-                st.caption(
-                    f"💡 추가 씬 0 = 일반 진단 모드 (v2.7). 비트 매핑 단계 생략."
-                )
+                if new_target > 0:
+                    _expected_total = _detected_scene_count + new_target
+                    st.caption(
+                        f"📈 확장 목표: {_detected_scene_count}씬 → **{_expected_total}씬** "
+                        f"(+{new_target}씬 추가). "
+                        f"진단 시 Phase 1(비트 매핑) → Phase 2(비트 인식 배치 진단) 순으로 진행됩니다."
+                    )
+                else:
+                    st.caption(
+                        f"💡 추가 씬 0 = 일반 진단 모드 (v2.7). 비트 매핑 단계 생략."
+                    )
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -4801,7 +5195,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v2.8",
+                "engine": "BLUE JEANS REVISE ENGINE v2.9",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -4858,10 +5252,11 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v2.8  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v2.9  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
-    '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>'
+    '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
+    '<span style="color:#EC4899;">Beat Expansion Mode</span>'
     '</div>',
     unsafe_allow_html=True,
 )
