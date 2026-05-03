@@ -1555,7 +1555,96 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
         return None
-    return parse_json(raw)
+    parsed = parse_json(raw)
+    if not parsed:
+        return None
+
+    # ★ 포맷 검증 — revised_content가 통짜 출력인지 체크 + 자동 보강
+    parsed = _validate_and_fix_revised_format(parsed)
+
+    return parsed
+
+
+def _validate_and_fix_revised_format(revise_result: dict) -> dict:
+    """REVISE 결과의 revised_content 포맷을 검증하고 자동 보강.
+
+    AI가 한 줄 통짜로 출력한 경우를 감지해 자동 줄바꿈 삽입.
+    Writer Engine 표준에 맞춰 캐릭터명 + 탭2 + 대사 형식 강제.
+    """
+    if not isinstance(revise_result, dict):
+        return revise_result
+
+    rr = revise_result.get("revision_result", {})
+    if not isinstance(rr, dict):
+        return revise_result
+
+    revised_scenes = rr.get("revised_scenes", [])
+    if not isinstance(revised_scenes, list):
+        return revise_result
+
+    import re as _re
+
+    # 캐릭터명 패턴 (대표님 작품 + 일반)
+    char_names_pattern = (
+        '유진|진호|세웅|다은|강회장|김 여사|김여사|지우|여름|최여름|'
+        '안경 아이|동생|아내|집배원|중개인|최상진|조민준|강유진|이진호|반세웅|'
+        '편집자|엄마|아빠|손님|상인|남자|여자|수강생\\s*\\d?|아이|보호자'
+    )
+
+    fixed_count = 0
+    for scene in revised_scenes:
+        if not isinstance(scene, dict):
+            continue
+        content = scene.get("revised_content", "")
+        if not content or len(content) < 100:
+            continue
+
+        # 줄바꿈 비율 체크
+        line_count = content.count('\n')
+        char_count = len(content)
+
+        # 200자당 줄바꿈 1개 미만이면 통짜 출력 → 자동 보강
+        if char_count > 500 and line_count < char_count / 200:
+            # 1. 씬 헤더(S#XX) 다음 줄바꿈
+            content = _re.sub(
+                r'(S#\d+\.\s+(?:INT|EXT)\.\s+[^\n—]+—\s+[^\n]{2,30}?(?:아침|점심|저녁|밤|낮|오전|오후|새벽))\s+([가-힣A-Z\[])',
+                r'\1\n\n\2',
+                content
+            )
+            # 2. CUT TO / DISSOLVE TO / FADE 앞뒤 줄바꿈
+            content = _re.sub(r'(?<!\n)\s+(CUT TO:|DISSOLVE TO:|FADE\s)', r'\n\n\1', content)
+            content = _re.sub(r'(CUT TO:|DISSOLVE TO:|FADE\s\w+)\s+(?=[^\n])', r'\1\n', content)
+            # 3. [인서트] 앞뒤 줄바꿈
+            content = _re.sub(r'(?<!\n)\s+(\[인서트)', r'\n\n\1', content)
+            # 4. 문장 끝 + 캐릭터명 + (괄호) → 줄바꿈 + 탭2
+            content = _re.sub(
+                rf'([\.\?\!…])\s+({char_names_pattern})\s+(\([^)]+\))',
+                r'\1\n\n\2\t\t\3',
+                content
+            )
+            # 5. 문장 끝 + 캐릭터명 + 공백 2+ → 줄바꿈 + 탭2
+            content = _re.sub(
+                rf'(?<!^)([\.\?\!…])\s+({char_names_pattern})\s{{2,}}',
+                r'\1\n\n\2\t\t',
+                content
+            )
+            # 6. 줄 시작 캐릭터명 + 공백 2+ → 캐릭터명\t\t
+            content = _re.sub(
+                rf'(^|\n)({char_names_pattern})\s{{2,}}',
+                r'\1\2\t\t',
+                content
+            )
+            # 7. 연속 빈 줄 정리
+            content = _re.sub(r'\n{3,}', '\n\n', content)
+
+            scene["revised_content"] = content
+            fixed_count += 1
+
+    if fixed_count > 0:
+        # 메타 정보로 자동 보강 사실 기록
+        rr["_format_auto_fixed"] = fixed_count
+
+    return revise_result
 
 
 def run_revise(client):

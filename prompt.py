@@ -873,8 +873,18 @@ JSON만 출력하라. 설명 금지.
 
 def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
     """Rewrite Engine JSON에서 메타데이터를 구조화 추출.
-    parse_rewrite_engine_json은 텍스트 변환만 했지만,
-    이 함수는 priority 격상·preserve_note 등 자동 적용 데이터를 반환."""
+
+    v2.3 확장 — MOON 의견 + REWRITE 제안 + ADD 제안까지 흡수.
+
+    Rewrite Engine의 진짜 처방 구조:
+      - chris_analysis: 구조·플롯·페이싱
+      - shiho_prescription: 캐릭터·관계·정서 (washing_table, weak_zones)
+      - moon_opinion: 시장성·차별성·전체 방향
+      - rewrite_suggestions: 6개 씬 수정 제안
+      - add_suggestions: 4개 씬 추가 제안
+
+    여러 가능한 키 이름 패턴을 동시 지원 (실제 JSON 키가 무엇이든 흡수).
+    """
     import json as _json
 
     if isinstance(rewrite_json, str):
@@ -887,14 +897,32 @@ def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
     else:
         return {}
 
-    chris = data.get("chris_analysis") or data
-    shiho = data.get("shiho_prescription") or data
+    chris = data.get("chris_analysis") or data.get("chris") or data
+    shiho = data.get("shiho_prescription") or data.get("shiho") or data
+    moon = (
+        data.get("moon_opinion")
+        or data.get("moon_rewrite")
+        or data.get("moon_analysis")
+        or data.get("moon")
+        or {}
+    )
 
     metadata = {
         "preserve_notes_by_seq": {},   # {seq: preserve_note}
         "weak_zone_scenes": [],        # [{seq_ref, hook, punch}, ...]
         "opening_diagnosis": {},
         "auto_priority_high": [],      # 격상 대상 씬 리스트
+
+        # ── v2.3 신규 ──
+        "moon_opinion_text": "",        # MOON 전체 의견 (문자열)
+        "moon_market_direction": "",    # MOON 시장성 방향
+        "moon_genre_strengthening": "", # MOON 장르 강화 방향
+        "moon_unique_value": "",        # MOON 차별성
+
+        "rewrite_suggestions": [],      # [{scene_id, what_to_change, why, ...}]
+        "add_suggestions": [],          # [{insert_after, type, content_plan, ...}]
+        "auto_target_scenes": [],       # 자동으로 target_scenes에 추가할 씬들
+        "auto_add_scenes": [],          # 자동으로 ADD할 씬들
     }
 
     # washing_table → preserve_notes
@@ -918,7 +946,6 @@ def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
             "hook_suggestion": zone.get("hook_suggestion", ""),
             "punch_suggestion": zone.get("punch_suggestion", ""),
         })
-        # 시퀀스 ref → 자동 priority HIGH
         if zone.get("seq_ref"):
             metadata["auto_priority_high"].append(zone["seq_ref"])
 
@@ -928,7 +955,213 @@ def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
         if od:
             metadata["opening_diagnosis"] = od
 
+    # ── v2.3 — MOON 의견 흡수 ──
+    if isinstance(moon, dict):
+        # 가능한 키 이름들 모두 시도
+        metadata["moon_opinion_text"] = (
+            moon.get("opinion")
+            or moon.get("summary")
+            or moon.get("overall_direction")
+            or moon.get("rewrite_direction")
+            or ""
+        )
+        metadata["moon_market_direction"] = (
+            moon.get("market_direction")
+            or moon.get("market")
+            or moon.get("commercial_direction")
+            or ""
+        )
+        metadata["moon_genre_strengthening"] = (
+            moon.get("genre_strengthening")
+            or moon.get("genre_direction")
+            or moon.get("genre_focus")
+            or ""
+        )
+        metadata["moon_unique_value"] = (
+            moon.get("unique_value")
+            or moon.get("differentiation")
+            or moon.get("uniqueness")
+            or ""
+        )
+    elif isinstance(moon, str):
+        metadata["moon_opinion_text"] = moon
+
+    # ── v2.3 — REWRITE 제안 흡수 (6개) ──
+    rewrite_keys = [
+        "rewrite_suggestions", "rewrite_proposals", "rewrites",
+        "scene_rewrites", "scene_revisions", "revision_targets",
+    ]
+    rewrite_list = []
+    for key in rewrite_keys:
+        candidate = data.get(key) or chris.get(key) if isinstance(chris, dict) else None
+        if isinstance(candidate, list):
+            rewrite_list = candidate
+            break
+
+    for item in rewrite_list:
+        if not isinstance(item, dict):
+            continue
+        scene_id = (
+            item.get("scene_id")
+            or item.get("scene")
+            or item.get("target_scene")
+            or item.get("seq")
+            or ""
+        )
+        what = (
+            item.get("what_to_change")
+            or item.get("change")
+            or item.get("revision")
+            or item.get("how")
+            or ""
+        )
+        why = (
+            item.get("why")
+            or item.get("reason")
+            or item.get("rationale")
+            or ""
+        )
+        if scene_id:
+            metadata["rewrite_suggestions"].append({
+                "scene_id": scene_id,
+                "what_to_change": what,
+                "why": why,
+            })
+            metadata["auto_target_scenes"].append(scene_id)
+            metadata["auto_priority_high"].append(scene_id)
+
+    # ── v2.3 — ADD 제안 흡수 (4개) ──
+    add_keys = [
+        "add_suggestions", "add_proposals", "additions",
+        "scene_additions", "new_scenes", "expansion_suggestions",
+    ]
+    add_list = []
+    for key in add_keys:
+        candidate = data.get(key) or chris.get(key) if isinstance(chris, dict) else None
+        if isinstance(candidate, list):
+            add_list = candidate
+            break
+
+    for item in add_list:
+        if not isinstance(item, dict):
+            continue
+        insert_after = (
+            item.get("insert_after")
+            or item.get("after_scene")
+            or item.get("position")
+            or item.get("location")
+            or ""
+        )
+        scene_type = (
+            item.get("type")
+            or item.get("scene_type")
+            or item.get("function")
+            or ""
+        )
+        content_plan = (
+            item.get("content_plan")
+            or item.get("description")
+            or item.get("what")
+            or item.get("content")
+            or ""
+        )
+        why = item.get("why") or item.get("reason") or ""
+        if insert_after or content_plan:
+            metadata["add_suggestions"].append({
+                "insert_after": insert_after,
+                "type": scene_type,
+                "content_plan": content_plan,
+                "why": why,
+            })
+            metadata["auto_add_scenes"].append({
+                "insert_after": insert_after,
+                "type": scene_type,
+                "content_plan": content_plan,
+            })
+
     return metadata
+
+
+def build_rewrite_metadata_block(metadata: dict) -> str:
+    """흡수된 Rewrite 메타데이터를 진단/집필 프롬프트에 주입할 텍스트 블록으로 변환.
+
+    DIAGNOSE에서 자동 활용:
+    - rewrite_suggestions → target_scenes에 자동 등록
+    - add_suggestions → target_scenes에 type=ADD로 자동 등록
+    - moon_opinion → 전체 방향에 강제 주입
+    """
+    if not metadata or not isinstance(metadata, dict):
+        return ""
+
+    parts = []
+
+    # MOON 의견 (가장 위 — 전체 방향)
+    moon_text = metadata.get("moon_opinion_text", "").strip()
+    moon_market = metadata.get("moon_market_direction", "").strip()
+    moon_genre = metadata.get("moon_genre_strengthening", "").strip()
+    moon_unique = metadata.get("moon_unique_value", "").strip()
+
+    if moon_text or moon_market or moon_genre or moon_unique:
+        parts.append("[★ MOON 의견 — Rewrite Engine 시장·장르·차별성 처방 ★]")
+        if moon_text:
+            parts.append(f"전체 방향: {moon_text}")
+        if moon_market:
+            parts.append(f"시장 방향: {moon_market}")
+        if moon_genre:
+            parts.append(f"장르 강화: {moon_genre}")
+        if moon_unique:
+            parts.append(f"차별성: {moon_unique}")
+        parts.append("→ 위 방향에 부합하도록 모든 수정·추가를 진행하라.")
+        parts.append("")
+
+    # REWRITE 제안 (6개)
+    rw = metadata.get("rewrite_suggestions", [])
+    if rw:
+        parts.append(f"[★ Rewrite Engine REWRITE 제안 ({len(rw)}개) — target_scenes에 자동 등록 ★]")
+        for item in rw:
+            parts.append(f"  ▸ {item.get('scene_id', '')}: {item.get('what_to_change', '')}")
+            why = item.get('why', '')
+            if why:
+                parts.append(f"      이유: {why}")
+        parts.append("→ 위 씬들을 priority=HIGH, type=REWRITE로 처리하라.")
+        parts.append("")
+
+    # ADD 제안 (4개)
+    ad = metadata.get("add_suggestions", [])
+    if ad:
+        parts.append(f"[★ Rewrite Engine ADD 제안 ({len(ad)}개) — type=ADD로 자동 등록 ★]")
+        for item in ad:
+            after = item.get('insert_after', '?')
+            stype = item.get('type', '시퀀스')
+            plan = item.get('content_plan', '')
+            parts.append(f"  ▸ {after} 다음에 [{stype}] 추가")
+            if plan:
+                parts.append(f"      내용: {plan}")
+            why = item.get('why', '')
+            if why:
+                parts.append(f"      이유: {why}")
+        parts.append("→ 위 추가 씬들을 type=ADD로 등록, insert_after 위치 정확히 적용.")
+        parts.append("")
+
+    # 보존 메모
+    pn = metadata.get("preserve_notes_by_seq", {})
+    if pn:
+        parts.append("[Rewrite Engine 보존 메모 (SHIHO washing_table)]")
+        for seq, note in list(pn.items())[:8]:
+            parts.append(f"  ▸ {seq}: {note[:100]}")
+        parts.append("")
+
+    # 약점 영역
+    wz = metadata.get("weak_zone_scenes", [])
+    if wz:
+        parts.append("[Rewrite Engine 약점 영역 (자동 priority HIGH)]")
+        for zone in wz[:8]:
+            seq = zone.get('seq_ref', '')
+            hook = zone.get('hook_suggestion', '')
+            parts.append(f"  ▸ {seq}: {hook[:100]}")
+        parts.append("")
+
+    return "\n".join(parts) if parts else ""
 
 
 # =================================================================
@@ -1506,23 +1739,20 @@ def build_v2_diagnose_context_block(
 ※ 위 격상 권장을 target_scenes의 priority에 반영하라.""")
 
     if rewrite_metadata:
-        preserve = rewrite_metadata.get("preserve_notes_by_seq", {})
-        weak = rewrite_metadata.get("weak_zone_scenes", [])
-        auto_high = rewrite_metadata.get("auto_priority_high", [])
-        if preserve or weak or auto_high:
+        # v2.3 — 종합 블록 (MOON + REWRITE/ADD + preserve + weak_zones)
+        rw_block = build_rewrite_metadata_block(rewrite_metadata)
+        if rw_block:
             parts.append(f"""
-[v2.0 — Rewrite Engine 메타 흡수]
+[★★★ v2.3 — Rewrite Engine 종합 처방 흡수 (CHRIS + SHIHO + MOON) ★★★]
 ━━━━━━━━━━━━━━━━━━━━━━━━
-preserve_notes (시퀀스별 유지 요소):
-{_json.dumps(preserve, ensure_ascii=False, indent=2)[:1500]}
-
-genre_fun_recovery weak_zones (자동 priority HIGH 격상):
-{_json.dumps(weak, ensure_ascii=False, indent=2)[:1500]}
-
-자동 격상 시퀀스: {auto_high}
+{rw_block}
 ━━━━━━━━━━━━━━━━━━━━━━━━
-※ preserve_notes를 해당 씬의 preservation_notes에 자동 매핑.
-※ weak_zones에 속한 씬은 priority HIGH로 자동 격상.""")
+※ 위 처방을 다음과 같이 자동 적용하라:
+   ① REWRITE 제안 씬 → target_scenes에 priority=HIGH, type=REWRITE
+   ② ADD 제안 씬 → target_scenes에 type=ADD, insert_after 정확히 적용
+   ③ MOON 의견 → 전체 수정 방향에 강제 반영 (summary에 명시)
+   ④ preserve_notes → 해당 씬의 preservation_notes에 자동 매핑
+   ⑤ weak_zones → priority HIGH 자동 격상""")
 
     if feedback_text and feedback_text.strip():
         parts.append(f"""
