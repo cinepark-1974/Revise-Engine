@@ -842,7 +842,47 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
 
     # 문자열 그대로의 \n이 들어온 경우(JSON 이스케이프 잔존) 안전 처리
     full_text = full_text.replace('\\n', '\n').replace('\\t', '\t')
-    lines = full_text.split('\n')
+
+    # ═══════════════════════════════════════════════════════════
+    # 대사 형식 붕괴 자동 복구 (Writer Engine v3.4 이식)
+    # 버그: 긴 컨텍스트에서 AI가 대사 포맷 규칙을 잊고
+    #       "캐릭터\n\n대사" 형식으로 출력
+    # 복구: "캐릭터" 단독 라인 + 빈 라인 + 대사 라인 → "캐릭터\t\t대사"
+    # ═══════════════════════════════════════════════════════════
+    _CHAR_NAMES = {
+        '유진', '진호', '세웅', '다은', '강회장', '민준', '박지영', '오현수',
+        '이진호', '반세웅', '김사장', '비서', '편집자', '기사', '배달 기사',
+        '사장', '민준 엄마', '박씨', '엄마', '아빠', '형', '누나', '아들', '딸',
+        '김 여사', '지우', '여름', '최여름', '안경 아이', '동생', '아내',
+        '집배원', '중개인', '최상진', '조민준', '강유진',
+    }
+    _broken_lines = full_text.split("\n")
+    _fixed_lines = []
+    _j = 0
+    while _j < len(_broken_lines):
+        _cur = _broken_lines[_j].strip()
+        # 패턴 A: "캐릭터명" 단독 + 빈줄 + 대사 → "캐릭터\t\t대사"
+        if (_cur in _CHAR_NAMES and
+            _j + 2 < len(_broken_lines) and
+            _broken_lines[_j + 1].strip() == "" and
+            _broken_lines[_j + 2].strip() and
+            not _broken_lines[_j + 2].strip().startswith("S#") and
+            _broken_lines[_j + 2].strip() not in _CHAR_NAMES):
+            _next_content = _broken_lines[_j + 2].strip()
+            # 괄호 지시(예: "(잠깐 생각하고)")가 있으면 다음 줄이 진짜 대사
+            if _next_content.startswith("(") and _next_content.endswith(")") and \
+               _j + 4 < len(_broken_lines) and _broken_lines[_j + 3].strip() == "" and \
+               _broken_lines[_j + 4].strip():
+                _fixed_lines.append(f"{_cur}\t\t{_next_content} {_broken_lines[_j + 4].strip()}")
+                _j += 5
+                continue
+            _fixed_lines.append(f"{_cur}\t\t{_next_content}")
+            _j += 3
+            continue
+        _fixed_lines.append(_broken_lines[_j])
+        _j += 1
+    lines = _fixed_lines
+
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -2566,6 +2606,85 @@ def show_step_2_revise():
     progress = completed_count / total_batches if total_batches else 0
     st.progress(progress, text=f"배치 {completed_count} / {total_batches} 완료  ({completed_scenes} / {total_scenes} 씬)")
 
+    # ── 💾 진행 상황 자동 백업 / 복구 패널 ──
+    backup_col1, backup_col2 = st.columns([1, 1])
+
+    with backup_col1:
+        # 백업 다운로드 — 완료된 배치가 1개 이상 있을 때만
+        if batch_results:
+            import json as _json
+            from datetime import datetime as _dt
+            backup_data = {
+                "version": "v2.2",
+                "saved_at": _dt.now().isoformat(),
+                "title": st.session_state.title,
+                "genre": st.session_state.genre,
+                "total_batches": total_batches,
+                "completed_batches": completed_count,
+                "batch_results": batch_results,
+                "diagnose_result": st.session_state.diagnose_result,
+                # 구간 모드 정보 보존
+                "section_mode": st.session_state.section_mode,
+                "work_mode": st.session_state.work_mode,
+                "protected_ranges": st.session_state.protected_ranges,
+                "revision_ranges": st.session_state.revision_ranges,
+            }
+            backup_json = _json.dumps(backup_data, ensure_ascii=False, indent=2)
+            backup_filename = f"revise_backup_{st.session_state.title}_{completed_count}of{total_batches}_{_dt.now().strftime('%Y%m%d_%H%M')}.json"
+
+            st.download_button(
+                f"💾 진행 상황 백업 ({completed_count}/{total_batches} 배치)",
+                data=backup_json.encode("utf-8"),
+                file_name=backup_filename,
+                mime="application/json",
+                key="backup_progress",
+                help="에러 대비. 다음 배치 시작 전에 받아두세요.",
+                use_container_width=True,
+            )
+
+    with backup_col2:
+        # 백업 복구 업로드
+        with st.popover("📂 백업에서 복구", use_container_width=True):
+            st.caption("이전 작업 백업 JSON을 올리면 그 지점부터 이어서 작업할 수 있습니다.")
+            restore_file = st.file_uploader(
+                "백업 JSON 업로드",
+                type=["json"],
+                key="restore_uploader",
+            )
+            if restore_file:
+                try:
+                    import json as _json
+                    raw = restore_file.read().decode("utf-8")
+                    loaded = _json.loads(raw)
+
+                    if st.button("✅ 이 백업으로 복구", key="confirm_restore", type="primary"):
+                        # 핵심 상태 복구
+                        st.session_state.batch_results = {
+                            int(k): v for k, v in loaded.get("batch_results", {}).items()
+                        }
+                        if loaded.get("diagnose_result"):
+                            st.session_state.diagnose_result = loaded["diagnose_result"]
+                        if loaded.get("section_mode") is not None:
+                            st.session_state.section_mode = loaded["section_mode"]
+                        if loaded.get("work_mode"):
+                            st.session_state.work_mode = loaded["work_mode"]
+                        if loaded.get("protected_ranges"):
+                            st.session_state.protected_ranges = loaded["protected_ranges"]
+                        if loaded.get("revision_ranges"):
+                            st.session_state.revision_ranges = loaded["revision_ranges"]
+
+                        restored_count = len(st.session_state.batch_results)
+                        st.success(f"✅ 복구 완료: {restored_count}개 배치 결과 복원됨")
+                        st.rerun()
+                    else:
+                        st.info(
+                            f"📅 백업 시각: {loaded.get('saved_at', '?')[:16]}\n\n"
+                            f"📌 작품: {loaded.get('title', '?')}\n\n"
+                            f"📊 진행: {loaded.get('completed_batches', 0)} / {loaded.get('total_batches', 0)} 배치"
+                        )
+                except Exception as e:
+                    st.error(f"백업 파일 로드 실패: {e}")
+
     # 배치 전략 안내
     plan = st.session_state.diagnose_result.get("revision_plan", {})
     strategy = plan.get("batch_strategy", "")
@@ -2664,9 +2783,20 @@ def show_step_2_revise():
                                 if result:
                                     st.session_state.batch_results[bidx] = result
                                     st.success(f"✅ 배치 {bidx} 완료")
+                                    # 다음 배치 들어가기 전 백업 권고
+                                    if bidx < total_batches:
+                                        st.info(
+                                            f"💡 **다음 배치 진행 전, 위쪽 [💾 진행 상황 백업] 버튼을 눌러 "
+                                            f"현재까지 결과({bidx}/{total_batches} 배치)를 다운로드해두세요. "
+                                            f"에러 발생 시 백업에서 복구할 수 있습니다.**"
+                                        )
                                     st.rerun()
                                 else:
-                                    st.error(f"배치 {bidx} 집필 실패. 다시 시도해주세요.")
+                                    st.error(
+                                        f"❌ 배치 {bidx} 집필 실패. "
+                                        f"위쪽 [💾 진행 상황 백업]으로 지금까지 결과를 먼저 저장하세요. "
+                                        f"그 다음 다시 시도해주세요."
+                                    )
                 else:
                     # 대기 중 (이전 배치 미완료)
                     st.button(f"⏸️ 배치 {bidx} 대기 중", disabled=True, use_container_width=True,
