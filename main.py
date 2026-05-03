@@ -1340,12 +1340,120 @@ def run_v2_pre_analyses(client) -> dict:
     return results
 
 
-def run_diagnose(client):
-    """Stage 1: Sonnet으로 지시 해석 + 수정 플랜 생성. v2.0/v2.1/v2.2 자동 분석 사전 실행."""
+def _build_auto_diagnose_for_section_mode() -> dict:
+    """구간 모드일 때 Stage 1 진단을 코드로 자동 생성.
 
-    # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱이라 안전)
+    이어쓰기/부분수정에서는 어디를 다시 쓸지 이미 정해졌으므로,
+    AI에게 진단 시키는 대신 코드로 즉시 revision_plan을 만든다.
+    토큰 절약 + 잘림 방지 + 즉시 응답.
+    """
+    import re as _re
+
+    revision_ranges = st.session_state.revision_ranges or []
+    protected_ranges = st.session_state.protected_ranges or []
+
+    # 재집필 구간 안의 모든 씬을 target_scenes로 자동 등록
+    target_scenes = []
+    raw = st.session_state.raw_text or ""
+
+    # 원본에서 모든 씬 헤더 + 헤더 텍스트 추출
+    scene_pattern = _re.compile(r'^\s*\*?\*?S#?(\d+)[\.\s]([^\n]*)', _re.MULTILINE)
+    all_scenes = {int(m.group(1)): m.group(2).strip() for m in scene_pattern.finditer(raw)}
+
+    for rev_range in revision_ranges:
+        from_str = rev_range.get("from", "")
+        to_str = rev_range.get("to", "")
+        from_num = int(_re.search(r'\d+', from_str).group()) if from_str else 0
+        to_num = int(_re.search(r'\d+', to_str).group()) if to_str else 0
+
+        for scene_num in range(from_num, to_num + 1):
+            if scene_num in all_scenes:
+                target_scenes.append({
+                    "scene_id": f"S#{scene_num}",
+                    "header": f"S#{scene_num}. {all_scenes[scene_num][:80]}",
+                    "priority": "HIGH",
+                    "type": "REWRITE",
+                    "what_to_change": [
+                        "보호 구간의 톤·스타일을 그대로 따라 다시 쓴다",
+                        "원본 씬의 핵심 사건·인물·장소는 유지",
+                        "대사·지문은 작가 톤(절제된 현재형 단문, 미시 시간 표기)으로 재작성"
+                    ],
+                    "preservation_notes": [
+                        "원본 씬의 이벤트·정보 누락 금지",
+                        "캐릭터 정체성·관계 변경 금지"
+                    ],
+                })
+
+    # LOCKED 인식 (입력값 그대로)
+    locked_text = (st.session_state.locked or "").strip()
+    locked_recognition = []
+    if locked_text:
+        # LOCKED 텍스트를 줄 단위로 분리해 인식 항목으로
+        for line in locked_text.split("\n"):
+            line = line.strip()
+            if line:
+                locked_recognition.append({
+                    "category": "사용자 명시",
+                    "item": line,
+                    "scope": "전체"
+                })
+
+    # 자동 생성된 진단 결과
+    prot_str = ", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in protected_ranges)
+    rev_str = ", ".join(f"{r.get('from','')}~{r.get('to','')}" for r in revision_ranges)
+
+    work_mode = st.session_state.work_mode or "continuation"
+    if work_mode == "continuation":
+        summary = (
+            f"이어쓰기 모드 — 작가가 직접 손본 보호 구간({prot_str})의 톤·스타일을 학습하여, "
+            f"재집필 구간({rev_str})을 같은 결로 다시 쓴다. "
+            f"보호 구간은 한 글자도 건드리지 않으며, 재집필 구간의 모든 씬은 priority HIGH로 처리된다. "
+            f"원본의 핵심 사건은 유지하되, 표현은 작가의 절제된 현재형 단문 + 미시 시간 표기 스타일로 재작성한다."
+        )
+    else:
+        summary = (
+            f"부분 수정 모드 — 사용자가 지정한 구간({rev_str})만 재집필한다. "
+            f"나머지 구간({prot_str})은 보호되어 변경되지 않는다. "
+            f"재집필 시 인접한 보호 구간과 자연스럽게 이어지도록 경계 조건을 따른다."
+        )
+
+    return {
+        "revision_plan": {
+            "summary": summary,
+            "estimated_scene_count": len(target_scenes),
+            "confidence": 9,
+            "auto_generated": True,
+            "auto_generation_reason": "구간 모드에서는 진단 대신 자동 플랜 생성 (토큰 절약·즉시 응답)",
+            "locked_recognition": locked_recognition,
+            "locked_conflicts": [],
+            "target_scenes": target_scenes,
+            "out_of_scope": [],
+            "section_mode_info": {
+                "mode": work_mode,
+                "protected_ranges": protected_ranges,
+                "revision_ranges": revision_ranges,
+            }
+        }
+    }
+
+
+def run_diagnose(client):
+    """Stage 1: 진단 + 수정 플랜 생성.
+
+    구간 모드(이어쓰기/부분수정): 코드로 자동 생성 (Fast Path).
+    전체 각색 모드: AI에게 진단 시킴.
+    """
+
+    # v2.0/v2.1/v2.2 — 사전 분석 항상 호출 (각 항목 독립 캐싱)
     pre_results = run_v2_pre_analyses(client)
 
+    # ★ Fast Path — 구간 모드에서는 진단을 코드로 자동 생성
+    if (st.session_state.section_mode
+            and st.session_state.revision_ranges):
+        st.success("⚡ 구간 모드 — 진단 자동 생성 (AI 호출 없이 즉시 완료)")
+        return _build_auto_diagnose_for_section_mode()
+
+    # 전체 각색 모드만 AI 진단
     prompt_text = build_diagnose_prompt(
         raw_text=st.session_state.raw_text,
         instruction=st.session_state.instruction,
