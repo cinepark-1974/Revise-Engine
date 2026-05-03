@@ -1761,11 +1761,103 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
     return parsed
 
 
+def _normalize_scene_time_marker(content: str) -> str:
+    """씬 헤더 시간 표기를 DAY/NIGHT 표준으로 정규화.
+
+    한국 시나리오 표준에 따라 씬 헤더는 INT./EXT. 장소 — DAY 또는 NIGHT 형식.
+    요일(월~일)·디테일 시간(아침/오전/오후/저녁/밤/낮/이른 아침/야경 등)은 모두 제거.
+
+    매핑:
+      아침 / 이른 아침 / 오전 / 낮 / 오후 / 정오 → DAY
+      저녁 / 밤 / 야경 / 새벽 / 자정              → NIGHT
+      요일만 표기                                  → DAY (보수적 기본값)
+    """
+    import re as _re
+
+    # 시간 키워드 매핑
+    day_keywords = ['이른 아침', '아침', '오전', '낮', '오후', '정오', '대낮']
+    night_keywords = ['이른 저녁', '저녁', '밤', '야경', '새벽', '자정', '한밤', '심야']
+    weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
+
+    def fix_header(match):
+        full = match.group(0)
+        scene_num = match.group(1)
+        in_ex = match.group(2)
+        location = match.group(3).strip()
+        time_part = match.group(4).strip()
+
+        # location 끝에 시간 키워드가 끼어든 경우 제거 (예: "한남동 골목 야경" → "한남동 골목")
+        for kw in ['야경', '새벽', '낮', '밤', '아침', '저녁']:
+            if location.endswith(' ' + kw):
+                location = location[:-len(kw)].rstrip()
+                # 시간 정보가 location에 있었으니 time_part에 합산해서 판정
+                time_part = kw + ' ' + time_part
+
+        # 우선순위 1: NIGHT 키워드 우선 검사 (저녁/밤은 강한 신호)
+        is_night = any(kw in time_part for kw in night_keywords)
+        is_day = any(kw in time_part for kw in day_keywords)
+
+        if is_night:
+            time_normalized = "NIGHT"
+        elif is_day:
+            time_normalized = "DAY"
+        else:
+            # 요일만 적힌 경우 — 보수적으로 DAY
+            has_weekday = any(wd in time_part for wd in weekdays)
+            if has_weekday:
+                time_normalized = "DAY"
+            else:
+                # 알 수 없는 표기 — 원본 유지
+                return full
+
+        return f"S#{scene_num}. {in_ex}. {location} — {time_normalized}"
+
+    # S#숫자. INT./EXT. 장소 — 시간표기 패턴
+    # 시간 표기는 — 뒤부터 줄바꿈 또는 다음 큰 구분까지
+    pattern = _re.compile(
+        r'S#(\d+(?:-\d+)?)\.\s*(INT|EXT)\.\s*([^\n—]+?)\s*—\s*([^\n]{1,40}?)(?=\n|$|\.\s+[가-힣A-Z])',
+        _re.MULTILINE
+    )
+    content = pattern.sub(fix_header, content)
+
+    # INT./EXT. 누락된 헤더도 시간 부분만 정규화 (장소만 있는 경우)
+    pattern_no_inext = _re.compile(
+        r'(S#\d+(?:-\d+)?\.\s+)([^\n]+?)\s+—\s+([^\n]{1,30}?)(?=\n|$)',
+        _re.MULTILINE
+    )
+
+    def fix_no_inext(match):
+        prefix = match.group(1)
+        location = match.group(2).strip()
+        time_part = match.group(3).strip()
+
+        # 이미 DAY/NIGHT면 건드리지 않음
+        if time_part in ('DAY', 'NIGHT'):
+            return match.group(0)
+
+        is_night = any(kw in time_part for kw in night_keywords)
+        is_day = any(kw in time_part for kw in day_keywords)
+        has_weekday = any(wd in time_part for wd in weekdays)
+
+        if is_night:
+            time_normalized = "NIGHT"
+        elif is_day or has_weekday:
+            time_normalized = "DAY"
+        else:
+            return match.group(0)
+
+        return f"{prefix}{location} — {time_normalized}"
+
+    content = pattern_no_inext.sub(fix_no_inext, content)
+    return content
+
+
 def _validate_and_fix_revised_format(revise_result: dict) -> dict:
     """REVISE 결과의 revised_content 포맷을 검증하고 자동 보강.
 
     AI가 한 줄 통짜로 출력한 경우를 감지해 자동 줄바꿈 삽입.
     Writer Engine 표준에 맞춰 캐릭터명 + 탭2 + 대사 형식 강제.
+    씬 헤더 시간 표기를 DAY/NIGHT 표준으로 정규화.
     """
     if not isinstance(revise_result, dict):
         return revise_result
@@ -1788,12 +1880,23 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
     )
 
     fixed_count = 0
+    time_normalized_count = 0
     for scene in revised_scenes:
         if not isinstance(scene, dict):
             continue
         content = scene.get("revised_content", "")
         if not content or len(content) < 100:
             continue
+
+        # ★ 모든 씬에 시간 표기 정규화 적용 (요일·디테일 시간 → DAY/NIGHT)
+        before_norm = content
+        content = _normalize_scene_time_marker(content)
+        if content != before_norm:
+            time_normalized_count += 1
+
+        # scene_header 필드도 함께 정규화
+        if "scene_header" in scene and isinstance(scene["scene_header"], str):
+            scene["scene_header"] = _normalize_scene_time_marker(scene["scene_header"])
 
         # 줄바꿈 비율 체크
         line_count = content.count('\n')
@@ -1839,6 +1942,8 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
     if fixed_count > 0:
         # 메타 정보로 자동 보강 사실 기록
         rr["_format_auto_fixed"] = fixed_count
+    if time_normalized_count > 0:
+        rr["_time_marker_normalized"] = time_normalized_count
 
     return revise_result
 
