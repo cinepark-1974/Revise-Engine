@@ -24,6 +24,9 @@
 #                    5. A32: POV Rotation Enforcer
 #                    6. ROMCOM Obstacle Intensity 모듈 (만남 빈도 50% 상한 + 장벽 4유형)
 #                    7. SPACE_DIVERSITY_CHECK 메타 마커 차단
+# v3.2.1 (2026-05-04) ★ 핫픽스 — show_step_2_revise()의 TypeError 수정.
+#                    proposed_direction/preservation_notes가 None일 때 슬라이싱 실패 방지.
+#                    부분 수정 모드에서 발생한 버그 해결.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -3581,7 +3584,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.2</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.2.1</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -5070,19 +5073,26 @@ def show_step_2_revise():
                     func = sc.get("original_function", "")
 
                     # ★ v3.1: 핵심 수정 방향 한 줄 추출
-                    items = sc.get("revision_items", [])
+                    # ★ v3.2.1 핫픽스: None 안전 처리
+                    items = sc.get("revision_items", []) or []
                     headline = ""
                     if items:
-                        first_item = items[0]
-                        proposed = first_item.get("proposed_direction", "") or first_item.get("issue", "")
-                        # 너무 길면 60자로 자르기
+                        first_item = items[0] if items[0] else {}
+                        proposed = (first_item.get("proposed_direction") or
+                                    first_item.get("issue") or "")
+                        # 명시적 str 변환 (혹시 dict나 다른 타입이 들어와도 안전)
+                        proposed = str(proposed) if proposed else ""
                         if len(proposed) > 60:
                             headline = proposed[:60] + "..."
                         else:
                             headline = proposed
-                    elif sc.get("preservation_notes"):
-                        pn = sc.get("preservation_notes", "")
-                        headline = pn[:60] + ("..." if len(pn) > 60 else "")
+
+                    if not headline:
+                        # preservation_notes 폴백 (None 안전)
+                        pn = sc.get("preservation_notes") or ""
+                        pn = str(pn) if pn else ""
+                        if pn:
+                            headline = pn[:60] + ("..." if len(pn) > 60 else "")
 
                     # ADD/REWRITE 한국어 라벨
                     type_kr = {
@@ -5476,7 +5486,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.2",
+                "engine": "BLUE JEANS REVISE ENGINE v3.2.1",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -5533,7 +5543,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.2  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.2.1  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
