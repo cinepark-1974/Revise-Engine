@@ -13,6 +13,17 @@
 # v3.0 (2026-05-03)  ★ 라우팅 버그 수정 — 모드 전환 시 잔존 데이터 강제 초기화.
 #                    Fast Path 0 조건 강화 (work_mode in {expansion} only).
 #                    진단 직전 모드 미리보기 박스 + 라우팅 디버그 표시.
+# v3.1 (2026-05-04)  ★ UI 한국어화 — "배치" → "N차 각색"으로 통일.
+#                    각 씬에 핵심 수정 방향 한 줄 표시 (작가 친화 UI).
+#                    ADD/REWRITE/DELETE 한국어 라벨 + 통계 표시.
+# v3.2 (2026-05-04)  ★ Writer Engine v3.5.1 동기화 — 7개 항목 일괄 동기화.
+#                    1. DOCX 줄간격 표준화 (3중 안전망 — _normalize_screenplay_blank_lines + prev_block_type + add_blank_line)
+#                    2. A29: 시간 정밀 표기 금지 (Writer A19 강화)
+#                    3. A30: Character Voice Differentiation
+#                    4. A31: Midpoint Erosion 차단
+#                    5. A32: POV Rotation Enforcer
+#                    6. ROMCOM Obstacle Intensity 모듈 (만남 빈도 50% 상한 + 장벽 4유형)
+#                    7. SPACE_DIVERSITY_CHECK 메타 마커 차단
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -697,6 +708,17 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
         _set_eastasia_font(r._element.get_or_add_rPr())
         return p
 
+    def add_blank_line():
+        """★ v3.2 — 지문↔대사 사이 빈 줄 (Writer Engine v3.5.1 자산 이식).
+        함초롬바탕 10pt로 통일된 빈 단락. 워드/한글 모두 일관된 높이."""
+        from docx.shared import Pt as _Pt
+        p = doc.add_paragraph(style='지문')
+        r = p.add_run("")
+        r.font.name = "함초롬바탕"
+        r.font.size = _Pt(10)
+        _set_eastasia_font(r._element.get_or_add_rPr())
+        return p
+
     def add_dialogue(char_name, parenthetical, line, continuation=False):
         """Writer Engine v3.1.3 자산 — 대사 본문 내 괄호 지시문은
         run을 분할하여 bold를 해제. 화자 표기의 괄호(예: V.O.)는 유지."""
@@ -1029,9 +1051,16 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
             continue
         _fixed_lines.append(_broken_lines[_j])
         _j += 1
-    lines = _fixed_lines
+
+    # ★ v3.2 — 지문↔대사 빈 줄 후처리 (3차 안전망, Writer Engine v3.5.1 자산)
+    _normalized_text = _normalize_screenplay_blank_lines("\n".join(_fixed_lines))
+    lines = _normalized_text.split("\n")
 
     i = 0
+    # ★ v3.2 — 지문↔대사 사이 빈 줄 자동 삽입을 위한 직전 블록 타입 추적
+    # (Writer Engine v3.5.1 자산 이식)
+    # 가능한 값: None, "scene", "action", "dialogue", "insert"
+    prev_block_type = None
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
@@ -1052,11 +1081,16 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
         if '내부 메모' in stripped or 'WRITER_NOTES' in stripped:
             i += 1
             continue
+        # ★ v3.2: SPACE_DIVERSITY_CHECK 마커 차단 (Writer v3.5 자산)
+        if 'SPACE_DIVERSITY_CHECK' in stripped:
+            i += 1
+            continue
 
         # 씬 헤딩
         m = heading_re.match(stripped)
         if m or _re.match(r'^S#\d+', stripped):
             add_scene_heading(stripped)
+            prev_block_type = "scene"  # ★ v3.2
             i += 1
             continue
 
@@ -1069,7 +1103,11 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
             inline_text = im.group(4).strip()
             if vo_marker:
                 char_name = f"{char_name} ({vo_marker})"
+            # ★ v3.2: 지문/insert 직후 대사면 빈 줄 1개 삽입
+            if prev_block_type in ("action", "insert"):
+                add_blank_line()
             add_dialogue(char_name, inline_paren, inline_text)
+            prev_block_type = "dialogue"  # ★ v3.2
             i += 1
             continue
 
@@ -1082,6 +1120,9 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
                 char_name = f"{char_name} ({vo_marker})"
             parenthetical = ""
             dialogue_lines = []
+            # ★ v3.2: 지문/insert 직후 대사면 빈 줄 1개 삽입
+            if prev_block_type in ("action", "insert"):
+                add_blank_line()
             i += 1
             if i < len(lines):
                 pm = paren_re.match(lines[i])
@@ -1104,10 +1145,15 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
             if dialogue_lines:
                 merged = " ".join(dialogue_lines)
                 add_dialogue(char_name, parenthetical, merged)
+            prev_block_type = "dialogue"  # ★ v3.2
             continue
 
         # 그 외: 지문
+        # ★ v3.2: 대사 직후 지문이면 빈 줄 1개 삽입
+        if prev_block_type == "dialogue":
+            add_blank_line()
         add_action(stripped)
+        prev_block_type = "action"  # ★ v3.2
         i += 1
 
     # ── 바이트 반환 ──
@@ -2938,6 +2984,71 @@ def _detect_paragraph_break_index(sentences: list) -> int:
     return candidates[0][0]
 
 
+# ═══════════════════════════════════════════════════════════
+# ★ v3.2 — 시나리오 줄간격 후처리 (Writer Engine v3.5.1 자산 이식)
+# 지문↔대사 사이에 빈 줄을 자동 삽입한다 (한국 시나리오 표준 포맷).
+# AI가 prompt.py 지시를 따라 빈 줄을 넣어 출력하는 것이 1차 안전망이고,
+# DOCX 빌더의 prev_block_type 추적이 2차 안전망,
+# 이 함수는 누락 시 보완하는 3차 안전망이다.
+# ═══════════════════════════════════════════════════════════
+
+def _normalize_screenplay_blank_lines(text: str) -> str:
+    """시나리오 본문에서 지문↔대사 사이 빈 줄을 보정한다.
+
+    규칙:
+    - 지문 다음 줄이 대사면 사이에 빈 줄 1개
+    - 대사 다음 줄이 지문이면 사이에 빈 줄 1개
+    - 같은 화자/다른 화자 대사 연속은 빈 줄 없이 유지
+    - 씬 헤딩 직전/직후는 기존 빈 줄 처리 유지
+    - 이미 빈 줄이 있으면 추가 삽입 안 함 (중복 방지)
+    """
+    import re as _re_norm
+
+    # 라인 분류 함수
+    heading_pat = _re_norm.compile(r'^S#\d+', _re_norm.UNICODE)
+    # 대사 패턴: "캐릭터명\t\t대사" (탭 1~3개 허용)
+    dialogue_pat = _re_norm.compile(r'^[^\t]+\t{1,}\S', _re_norm.UNICODE)
+
+    def line_type(line: str) -> str:
+        s = line.rstrip()
+        if not s.strip():
+            return "blank"
+        if heading_pat.match(s.strip()):
+            return "scene"
+        if dialogue_pat.match(s):
+            return "dialogue"
+        return "action"
+
+    lines = text.split('\n')
+    result = []
+    for idx, line in enumerate(lines):
+        cur_type = line_type(line)
+        # 이전 의미 있는 라인 타입 찾기 (빈 줄 건너뛰기)
+        prev_meaningful = None
+        for r_line in reversed(result):
+            r_type = line_type(r_line)
+            if r_type != "blank":
+                prev_meaningful = r_type
+                break
+
+        # 직전 줄이 빈 줄인지 (이미 분리된 상태인지)
+        already_separated = bool(result) and not result[-1].strip()
+
+        # 빈 줄 삽입 결정
+        need_blank = False
+        if prev_meaningful and not already_separated:
+            # 지문 → 대사 또는 대사 → 지문 전환
+            if (prev_meaningful == "action" and cur_type == "dialogue") or \
+               (prev_meaningful == "dialogue" and cur_type == "action"):
+                need_blank = True
+
+        if need_blank:
+            result.append("")
+        result.append(line)
+
+    return '\n'.join(result)
+
+
 def _split_action_paragraph(text: str) -> list:
     """
     지문 단락이 임계값을 넘으면 의미 비트 단위로 분할.
@@ -3470,7 +3581,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.0</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.2</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -4734,7 +4845,7 @@ def show_step_1_diagnose():
                 st.session_state.batch_results = {}
                 st.session_state.current_batch = 0
                 st.session_state.step = 2
-                st.success(f"✅ {len(batches)}개 배치로 분할되었습니다. 배치별로 집필을 진행합니다.")
+                st.success(f"✅ {len(batches)}차 각색으로 나누어집니다. 차례대로 집필합니다.")
                 st.rerun()
     with c2:
         if st.button("◀ 입력으로 돌아가기", use_container_width=True):
@@ -4830,7 +4941,7 @@ def show_step_2_revise():
                 file_name=backup_filename,
                 mime="application/json",
                 key="backup_progress",
-                help="에러 대비. 다음 배치 시작 전에 받아두세요.",
+                help="에러 대비. 다음 각색 시작 전에 받아두세요.",
                 use_container_width=True,
             )
 
@@ -4866,7 +4977,7 @@ def show_step_2_revise():
                             st.session_state.revision_ranges = loaded["revision_ranges"]
 
                         restored_count = len(st.session_state.batch_results)
-                        st.success(f"✅ 복구 완료: {restored_count}개 배치 결과 복원됨")
+                        st.success(f"✅ 복구 완료: {restored_count}차 각색 결과 복원됨")
                         st.rerun()
                     else:
                         st.info(
@@ -4877,15 +4988,15 @@ def show_step_2_revise():
                 except Exception as e:
                     st.error(f"백업 파일 로드 실패: {e}")
 
-    # 배치 전략 안내
+    # 각색 묶음 안내
     plan = st.session_state.diagnose_result.get("revision_plan", {})
     strategy = plan.get("batch_strategy", "")
     if strategy:
-        st.info(f"📋 **배치 전략:** {strategy}")
+        st.info(f"📋 **각색 진행 전략:** {strategy}")
 
     st.markdown("---")
 
-    # ── 배치 카드 목록 ──
+    # ── 각색 카드 목록 ──
     for batch in batches:
         bidx = batch["batch_index"]
         scenes = batch["scenes"]
@@ -4900,11 +5011,37 @@ def show_step_2_revise():
         elif is_current:
             status_icon = "▶️"
             status_color = "#FFCB05"
-            status_text = "다음 배치"
+            status_text = "다음 차례"
         else:
             status_icon = "⏸️"
             status_color = "#8E8E99"
-            status_text = "대기"
+            status_text = "대기 중"
+
+        # ★ v3.1 한국어 통계 (priority_summary, type_summary 한글화)
+        # priority_summary는 "HIGH 6개" 식 → 그대로 사용
+        # type_summary는 "REWRITE 6개" 식 → "수정 6 / 추가 0" 형태로 변환
+        type_summary_kr = batch.get("type_summary", "")
+        # type_summary 파싱 (예: "REWRITE 6개" 또는 "REWRITE 4 · ADD 2")
+        import re as _re_v31
+        rewrite_n = 0
+        add_n = 0
+        delete_n = 0
+        merge_n = 0
+        split_n = 0
+        for sc in scenes:
+            t = sc.get("type", "REWRITE")
+            if t == "ADD": add_n += 1
+            elif t == "DELETE": delete_n += 1
+            elif t == "MERGE": merge_n += 1
+            elif t == "SPLIT": split_n += 1
+            else: rewrite_n += 1
+        type_parts_kr = []
+        if rewrite_n > 0: type_parts_kr.append(f"수정 {rewrite_n}")
+        if add_n > 0: type_parts_kr.append(f"✨추가 {add_n}")
+        if delete_n > 0: type_parts_kr.append(f"삭제 {delete_n}")
+        if merge_n > 0: type_parts_kr.append(f"합치기 {merge_n}")
+        if split_n > 0: type_parts_kr.append(f"쪼개기 {split_n}")
+        type_summary_kr_final = " · ".join(type_parts_kr) if type_parts_kr else f"씬 {len(scenes)}개"
 
         with st.container():
             st.markdown(
@@ -4912,19 +5049,19 @@ def show_step_2_revise():
                 f'border-radius:10px; padding:16px; margin-bottom:12px;">'
                 f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">'
                 f'<div style="font-family:Paperlogy,sans-serif; font-weight:800; font-size:1.05rem; color:#191970;">'
-                f'{status_icon} 배치 {bidx} / {total_batches}'
+                f'{status_icon} 각색 {bidx}차 ({bidx} / {total_batches})'
                 f'</div>'
                 f'<div style="color:{status_color}; font-weight:700; font-size:0.85rem;">{status_text}</div>'
                 f'</div>'
                 f'<div style="color:#8E8E99; font-size:0.85rem; margin-bottom:8px;">'
-                f'{batch["priority_summary"]}  ·  {batch["type_summary"]}  ·  씬 {len(scenes)}개'
+                f'우선순위: {batch["priority_summary"]}  ·  {type_summary_kr_final}  ·  총 {len(scenes)}씬'
                 f'</div>'
                 f'</div>',
                 unsafe_allow_html=True
             )
 
             # 씬 목록 (작은 expander)
-            with st.expander(f"씬 목록 ({len(scenes)}개)", expanded=is_current and not is_done):
+            with st.expander(f"📝 수정 대상 씬 ({len(scenes)}개) — 클릭하면 무엇을 고치는지 보입니다", expanded=is_current and not is_done):
                 for sc in scenes:
                     sid = sc.get("scene_id", "")
                     pri = sc.get("priority", "MEDIUM")
@@ -4932,66 +5069,105 @@ def show_step_2_revise():
                     pos = sc.get("scene_position", "")
                     func = sc.get("original_function", "")
 
-                    st.markdown(
+                    # ★ v3.1: 핵심 수정 방향 한 줄 추출
+                    items = sc.get("revision_items", [])
+                    headline = ""
+                    if items:
+                        first_item = items[0]
+                        proposed = first_item.get("proposed_direction", "") or first_item.get("issue", "")
+                        # 너무 길면 60자로 자르기
+                        if len(proposed) > 60:
+                            headline = proposed[:60] + "..."
+                        else:
+                            headline = proposed
+                    elif sc.get("preservation_notes"):
+                        pn = sc.get("preservation_notes", "")
+                        headline = pn[:60] + ("..." if len(pn) > 60 else "")
+
+                    # ADD/REWRITE 한국어 라벨
+                    type_kr = {
+                        "ADD": "✨추가",
+                        "REWRITE": "✏️수정",
+                        "DELETE": "🗑️삭제",
+                        "MERGE": "🔗합치기",
+                        "SPLIT": "✂️쪼개기",
+                    }.get(typ, typ)
+
+                    # 메인 라인
+                    main_line = (
                         f'{_priority_badge(pri)} {_type_badge(typ)} '
-                        f'<b>{sid}</b>  '
-                        f'<span style="color:#8E8E99; font-size:0.85rem;">— {pos}</span>',
-                        unsafe_allow_html=True
+                        f'<b>{sid}</b>'
                     )
+                    if pos:
+                        main_line += f'  <span style="color:#8E8E99; font-size:0.85rem;">— {pos}</span>'
+                    st.markdown(main_line, unsafe_allow_html=True)
+
+                    # ★ v3.1: 핵심 수정 방향 한 줄 (가장 중요한 정보)
+                    if headline:
+                        st.markdown(
+                            f'<div style="margin:4px 0 8px 8px; padding:6px 10px; '
+                            f'background:#FFF8E1; border-left:3px solid #FFCB05; '
+                            f'border-radius:4px; font-size:0.9rem;">'
+                            f'<b style="color:#191970;">→ 핵심 방향:</b> {headline}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
                     if func:
                         st.caption(f"플롯상 기능: {func}")
 
-                    # 수정 항목 요약
-                    items = sc.get("revision_items", [])
-                    for it in items[:3]:  # 최대 3개만 표시
-                        st.markdown(f"  └ *{it.get('issue','')}* → {it.get('proposed_direction','')}")
+                    # 추가 수정 항목 (2번째 이후)
+                    if len(items) > 1:
+                        with st.expander(f"📌 세부 수정 항목 {len(items)}개 보기", expanded=False):
+                            for it in items:
+                                st.markdown(f"  • *{it.get('issue','')}* → {it.get('proposed_direction','')}")
                     st.markdown("")
 
-            # 배치 액션 버튼
+            # 각색 액션 버튼
             bc1, bc2, bc3 = st.columns([2, 1, 1])
             with bc1:
                 if is_done:
-                    # 완료된 배치 — 결과 미리보기 + 재집필
-                    btn_label = f"🔄 배치 {bidx} 재집필"
+                    # 완료된 각색 — 결과 미리보기 + 재집필
+                    btn_label = f"🔄 {bidx}차 각색 다시 하기"
                     if st.button(btn_label, key=f"rewrite_batch_{bidx}", use_container_width=True):
                         client = get_client()
                         if client:
-                            with st.spinner(f"✍️ 배치 {bidx} 재집필 중... (Opus 4.6)"):
+                            with st.spinner(f"✍️ {bidx}차 각색 다시 진행 중... (Opus 4.6)"):
                                 result = run_revise_batch(client, bidx, scenes, total_batches)
                                 if result:
                                     st.session_state.batch_results[bidx] = result
-                                    st.success(f"✅ 배치 {bidx} 재집필 완료")
+                                    st.success(f"✅ {bidx}차 각색 완료")
                                     st.rerun()
                                 else:
-                                    st.error(f"배치 {bidx} 재집필 실패")
+                                    st.error(f"{bidx}차 각색 실패")
                 elif is_current:
-                    # 다음 차례 배치 — 집필 시작
-                    btn_label = f"▶️ 배치 {bidx} 집필 시작"
+                    # 다음 차례 — 집필 시작
+                    btn_label = f"▶️ {bidx}차 각색 시작 ({len(scenes)}씬)"
                     if st.button(btn_label, key=f"run_batch_{bidx}", type="primary", use_container_width=True):
                         client = get_client()
                         if client:
-                            with st.spinner(f"✍️ 배치 {bidx} 집필 중... ({len(scenes)}개 씬, Opus 4.6, 1~3분 소요)"):
+                            with st.spinner(f"✍️ {bidx}차 각색 진행 중... ({len(scenes)}씬, Opus 4.6, 1~3분 소요)"):
                                 result = run_revise_batch(client, bidx, scenes, total_batches)
                                 if result:
                                     st.session_state.batch_results[bidx] = result
-                                    st.success(f"✅ 배치 {bidx} 완료")
-                                    # 다음 배치 들어가기 전 백업 권고
+                                    st.success(f"✅ {bidx}차 각색 완료")
+                                    # 다음 묶음 들어가기 전 백업 권고
                                     if bidx < total_batches:
                                         st.info(
-                                            f"💡 **다음 배치 진행 전, 위쪽 [💾 진행 상황 백업] 버튼을 눌러 "
-                                            f"현재까지 결과({bidx}/{total_batches} 배치)를 다운로드해두세요. "
+                                            f"💡 **다음 각색 진행 전, 위쪽 [💾 진행 상황 백업] 버튼을 눌러 "
+                                            f"현재까지 결과({bidx}/{total_batches}차)를 다운로드해두세요. "
                                             f"에러 발생 시 백업에서 복구할 수 있습니다.**"
                                         )
                                     st.rerun()
                                 else:
                                     st.error(
-                                        f"❌ 배치 {bidx} 집필 실패. "
+                                        f"❌ {bidx}차 각색 실패. "
                                         f"위쪽 [💾 진행 상황 백업]으로 지금까지 결과를 먼저 저장하세요. "
                                         f"그 다음 다시 시도해주세요."
                                     )
                 else:
-                    # 대기 중 (이전 배치 미완료)
-                    st.button(f"⏸️ 배치 {bidx} 대기 중", disabled=True, use_container_width=True,
+                    # 대기 중 (이전 묶음 미완료)
+                    st.button(f"⏸️ {bidx}차 각색 (대기 중)", disabled=True, use_container_width=True,
                               key=f"wait_batch_{bidx}")
 
             with bc2:
@@ -5005,7 +5181,7 @@ def show_step_2_revise():
                 if is_done:
                     if st.button("🗑️ 결과 삭제", key=f"delete_batch_{bidx}", use_container_width=True):
                         del st.session_state.batch_results[bidx]
-                        # 이후 배치 결과도 삭제 (순차 의존성)
+                        # 이후 각색 결과도 삭제 (순차 의존성)
                         for later_idx in range(bidx + 1, total_batches + 1):
                             st.session_state.batch_results.pop(later_idx, None)
                         st.rerun()
@@ -5018,7 +5194,7 @@ def show_step_2_revise():
                     st.markdown(
                         f'<div style="background:#F7F7F5; border-left:4px solid #2EC484; '
                         f'padding:12px 16px; border-radius:0 8px 8px 0; margin-top:8px; margin-bottom:8px;">'
-                        f'<b style="color:#191970;">배치 {bidx} 결과 요약</b><br/>'
+                        f'<b style="color:#191970;">{bidx}차 각색 결과 요약</b><br/>'
                         f'<span style="color:#1A1A2E;">{rr.get("summary","(요약 없음)")}</span>'
                         f'</div>',
                         unsafe_allow_html=True
@@ -5048,17 +5224,17 @@ def show_step_2_revise():
 
     st.markdown("---")
 
-    # ── 모든 배치 완료 시 다음 단계 ──
+    # ── 모든 각색 완료 시 다음 단계 ──
     all_done = (completed_count == total_batches)
 
     if all_done:
-        st.success(f"🎉 모든 배치 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
+        st.success(f"🎉 모든 각색 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         if st.button("✅ Stage 3: 검증 시작 (VERIFY)",
                      disabled=not all_done, use_container_width=True, type="primary"):
-            # 모든 배치 결과 통합
+            # 모든 각색 결과 통합
             all_results = [batch_results[i] for i in range(1, total_batches + 1) if i in batch_results]
             merged = merge_batch_results(all_results)
             st.session_state.revise_result = merged
@@ -5087,13 +5263,13 @@ def show_step_2_revise():
                             continue
                         progress_bar.progress(
                             (completed_count + (i - completed_count + 1)) / total_batches,
-                            text=f"배치 {bidx} 집필 중... ({len(batch['scenes'])}개 씬)"
+                            text=f"{bidx}차 각색 진행 중... ({len(batch['scenes'])}개 씬)"
                         )
                         result = run_revise_batch(client, bidx, batch["scenes"], total_batches)
                         if result:
                             st.session_state.batch_results[bidx] = result
                         else:
-                            st.error(f"배치 {bidx}에서 실패. 중단합니다.")
+                            st.error(f"{bidx}차 각색에서 실패. 중단합니다.")
                             break
                     progress_bar.empty()
                     st.rerun()
@@ -5300,7 +5476,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.0",
+                "engine": "BLUE JEANS REVISE ENGINE v3.2",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -5357,12 +5533,13 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.0  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.2  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
     '<span style="color:#EC4899;">Beat Expansion Mode</span>  ·  '
-    '<span style="color:#6B7280;">Routing Hardened</span>'
+    '<span style="color:#6366F1;">작가 친화 UI</span>  ·  '
+    '<span style="color:#0EA5E9;">Writer v3.5.1 Sync</span>'
     '</div>',
     unsafe_allow_html=True,
 )
