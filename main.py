@@ -38,6 +38,10 @@
 #                    [1차 수정용] Rewrite Engine JSON / [N차 수정용] Revise 검증 보고서 명시.
 #                    피드백 자료 헤더 아래 워크플로우 안내 박스 추가.
 #                    Rewrite JSON 캡션에 MOON 자산 분리 명시 (전략 흡수 / 원고만 제외).
+# v3.3.2 (2026-05-04) ★ 파일명 백업 관리 강화 — 모든 출력 파일에 라운드·시·분·점수 명시.
+#                    형식: 제목_종류_R(라운드)_score(점수)_YYYYMMDD_HHMM_Blue.확장자
+#                    같은 날 여러 라운드 작업해도 파일 자동 구분.
+#                    수정본 DOCX, 검증 DOCX, 검증 JSON, 진행 백업, 전체 JSON 모두 통일.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -1184,6 +1188,51 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
 # =================================================================
 # ★★★ v3.3 — 검증 보고서 DOCX 파서 + JSON 출력 + 자동 후처리 ★★★
 # =================================================================
+
+def _get_round_aware_filename(title: str, kind: str = "revised", ext: str = "docx") -> str:
+    """v3.3.2 — 라운드·시·분 인지 파일명 생성.
+
+    형식: 제목_종류_R(라운드)_score(점수)_YYYYMMDD_HHMM_Blue.ext
+    예시: 오랜만에_가제_수정본_R2_score78_20260504_2305_Blue.docx
+          테이스티_러브_검증보고서_R1_score68_20260504_2310_Blue.json
+
+    score는 verify_result에서 자동 추출되며, 없으면 생략.
+    """
+    import re as _re_filename
+    from datetime import datetime as _dt_filename
+
+    safe_title = _re_filename.sub(r'[/*?:"<>|]', '_', title.strip()) if title else "제목없음"
+    timestamp = _dt_filename.now().strftime("%Y%m%d_%H%M")
+
+    kind_map = {
+        "revised": "수정본",
+        "verify":  "검증보고서",
+        "diagnose": "수정플랜",
+        "backup": "백업",
+    }
+    kind_kor = kind_map.get(kind, kind)
+
+    # 라운드 번호 (있으면)
+    try:
+        round_n = st.session_state.get("round_n", 1)
+        round_str = f"_R{round_n}"
+    except Exception:
+        round_str = ""
+
+    # 점수 (있으면, verify_result에서 자동 추출)
+    score_str = ""
+    try:
+        verify_result = st.session_state.get("verify_result", {})
+        if verify_result and isinstance(verify_result, dict):
+            score = verify_result.get("overall_score")
+            if isinstance(score, (int, float)):
+                # 7.8 → "score78", 6.5 → "score65"
+                score_str = f"_score{int(score * 10)}"
+    except Exception:
+        pass
+
+    return f"{safe_title}_{kind_kor}{round_str}{score_str}_{timestamp}_Blue.{ext}"
+
 
 def parse_verification_docx(file_obj_or_path) -> dict:
     """검증 보고서 DOCX를 파싱하여 다음 라운드 입력으로 변환.
@@ -3921,7 +3970,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.1</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.2</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -5444,15 +5493,24 @@ def show_step_2_revise():
                 "revision_ranges": st.session_state.revision_ranges,
             }
             backup_json = _json.dumps(backup_data, ensure_ascii=False, indent=2)
-            backup_filename = f"revise_backup_{st.session_state.title}_{completed_count}of{total_batches}_{_dt.now().strftime('%Y%m%d_%H%M')}.json"
+            # ★ v3.3.2: 백업 파일명에 라운드 번호 + 안전한 제목 처리
+            import re as _re_backup
+            _safe_title_backup = _re_backup.sub(r'[/*?:"<>|]', '_',
+                                                  (st.session_state.title or "제목없음").strip())
+            _round_n_backup = st.session_state.get("round_n", 1)
+            backup_filename = (
+                f"{_safe_title_backup}_백업_R{_round_n_backup}_"
+                f"{completed_count}of{total_batches}_"
+                f"{_dt.now().strftime('%Y%m%d_%H%M')}_Blue.json"
+            )
 
             st.download_button(
-                f"💾 진행 상황 백업 ({completed_count}/{total_batches} 배치)",
+                f"💾 진행 상황 백업 ({completed_count}/{total_batches} 각색)",
                 data=backup_json.encode("utf-8"),
                 file_name=backup_filename,
                 mime="application/json",
                 key="backup_progress",
-                help="에러 대비. 다음 각색 시작 전에 받아두세요.",
+                help="에러 대비. 다음 각색 시작 전에 받아두세요. 파일명에 라운드·진행도·시·분 표시.",
                 use_container_width=True,
             )
 
@@ -5932,6 +5990,22 @@ def show_step_4_complete():
     title = st.session_state.title or "수정본"
     genre = st.session_state.genre
 
+    # ★ v3.3.2 — 파일명 가이드 안내 박스
+    _round_v332 = st.session_state.get("round_n", 1)
+    _score_v332 = st.session_state.get("verify_result", {}).get("overall_score", "?")
+    st.markdown(
+        f'<div style="background:#F8F9FB; padding:10px 14px; border-radius:6px; '
+        f'border-left:3px solid #6B7280; margin:8px 0; font-size:0.85rem;">'
+        f'<b>📁 v3.3.2 — 파일명 규칙</b><br>'
+        f'모든 출력 파일은 <code>제목_종류_R(라운드)_score(점수)_YYYYMMDD_HHMM_Blue.확장자</code> 형식.<br>'
+        f'<span style="color:#666;">'
+        f'예시: <code>{title}_수정본_R{_round_v332}_score{int(_score_v332*10) if isinstance(_score_v332, (int,float)) else "??"}_'
+        f'{datetime.now().strftime("%Y%m%d_%H%M")}_Blue.docx</code><br>'
+        f'💡 같은 작품을 여러 라운드 작업해도 파일이 자동으로 구분됩니다 (시·분·라운드·점수 모두 포함).'
+        f'</span></div>',
+        unsafe_allow_html=True
+    )
+
     c1, c2 = st.columns(2)
 
     # 수정본 DOCX
@@ -5957,10 +6031,10 @@ def show_step_4_complete():
             st.download_button(
                 "📄 수정본 (DOCX)",
                 data=docx_bytes,
-                file_name=get_report_filename(title, "revised"),
+                file_name=_get_round_aware_filename(title, "revised"),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key="dl_revised",
-                help="원본 + 수정된 씬을 통합한 최종 시나리오 (한국 표준 서식)",
+                help="원본 + 수정된 씬을 통합한 최종 시나리오 (한국 표준 서식). 파일명에 라운드·시·분 표시.",
                 use_container_width=True,
             )
         except Exception as e:
@@ -5976,10 +6050,10 @@ def show_step_4_complete():
             st.download_button(
                 "✅ 검증 보고서 (DOCX)",
                 data=verify_bytes,
-                file_name=get_report_filename(title, "verify"),
+                file_name=_get_round_aware_filename(title, "verify"),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key="dl_verify",
-                help="지시사항 반영 + LOCKED 보존 + AI ESCAPE + 장르 준수도 검증",
+                help="지시사항 반영 + LOCKED 보존 + AI ESCAPE + 장르 준수도 검증. 파일명에 라운드·시·분 표시.",
                 use_container_width=True,
             )
         except Exception as e:
@@ -5999,18 +6073,23 @@ def show_step_4_complete():
     cj1, cj2 = st.columns([1, 1])
     with cj1:
         try:
+            current_round = st.session_state.get("round_n", 1)
             verify_json_bytes = export_verify_json(
                 st.session_state.verify_result,
                 title=title,
-                round_n=st.session_state.get("round_n", 1),
+                round_n=current_round,
             )
+
             st.download_button(
                 "📊 검증 보고서 (JSON) — 다음 라운드용",
                 data=verify_json_bytes,
-                file_name=get_report_filename(title, "verify").replace(".docx", ".json"),
+                file_name=_get_round_aware_filename(title, "verify", "json"),
                 mime="application/json",
                 key="dl_verify_json",
-                help="다음 라운드 작업 시 'v3.3 검증 보고서 흡수' 영역에 업로드하면 자동 변환",
+                help=(
+                    "다음 라운드 작업 시 'v3.3 검증 보고서 흡수' 영역에 업로드하면 자동 변환.\n"
+                    "파일명 형식: 제목_검증보고서_R(라운드)_score(점수)_YYYYMMDD_HHMM_Blue.json"
+                ),
                 use_container_width=True,
             )
         except Exception as e:
@@ -6030,7 +6109,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.1",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.2",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6042,11 +6121,11 @@ def show_step_4_complete():
         }
         json_bytes = json.dumps(full_state, ensure_ascii=False, indent=2).encode("utf-8")
         safe_title = re.sub(r'[/*?:"<>|]', '_', title)
-        date_str = datetime.now().strftime("%Y%m%d")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")  # ★ v3.3.2: 시·분 추가
         st.download_button(
             "📋 전체 JSON 다운로드",
             data=json_bytes,
-            file_name=f"{safe_title}_revise_full_{date_str}.json",
+            file_name=f"{safe_title}_revise_full_{timestamp}.json",
             mime="application/json",
             key="dl_json_full",
             use_container_width=True,
@@ -6087,7 +6166,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.1  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.2  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '

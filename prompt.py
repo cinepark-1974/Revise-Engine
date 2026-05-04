@@ -3070,18 +3070,23 @@ JSON만 출력하라. 설명·주석·마크다운 금지.
 # [8] 보고서 파일명 생성 유틸
 # =================================================================
 def get_report_filename(title: str, kind: str = "revised") -> str:
-    """파일명 생성: 제목_수정본_날짜.docx 등"""
+    """파일명 생성: 제목_수정본_YYYYMMDD_HHMM_Blue.docx 등.
+
+    v3.3.2: 같은 날 여러 차례 작업할 때 시·분으로 구분.
+    예: 오랜만에_가제_수정본_20260504_2055_Blue.docx
+        오랜만에_가제_검증보고서_20260504_2055_Blue.docx
+    """
     import re
     from datetime import datetime
     safe_title = re.sub(r'[/*?:"<>|]', '_', title.strip()) if title else "제목없음"
-    date_str = datetime.now().strftime("%Y%m%d")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")  # ★ v3.3.2: 시·분 추가
     kind_map = {
         "revised": "수정본",
         "verify":  "검증보고서",
         "diagnose": "수정플랜"
     }
     kind_kor = kind_map.get(kind, kind)
-    return f"{safe_title}_{kind_kor}_{date_str}_Blue.docx"
+    return f"{safe_title}_{kind_kor}_{timestamp}_Blue.docx"
 
 
 # =================================================================
