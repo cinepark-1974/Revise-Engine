@@ -53,6 +53,13 @@
 #                       (숫자·괄호 마커 F/M/TEL/전화/VO/OS 추가 인식)
 #                    2. 빈 씬 자동 제거 — LLM이 "통합" 처방 시 한쪽 씬을 비워서
 #                       헤더만 남기는 패턴(예: S#16 본문 없이 헤더만) 자동 필터링.
+# v3.3.5 (2026-05-04) ★ A33 신규 룰 + 자동 후처리 — Verbatim Repetition Prohibition.
+#                    「오랜만에」 Round 2에서 발견된 LLM 출력 결함 3가지 방어:
+#                    1. 같은 씬 통째로 중복 출력 (S#36-2, S#44 케이스) → 자동 제거
+#                    2. 같은 씬 내 동일 대사 중복 (S#17 "알아요." 케이스) → 자동 제거
+#                    3. 작품 전체 verbatim 반복 (수익률 34 케이스) → 검출·경고
+#                    A33 룰 prompt.py 추가 + auto_fix_a33_violations 함수 +
+#                    auto_fix_duplicate_scene_blocks 함수.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -1059,6 +1066,17 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
 
     full_text = '\n\n'.join(_filtered_scenes)
 
+    # ★ v3.3.5: 통째로 중복된 씬 블록 자동 제거 (A33 후처리)
+    full_text, _dup_removed = auto_fix_duplicate_scene_blocks(full_text)
+    if _dup_removed > 0:
+        try:
+            st.warning(
+                f"⚠️ A33 위반 자동 처리: {_dup_removed}개 씬이 통째로 중복 출력됨 → 두 번째 블록 자동 제거. "
+                f"(LLM이 ADD 처방 시 같은 씬을 두 번 쓰는 결함 — 정상 처리)"
+            )
+        except Exception:
+            pass
+
     # ─────────────────────────────────────────────────────────
     # 본문 라인 단위 파싱 (Writer Engine 동일 로직)
     # ─────────────────────────────────────────────────────────
@@ -1512,6 +1530,164 @@ def auto_fix_a29_violations(text: str) -> tuple:
             count += n
 
     return fixed, count
+
+
+# =================================================================
+# ★★★ v3.3.5 — A33 자동 검증·수정 (Verbatim Repetition Prohibition) ★★★
+# =================================================================
+
+def auto_fix_a33_violations(scenes_dict: dict) -> tuple:
+    """v3.3.5 — A33 위반 자동 후처리.
+
+    3가지 결함 패턴 자동 처리:
+    1. 같은 씬 ID가 두 번 등장 → 두 번째 제거
+    2. 같은 씬 내 같은 화자 동일 대사 → 두 번째 제거
+    3. 작품 전체에서 동일 대사 verbatim 반복 → 경고만 (변주는 작가 결정 필요)
+
+    Args:
+        scenes_dict: {"scenes": [{"scene_id": "S#1", "scene_header": "...",
+                                  "revised_content": "..."}], ...}
+
+    Returns:
+        (fixed_dict, stats) — 수정된 dict + 통계
+    """
+    import re as _re_v335
+    from collections import defaultdict
+
+    if not isinstance(scenes_dict, dict):
+        return scenes_dict, {"errors": "invalid_input"}
+
+    rr = scenes_dict.get("revise_result", scenes_dict)
+    scenes = rr.get("scenes", []) if isinstance(rr, dict) else []
+    if not scenes:
+        return scenes_dict, {"no_scenes": True}
+
+    stats = {
+        "duplicate_scenes_removed": 0,
+        "in_scene_duplicate_dialogues_removed": 0,
+        "verbatim_repetitions_warned": [],
+    }
+
+    # === Phase 1: 같은 씬 ID 두 번 등장 → 두 번째 제거 ===
+    seen_scene_ids = set()
+    deduped_scenes = []
+    for sc in scenes:
+        sid = sc.get("scene_id", "")
+        if sid in seen_scene_ids:
+            stats["duplicate_scenes_removed"] += 1
+            continue
+        if sid:
+            seen_scene_ids.add(sid)
+        deduped_scenes.append(sc)
+    scenes = deduped_scenes
+
+    # === Phase 2: 같은 씬 내 동일 대사 중복 제거 ===
+    dialogue_pattern = _re_v335.compile(
+        r'^([가-힣a-zA-Z0-9\s]{1,15}?)\s*(?:\([^)]*\))?\s*\t+(?:\([^)]*\))?\s*(.+)$'
+    )
+    for sc in scenes:
+        content = sc.get("revised_content", "")
+        if not content:
+            continue
+        lines = content.split('\n')
+        seen_dialogues = {}
+        new_lines = []
+        for ln in lines:
+            m = dialogue_pattern.match(ln.strip())
+            if m and "\t\t" in ln:
+                speaker = m.group(1).strip()
+                dialogue = _re_v335.sub(r'[\s.,!?…\-]', '', m.group(2).strip())
+                key = f"{speaker}::{dialogue}"
+                if dialogue and len(dialogue) >= 5 and key in seen_dialogues:
+                    # 같은 씬 내 동일 대사 중복 — 제거
+                    stats["in_scene_duplicate_dialogues_removed"] += 1
+                    continue
+                seen_dialogues[key] = True
+            new_lines.append(ln)
+        sc["revised_content"] = '\n'.join(new_lines)
+
+    # === Phase 3: 작품 전체 verbatim 반복 검출 → 경고만 ===
+    # (자동 변주는 LLM 영역이므로 코드는 식별만 함)
+    global_dialogues = defaultdict(list)
+    for sc in scenes:
+        content = sc.get("revised_content", "")
+        sid = sc.get("scene_id", "")
+        for ln in content.split('\n'):
+            m = dialogue_pattern.match(ln.strip())
+            if m and "\t\t" in ln:
+                speaker = m.group(1).strip()
+                dialogue = _re_v335.sub(r'[\s.,!?…\-]', '', m.group(2).strip())
+                if dialogue and len(dialogue) >= 8:  # 8자 이상만 (짧은 응답 제외)
+                    key = f"{speaker}::{dialogue}"
+                    global_dialogues[key].append(sid)
+
+    for key, scene_ids in global_dialogues.items():
+        if len(scene_ids) >= 2:
+            speaker = key.split("::")[0]
+            stats["verbatim_repetitions_warned"].append({
+                "speaker": speaker,
+                "occurrence_count": len(scene_ids),
+                "scenes": scene_ids,
+            })
+
+    rr["scenes"] = scenes
+    rr["_a33_auto_fix_stats"] = stats
+
+    return scenes_dict, stats
+
+
+def auto_fix_duplicate_scene_blocks(full_text: str) -> tuple:
+    """v3.3.5 — 통합 본문(full_text)에서 씬 블록 통째로 중복 자동 제거.
+
+    같은 씬 헤더(예: 'S#36-2')가 본문과 함께 두 번 출현하면
+    두 번째 블록을 제거.
+
+    Args:
+        full_text: 통합된 시나리오 본문 텍스트
+
+    Returns:
+        (fixed_text, removed_count)
+    """
+    import re as _re_v335
+
+    # 씬 단위로 분할
+    scene_pat = _re_v335.compile(r'(?=^S#\d+(?:-\d+)?\.\s)', _re_v335.MULTILINE)
+    blocks = scene_pat.split(full_text)
+
+    seen_blocks = {}  # scene_id → first_block_normalized
+    output_blocks = []
+    removed = 0
+
+    for blk in blocks:
+        if not blk.strip():
+            output_blocks.append(blk)
+            continue
+        # 첫 줄에서 씬 ID 추출
+        first_line = blk.strip().split('\n')[0] if blk.strip() else ""
+        m = _re_v335.match(r'^(S#\d+(?:-\d+)?)\.', first_line)
+        if not m:
+            output_blocks.append(blk)
+            continue
+        sid = m.group(1)
+
+        # 본문 정규화 (공백·구두점 제거)
+        body_normalized = _re_v335.sub(r'\s+', '', blk)
+
+        if sid in seen_blocks:
+            # 같은 씬 ID 두 번 등장 — 본문도 같은지 확인
+            if seen_blocks[sid] == body_normalized:
+                # 통째로 중복 — 제거
+                removed += 1
+                continue
+            # 본문이 다르면 — 그래도 같은 씬 ID 중복은 결함이므로 두 번째 제거
+            # (의도적 분할 씬은 S#XX-1, S#XX-2 같이 다른 ID를 써야 함)
+            removed += 1
+            continue
+
+        seen_blocks[sid] = body_normalized
+        output_blocks.append(blk)
+
+    return ''.join(output_blocks), removed
 
 
 def export_verify_json(verify_result: dict, title: str = "",
@@ -4048,6 +4224,35 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
             # 세션 외부에서 호출되면 통과
             pass
 
+        # ★ v3.3.5 — A33 자동 후처리: 같은 씬 내 동일 대사 중복 제거
+        try:
+            import re as _re_a33
+            _dialogue_pat = _re_a33.compile(
+                r'^([가-힣a-zA-Z0-9\s]{1,15}?)\s*(?:\([^)]*\))?\s*\t+(?:\([^)]*\))?\s*(.+)$'
+            )
+            _content_lines = content.split('\n')
+            _seen_dialogues = {}
+            _new_lines = []
+            _a33_removed_in_scene = 0
+            for _ln in _content_lines:
+                _m = _dialogue_pat.match(_ln.strip())
+                if _m and "\t\t" in _ln:
+                    _speaker = _m.group(1).strip()
+                    _norm = _re_a33.sub(r'[\s.,!?…\-]', '', _m.group(2).strip())
+                    _key = f"{_speaker}::{_norm}"
+                    if _norm and len(_norm) >= 5 and _key in _seen_dialogues:
+                        _a33_removed_in_scene += 1
+                        continue
+                    _seen_dialogues[_key] = True
+                _new_lines.append(_ln)
+            if _a33_removed_in_scene > 0:
+                content = '\n'.join(_new_lines)
+                if "_a33_auto_fixed_total" not in rr:
+                    rr["_a33_auto_fixed_total"] = 0
+                rr["_a33_auto_fixed_total"] += _a33_removed_in_scene
+        except Exception:
+            pass
+
         # ★ A21/A22/시간 정규화로 변경된 내용도 무조건 저장
         scene["revised_content"] = content
 
@@ -4106,7 +4311,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.4</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.5</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6245,7 +6450,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.4",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.5",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6302,7 +6507,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.4  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.5  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
