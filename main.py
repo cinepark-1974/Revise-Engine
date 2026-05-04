@@ -60,6 +60,10 @@
 #                    3. 작품 전체 verbatim 반복 (수익률 34 케이스) → 검출·경고
 #                    A33 룰 prompt.py 추가 + auto_fix_a33_violations 함수 +
 #                    auto_fix_duplicate_scene_blocks 함수.
+# v3.3.6 (2026-05-04) ★ A34 신규 룰 — Concrete Evasion (구체적 회피).
+#                    「오랜만에」 S#35에서 발견된 LLM 결함 방어.
+#                    추상적 메타포 우회 ("빈 자리가 있으면 채우는 게 서점") 금지.
+#                    우회 4유형(행동/사실/침묵/직업)만 허용. 예외 케이스 명시.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -4311,7 +4315,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.5</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.6</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6450,7 +6454,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.5",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.6",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6507,7 +6511,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.5  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.6  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
