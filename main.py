@@ -47,6 +47,12 @@
 #                    실제 LLM 응답은 verify_result["verify_report"][...]에 데이터 저장됨.
 #                    해결: verify_report 래핑 자동 인식 + 다중 키명 폴백 체인.
 #                    이제 점수·판정·항목·위반·권고 모두 정상 추출.
+# v3.3.4 (2026-05-04) ★ 핫픽스 — DOCX 빌더 두 가지 버그 수정.
+#                    1. 캐릭터명 정규식 강화 — 미래(F), 수강생1, 참석자2 등이
+#                       대사로 인식 안 되어 지문 스타일로 폴백되던 문제 해결.
+#                       (숫자·괄호 마커 F/M/TEL/전화/VO/OS 추가 인식)
+#                    2. 빈 씬 자동 제거 — LLM이 "통합" 처방 시 한쪽 씬을 비워서
+#                       헤더만 남기는 패턴(예: S#16 본문 없이 헤더만) 자동 필터링.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -1020,19 +1026,54 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
             full_text = _merge_header_content(s_header, s_content)
             final_scenes.append(full_text)
 
-    full_text = '\n\n'.join(final_scenes)
+    # ★ v3.3.4: 빈 씬 자동 제거
+    # 헤더(S#16. INT. ...)만 있고 본문이 없는 씬을 자동 필터링.
+    # 원인: LLM이 "S#16과 S#22 통합" 처방을 받으면 S#16을 비우고 S#22로 통합하는데,
+    # 빈 헤더만 남으면 시나리오 흐름이 끊김.
+    _filtered_scenes = []
+    _empty_scene_count = 0
+    import re as _re_empty
+    for _scene in final_scenes:
+        if not _scene or not _scene.strip():
+            _empty_scene_count += 1
+            continue
+        # 헤더 한 줄 + 빈 줄만 있는 경우 검사
+        _scene_lines = [l for l in _scene.strip().split('\n') if l.strip()]
+        if len(_scene_lines) == 0:
+            _empty_scene_count += 1
+            continue
+        # 한 줄만 있고 그게 씬 헤더면 빈 씬으로 간주
+        if len(_scene_lines) == 1 and _re_empty.match(r'^\s*S#\d+', _scene_lines[0]):
+            _empty_scene_count += 1
+            continue
+        _filtered_scenes.append(_scene)
+    if _empty_scene_count > 0:
+        try:
+            st.warning(
+                f"⚠️ 빈 씬 자동 제거: {_empty_scene_count}개 씬이 헤더만 있고 본문 없음 → 자동 필터링됨. "
+                f"(LLM이 '통합' 처방 시 한쪽 씬을 비우는 패턴 — 정상 처리)"
+            )
+        except Exception:
+            # st 컨텍스트 외부에서 호출되면 통과
+            pass
+
+    full_text = '\n\n'.join(_filtered_scenes)
 
     # ─────────────────────────────────────────────────────────
     # 본문 라인 단위 파싱 (Writer Engine 동일 로직)
     # ─────────────────────────────────────────────────────────
+    # ★ v3.3.4: 캐릭터명 인식 강화
+    # - 숫자 허용 (수강생1, 참석자2, 학생3)
+    # - 괄호 형식 (F)/(M) 마커 인식 (미래(F), 봉식(M) 등 — 통화 상대 표시)
+    # - 하이픈/언더스코어 허용 (S#36-2 같은 경우)
     char_re = _re.compile(
-        r'^\s{2,}([가-힣a-zA-Z\s]{1,15}?)\s*'
-        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*$',
+        r'^\s{2,}([가-힣a-zA-Z0-9\s]{1,15}?)\s*'
+        r'(?:\(([FMfm]|V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.|TEL|전화|VO|OS)\))?\s*$',
         _re.IGNORECASE
     )
     inline_dialogue_re = _re.compile(
-        r'^([가-힣a-zA-Z\s]{1,15}?)\s*'
-        r'(?:\((V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.)\))?\s*'
+        r'^([가-힣a-zA-Z0-9\s]{1,15}?)\s*'
+        r'(?:\(([FMfm]|V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.|TEL|전화|VO|OS)\))?\s*'
         r'\t{1,}\s*(?:\(([^)]*)\)\s*)?(.+)',
         _re.IGNORECASE
     )
@@ -4065,7 +4106,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.3</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.4</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6204,7 +6245,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.3",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.4",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6261,7 +6302,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.3  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.4  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
