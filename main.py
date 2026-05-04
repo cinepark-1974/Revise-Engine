@@ -34,6 +34,10 @@
 #                    3. auto_fix_a29_violations — 집필 결과의 "한 박자/찰나/0.3초" 자동 치환
 #                    4. UI: 검증 보고서 흡수 expander + Round 번호 + A29 자동 후처리 옵션
 #                    5. 8점 도달 사이클: Round 1 결과 → 검증 → JSON 다운로드 → Round 2 흡수 → 8점
+# v3.3.1 (2026-05-04) ★ UX 개선 — 피드백 자료 섹션 라벨 명확화.
+#                    [1차 수정용] Rewrite Engine JSON / [N차 수정용] Revise 검증 보고서 명시.
+#                    피드백 자료 헤더 아래 워크플로우 안내 박스 추가.
+#                    Rewrite JSON 캡션에 MOON 자산 분리 명시 (전략 흡수 / 원고만 제외).
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -3917,7 +3921,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.1</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -4430,11 +4434,34 @@ def show_step_0_input():
                 '비워두어도 자동 진단이 작동합니다.</div>',
                 unsafe_allow_html=True)
 
+    # ★ v3.3.1 — 워크플로우 안내 박스 (어느 입력을 언제 쓰는지 명확히)
+    st.markdown(
+        '<div style="background:#F8F9FB; padding:12px 16px; border-radius:8px; '
+        'border-left:4px solid #191970; margin:10px 0; font-size:0.88rem;">'
+        '<b style="color:#191970;">📋 입력 자료 사용 가이드</b><br>'
+        '<table style="width:100%; margin-top:6px; border-collapse:collapse;">'
+        '<tr style="border-bottom:1px solid #E5E7EB;">'
+        '<td style="padding:6px 0; width:80px;"><b style="color:#0EA5E9;">1차 수정</b></td>'
+        '<td style="padding:6px 0;">Writer Engine 결과 → <b>Rewrite JSON</b> 사용 (아래 첫 expander)</td></tr>'
+        '<tr><td style="padding:6px 0;"><b style="color:#EC4899;">N차 수정</b></td>'
+        '<td style="padding:6px 0;">이전 각색본 + 검증 보고서 → <b>Revise 검증 JSON</b> 사용 (아래 두 번째 expander)</td></tr>'
+        '</table>'
+        '<span style="color:#666; font-size:0.82rem;">💡 둘 다 비워도 진단은 작동하며, 둘 다 입력하면 둘 모두 흡수됩니다.</span>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
     # Rewrite Engine JSON 자동 변환 expander
-    with st.expander("🔗 Rewrite Engine 진단·처방 JSON 불러오기 (자동 변환)"):
-        st.caption("Rewrite Engine에서 다운로드한 진단·처방 JSON을 업로드하거나 텍스트로 붙여넣으면, "
-                   "CHRIS 분석 + SHIHO 처방이 자동으로 수정 지시문으로 변환됩니다. "
-                   "(MOON 리라이팅은 자동 제외됩니다.)")
+    with st.expander("🔗 **[1차 수정용]** Rewrite Engine 진단·처방 JSON (자동 변환)"):
+        st.caption(
+            "**📌 언제 사용?** Writer Engine으로 집필한 시나리오의 첫 각색(1차) 시 사용합니다.\n\n"
+            "Rewrite Engine에서 다운로드한 진단·처방 JSON을 업로드하거나 텍스트로 붙여넣으면, "
+            "**CHRIS 분석 + SHIHO 처방 + MOON 전략(시장·장르·차별성·전체 방향)**이 자동으로 수정 지시문으로 변환됩니다.\n\n"
+            "단, MOON이 직접 쓴 각색 원고(`moon_rewrite`)는 흡수되지 않고 Revise Engine이 "
+            "자체 집필합니다 (AI ESCAPE A1~A32 + Genre Pack 적용).\n\n"
+            "💡 **이 입력은 Round 1에서만 의미 있습니다.** "
+            "Round 2 이상은 아래 [N차 수정용] 검증 보고서 흡수를 사용하세요."
+        )
 
         rj_col1, rj_col2 = st.columns([1, 1])
         with rj_col1:
@@ -4488,11 +4515,15 @@ def show_step_0_input():
                 st.warning("⚠️ JSON 파일을 업로드하거나 텍스트로 붙여넣어 주세요.")
 
     # ★★★ v3.3 — Round N 검증 보고서 흡수 ★★★
-    with st.expander("📊 v3.3 — 직전 라운드 검증 보고서 흡수 (Round 2 이상 작업)"):
+    with st.expander("📊 **[N차 수정용]** Revise Engine 검증 보고서 흡수 (Round 2 이상)"):
         st.caption(
+            "**📌 언제 사용?** Revise Engine으로 한 번 이상 각색한 시나리오를 "
+            "추가로 다듬어 점수를 올릴 때 사용합니다 (Round 2, 3, ...).\n\n"
             "이전 라운드의 검증 보고서(.docx) 또는 검증 JSON을 업로드하면, "
-            "미반영 처방 + AI 작법 위반 + 원본 유지 진단 씬이 자동으로 수정 지시문에 흡수됩니다. "
-            "8점 도달을 위한 Round 2~N 작업에 사용합니다."
+            "미반영 처방 + AI 작법 위반 + 원본 유지 진단 씬이 자동으로 수정 지시문에 흡수됩니다.\n\n"
+            "💡 **이 입력은 Round 2 이상에서만 사용합니다.** "
+            "Writer Engine 결과의 첫 각색은 위 [1차 수정용] Rewrite JSON을 사용하세요.\n\n"
+            "🎯 **목표:** Round 1의 6.x점 → Round 2의 7.5~8.0점 → Round 3의 8.0+ 점."
         )
 
         vr_col1, vr_col2 = st.columns([1, 1])
@@ -5999,7 +6030,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.1",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6056,7 +6087,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.1  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
