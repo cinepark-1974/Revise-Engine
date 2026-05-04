@@ -42,6 +42,11 @@
 #                    형식: 제목_종류_R(라운드)_score(점수)_YYYYMMDD_HHMM_Blue.확장자
 #                    같은 날 여러 라운드 작업해도 파일 자동 구분.
 #                    수정본 DOCX, 검증 DOCX, 검증 JSON, 진행 백업, 전체 JSON 모두 통일.
+# v3.3.3 (2026-05-04) ★ 핫픽스 — 검증 보고서 JSON 빈 데이터 버그 수정.
+#                    원인: export_verify_json이 verify_result 최상위에서 키를 찾았으나,
+#                    실제 LLM 응답은 verify_result["verify_report"][...]에 데이터 저장됨.
+#                    해결: verify_report 래핑 자동 인식 + 다중 키명 폴백 체인.
+#                    이제 점수·판정·항목·위반·권고 모두 정상 추출.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -1474,6 +1479,11 @@ def export_verify_json(verify_result: dict, title: str = "",
 
     다음 라운드(Round N+1)에서 자동 흡수 가능한 형식.
 
+    v3.3.3 핫픽스: 실제 verify_result 키 구조에 맞춰 폴백 체인 추가.
+    - 새 구조: verify_result["verify_report"]["overall_verdict"|"overall_score"|...]
+    - 구 구조: verify_result["verdict"|"overall_score"|...]
+    - 둘 다 시도해서 데이터를 정확히 추출.
+
     Args:
         verify_result: Stage 3 verify 결과 dict
         title: 작품 제목
@@ -1485,26 +1495,94 @@ def export_verify_json(verify_result: dict, title: str = "",
     import json as _json
     from datetime import datetime as _dt
 
+    if not isinstance(verify_result, dict):
+        verify_result = {}
+
+    # ★ v3.3.3: verify_report 래핑 자동 인식
+    # 실제 LLM 응답 구조: {"verify_report": {...실제 데이터...}}
+    # 일부 코드 경로 구조: {...실제 데이터 평면 배치...}
+    inner = verify_result.get("verify_report")
+    if isinstance(inner, dict):
+        # 새 구조 — verify_report 안에 실제 데이터
+        src = inner
+    else:
+        # 구 구조 — 평면 배치
+        src = verify_result
+
+    # ★ v3.3.3: 키 폴백 체인 (다양한 키명 시도)
+    verdict = (
+        src.get("overall_verdict") or
+        src.get("verdict") or
+        src.get("final_verdict", {}).get("judgment") if isinstance(src.get("final_verdict"), dict) else None or
+        src.get("judgment") or
+        ""
+    )
+
+    overall_score = (
+        src.get("overall_score") or
+        src.get("score") or
+        (src.get("final_verdict", {}).get("score") if isinstance(src.get("final_verdict"), dict) else None)
+    )
+
+    instruction_compliance = (
+        src.get("instruction_compliance") or
+        src.get("stage1_instruction") or
+        {}
+    )
+
+    locked_preservation = (
+        src.get("locked_preservation") or
+        src.get("stage2_locked") or
+        {}
+    )
+
+    ai_escape_check = (
+        src.get("ai_escape_check") or
+        src.get("stage3_ai_escape") or
+        {}
+    )
+
+    genre_compliance = (
+        src.get("genre_compliance") or
+        src.get("stage4_genre") or
+        {}
+    )
+
+    key_changes = (
+        src.get("side_by_side_highlights") or  # 실제 키
+        src.get("key_changes") or
+        []
+    )
+
+    next_recommendations = (
+        src.get("recommendations") or  # 실제 키
+        src.get("next_round_recommendations") or
+        []
+    )
+
+    # 진단 신뢰도, 판정 이유 등 부가 정보 추가
+    verdict_reason = src.get("verdict_reason", "")
+
     export = {
         "schema_version": "revise_verify_v1.0",
-        "engine_version": "BLUE JEANS REVISE ENGINE v3.3",
+        "engine_version": "BLUE JEANS REVISE ENGINE v3.3.3",
         "title": title or "(제목 미지정)",
         "round_n": round_n,
         "report_date": _dt.now().isoformat(),
-        "verdict": verify_result.get("verdict", ""),
-        "overall_score": verify_result.get("overall_score"),
-        "instruction_compliance": verify_result.get("instruction_compliance", {}),
-        "locked_preservation": verify_result.get("locked_preservation", {}),
-        "ai_escape_check": verify_result.get("ai_escape_check", {}),
-        "genre_compliance": verify_result.get("genre_compliance", {}),
-        "key_changes": verify_result.get("key_changes", []),
-        "next_round_recommendations": verify_result.get("next_round_recommendations", [])
-                                       or verify_result.get("recommendations", []),
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "overall_score": overall_score,
+        "instruction_compliance": instruction_compliance,
+        "locked_preservation": locked_preservation,
+        "ai_escape_check": ai_escape_check,
+        "genre_compliance": genre_compliance,
+        "key_changes": key_changes,
+        "next_round_recommendations": next_recommendations,
         # 다음 라운드 자동 흡수용 정규화 필드
         "normalized_for_next_round": {
             "untouched_scenes": _extract_untouched_from_verify(verify_result),
-            "ai_escape_violations": verify_result.get("ai_escape_check", {}).get("violations", []),
-            "target_score_next_round": (verify_result.get("overall_score") or 7.0) + 1.0,
+            "ai_escape_violations": ai_escape_check.get("violations", []) if isinstance(ai_escape_check, dict) else [],
+            "target_score_next_round": (overall_score or 7.0) + 1.0 if isinstance(overall_score, (int, float)) else 8.0,
         }
     }
 
@@ -1512,25 +1590,42 @@ def export_verify_json(verify_result: dict, title: str = "",
 
 
 def _extract_untouched_from_verify(verify_result: dict) -> list:
-    """verify_result에서 '원본 유지' 진단된 씬 ID 추출."""
+    """verify_result에서 '원본 유지' 진단된 씬 ID 추출.
+
+    v3.3.3 핫픽스: verify_report 래핑 자동 인식.
+    """
     import re as _re_v33
+
+    if not isinstance(verify_result, dict):
+        return []
+
+    # ★ v3.3.3: verify_report 래핑 자동 인식
+    inner = verify_result.get("verify_report")
+    src = inner if isinstance(inner, dict) else verify_result
 
     untouched = set()
     # ai_escape_check.violations 내 (원본 유지) 표기
-    violations = verify_result.get("ai_escape_check", {}).get("violations", [])
+    ai_check = src.get("ai_escape_check") or src.get("stage3_ai_escape") or {}
+    violations = ai_check.get("violations", []) if isinstance(ai_check, dict) else []
     for v in violations:
+        if not isinstance(v, dict):
+            continue
         scene_id = v.get("scene_id", "")
         if "원본 유지" in str(scene_id) or "원본유지" in str(scene_id):
             ids = _re_v33.findall(r'S#\d+', str(scene_id))
             untouched.update(ids)
 
     # instruction_compliance 내 [N] 항목
-    ic = verify_result.get("instruction_compliance", {})
-    items = ic.get("items", []) or []
+    ic = src.get("instruction_compliance") or src.get("stage1_instruction") or {}
+    items = ic.get("items", []) if isinstance(ic, dict) else []
+    items = items or []
     for item in items:
-        if item.get("status") == "N" or item.get("status") == "Partial":
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status", "")
+        if status == "N" or status == "Partial":
             details = str(item.get("details", "")) + " " + str(item.get("instruction", ""))
-            if "원본 유지" in details:
+            if "원본 유지" in details or "원본유지" in details:
                 ids = _re_v33.findall(r'S#\d+', details)
                 untouched.update(ids)
 
@@ -3970,7 +4065,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.2</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.3</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6109,7 +6204,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.2",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.3",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6166,7 +6261,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.2  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.3  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
