@@ -27,6 +27,13 @@
 # v3.2.1 (2026-05-04) ★ 핫픽스 — show_step_2_revise()의 TypeError 수정.
 #                    proposed_direction/preservation_notes가 None일 때 슬라이싱 실패 방지.
 #                    부분 수정 모드에서 발생한 버그 해결.
+# v3.3 (2026-05-04)  ★ Round N+1 사이클 시스템 — 검증 보고서 자동 흡수 + JSON 출력 + A29 자동 후처리.
+#                    1. parse_verification_docx — 검증 보고서 DOCX 파서
+#                       (✗[N] 미반영 / △[Partial] / A29~A32 위반 / 원본 유지 씬 / 재수정 권고 자동 추출)
+#                    2. export_verify_json — 검증 결과를 JSON으로 내보내기 (다음 라운드 자동 흡수용)
+#                    3. auto_fix_a29_violations — 집필 결과의 "한 박자/찰나/0.3초" 자동 치환
+#                    4. UI: 검증 보고서 흡수 expander + Round 번호 + A29 자동 후처리 옵션
+#                    5. 8점 도달 사이클: Round 1 결과 → 검증 → JSON 다운로드 → Round 2 흡수 → 8점
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -293,6 +300,11 @@ INIT_STATE = {
     "diff_analysis": None,      # Diff 학습 결과
     "distribution_diagnostic": None,  # 분포 진단
     "rewrite_metadata": None,   # Rewrite 메타 흡수
+    # ★ v3.3 — Round N 검증 보고서 흡수
+    "verify_report_text": "",     # 검증 보고서 통합 지시문
+    "verify_report_metadata": None,  # 파싱된 검증 보고서 dict
+    "round_n": 1,                  # 현재 라운드 번호 (1=초회, 2=Round 2 ...)
+    "auto_fix_a29_enabled": True,  # 집필 후 A29 자동 후처리 ON/OFF
     # v2.1 — 장르 DNA (참고작 1~3편에서 추출)
     "genre_ref_texts": [],      # [참고작1 텍스트, 참고작2, ...] 최대 3편
     "genre_ref_filenames": [],  # 파일명 리스트
@@ -1163,6 +1175,313 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
     buf = BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+# =================================================================
+# ★★★ v3.3 — 검증 보고서 DOCX 파서 + JSON 출력 + 자동 후처리 ★★★
+# =================================================================
+
+def parse_verification_docx(file_obj_or_path) -> dict:
+    """검증 보고서 DOCX를 파싱하여 다음 라운드 입력으로 변환.
+
+    파싱 대상:
+    - "✗ [N]" 항목 → 미반영 처방 (재수정 대상)
+    - "△ [Partial]" 항목 → 부분 반영 (보강 대상)
+    - "A29~A32 위반" 항목 → 자동 후처리 대상
+    - "재수정 권고" 섹션 → 수정 지시문으로 변환
+    - "원본 유지" 표기된 씬 ID → 다음 라운드 REWRITE 후보
+
+    Args:
+        file_obj_or_path: DOCX 파일 객체 또는 경로
+
+    Returns:
+        {
+            "round_n": 1,
+            "previous_score": 6.8,
+            "previous_verdict": "NEEDS_REVISION",
+            "not_reflected": [{"original": "...", "scene_ids": [...]}],
+            "partial_reflected": [...],
+            "ai_escape_violations": [{"pattern_id": "A29", "scene_id": "S#1", "quote": "..."}],
+            "untouched_scenes": ["S#10", "S#14", ...],
+            "next_recommendations": ["권고 1...", "권고 2..."],
+            "instruction_text": "다음 라운드 진단·집필에 주입할 통합 지시문"
+        }
+    """
+    from docx import Document as _DocxDoc
+    import re as _re_v33
+
+    try:
+        doc = _DocxDoc(file_obj_or_path)
+    except Exception as e:
+        return {"error": f"DOCX 파싱 실패: {e}"}
+
+    paragraphs = [p.text for p in doc.paragraphs]
+    full_text = "\n".join(paragraphs)
+
+    result = {
+        "round_n": 1,
+        "previous_score": None,
+        "previous_verdict": "",
+        "not_reflected": [],
+        "partial_reflected": [],
+        "ai_escape_violations": [],
+        "untouched_scenes": [],
+        "next_recommendations": [],
+        "instruction_text": "",
+    }
+
+    # 1. 종합 점수 + 판정
+    m = _re_v33.search(r'\[\s*(APPROVED|NEEDS_REVISION|REJECTED)\s*\]', full_text)
+    if m:
+        result["previous_verdict"] = m.group(1)
+    m = _re_v33.search(r'종합\s*점수[:：]\s*(\d+\.?\d*)\s*/\s*10', full_text)
+    if m:
+        result["previous_score"] = float(m.group(1))
+
+    # 2. 미반영 항목 (✗ [N])
+    not_reflected_pattern = _re_v33.compile(r'✗\s*\[N\]\s*(.+?)(?=\n\s*✓|\n\s*△|\n\s*✗|\n\s*■|\Z)',
+                                              _re_v33.DOTALL)
+    for m in not_reflected_pattern.finditer(full_text):
+        item_text = m.group(1).strip()
+        # 첫 줄을 처방 요지로
+        lines = [l.strip() for l in item_text.split('\n') if l.strip()]
+        if lines:
+            result["not_reflected"].append({
+                "instruction": lines[0],
+                "details": " ".join(lines[1:])[:300] if len(lines) > 1 else "",
+                "scene_ids": _re_v33.findall(r'S#\d+', item_text)
+            })
+
+    # 3. 부분 반영 항목 (△ [Partial])
+    partial_pattern = _re_v33.compile(r'△\s*\[Partial\]\s*(.+?)(?=\n\s*✓|\n\s*△|\n\s*✗|\n\s*■|\Z)',
+                                        _re_v33.DOTALL)
+    for m in partial_pattern.finditer(full_text):
+        item_text = m.group(1).strip()
+        lines = [l.strip() for l in item_text.split('\n') if l.strip()]
+        if lines:
+            result["partial_reflected"].append({
+                "instruction": lines[0],
+                "details": " ".join(lines[1:])[:300] if len(lines) > 1 else "",
+                "scene_ids": _re_v33.findall(r'S#\d+', item_text)
+            })
+
+    # 4. AI ESCAPE 위반 항목 (A29~A32 등)
+    # 패턴: "✗ [A29] 시간 정밀 표기 금지 — S#1 REWRITE (Medium)"
+    escape_pattern = _re_v33.compile(
+        r'✗\s*\[(A\d+)\][^—\n]*?—\s*([^(\n]+?)\s*\((\w+)\)\s*\n[^→]*→\s*"([^"]+)"',
+        _re_v33.DOTALL
+    )
+    for m in escape_pattern.finditer(full_text):
+        result["ai_escape_violations"].append({
+            "pattern_id": m.group(1),
+            "scene_ids": _re_v33.findall(r'S#\d+', m.group(2)),
+            "scene_label": m.group(2).strip(),
+            "severity": m.group(3),
+            "quote": m.group(4).strip(),
+        })
+
+    # 5. 원본 유지 / 미처리 씬 추출
+    # 패턴: "S#XX (원본 유지)" 또는 "원본 유지: S#10, S#14, ..."
+    untouched_set = set()
+    for m in _re_v33.finditer(r'(?:원본\s*유지|미처리|미수정).{0,120}?(S#\d+(?:\s*[,/·]\s*S#\d+)*)', full_text):
+        scene_list = _re_v33.findall(r'S#\d+', m.group(1))
+        untouched_set.update(scene_list)
+    # 직접 언급된 패턴: "S#X / S#Y / S#Z (원본 유지)"
+    for m in _re_v33.finditer(r'(S#\d+(?:\s*[/·,]\s*S#\d+)+)\s*\(원본\s*유지\)', full_text):
+        scene_list = _re_v33.findall(r'S#\d+', m.group(1))
+        untouched_set.update(scene_list)
+    result["untouched_scenes"] = sorted(untouched_set,
+                                         key=lambda s: int(_re_v33.search(r'\d+', s).group()))
+
+    # 6. 재수정 권고 섹션
+    recom_section = _re_v33.search(
+        r'■\s*재수정\s*권고\s*\n?(.+?)(?=\n\s*■|\Z)', full_text, _re_v33.DOTALL
+    )
+    if recom_section:
+        recom_text = recom_section.group(1)
+        # 단락 단위로 시도
+        # 패턴 1: "• N. ..." 명시적 항목 (각 줄 시작)
+        items_v1 = _re_v33.findall(r'•\s*\d+\.\s*(.+?)(?=\n\s*•\s*\d+\.|\Z)',
+                                    recom_text, _re_v33.DOTALL)
+        # 패턴 2: 연속 텍스트에서 "• N." 또는 " N." 식별 (줄바꿈 없을 때)
+        items_v2 = _re_v33.findall(r'(?:^|\s)•?\s*(\d+)\.\s*([^•]+?)(?=\s•?\s*\d+\.|\Z)',
+                                    recom_text, _re_v33.DOTALL)
+        # v1 우선, v2 폴백
+        if items_v1 and len(items_v1) >= 2:
+            for item in items_v1:
+                cleaned = item.strip().replace('\n', ' ').strip()
+                if cleaned and len(cleaned) > 10:
+                    result["next_recommendations"].append(cleaned[:400])
+        elif items_v2:
+            for num_str, item in items_v2:
+                cleaned = item.strip().replace('\n', ' ').strip()
+                if cleaned and len(cleaned) > 10:
+                    result["next_recommendations"].append(cleaned[:400])
+        else:
+            # 폴백 3: 단락 단위로 자르기
+            paragraphs_split = [p.strip() for p in recom_text.split('\n\n') if p.strip()]
+            for p in paragraphs_split:
+                # "•" 또는 숫자.로 시작하는 것만
+                if _re_v33.match(r'(?:•|\d+\.)', p):
+                    cleaned = _re_v33.sub(r'^(?:•\s*)?\d+\.\s*', '', p).replace('\n', ' ').strip()
+                    if cleaned and len(cleaned) > 10:
+                        result["next_recommendations"].append(cleaned[:400])
+
+    # 7. 통합 지시문 텍스트 생성
+    parts = []
+    if result["previous_score"]:
+        parts.append(
+            f"[Round 직전 검증 결과]\n"
+            f"이전 라운드 종합 점수: {result['previous_score']}/10 ({result['previous_verdict']})\n"
+            f"이번 라운드 목표: 8.0/10 도달."
+        )
+
+    if result["not_reflected"]:
+        parts.append("\n[미반영 처방 — 이번 라운드에서 반드시 처리]")
+        for i, item in enumerate(result["not_reflected"], 1):
+            parts.append(f"{i}. {item['instruction']}")
+            if item["details"]:
+                parts.append(f"   세부: {item['details'][:200]}")
+
+    if result["partial_reflected"]:
+        parts.append("\n[부분 반영 처방 — 보강 필요]")
+        for i, item in enumerate(result["partial_reflected"], 1):
+            parts.append(f"{i}. {item['instruction']}")
+
+    if result["ai_escape_violations"]:
+        parts.append("\n[AI 작법 위반 — 자동 후처리 + 재집필 시 회피]")
+        # pattern_id별 그룹화
+        by_pattern = {}
+        for v in result["ai_escape_violations"]:
+            by_pattern.setdefault(v["pattern_id"], []).append(v)
+        for pid, vs in sorted(by_pattern.items()):
+            scene_set = set()
+            for v in vs:
+                scene_set.update(v["scene_ids"])
+            scenes_str = ", ".join(sorted(scene_set,
+                                            key=lambda s: int(_re_v33.search(r'\d+', s).group()))) if scene_set else "(전체)"
+            quotes = " / ".join([f'"{v["quote"]}"' for v in vs[:3]])
+            parts.append(f"- {pid}: {len(vs)}회 위반 — 위치 {scenes_str}\n  예시: {quotes}")
+
+    if result["untouched_scenes"]:
+        parts.append(f"\n[원본 유지 진단 씬 — 이번 라운드 우선 검토 대상]\n{', '.join(result['untouched_scenes'])}")
+
+    if result["next_recommendations"]:
+        parts.append("\n[다음 라운드 재수정 권고]")
+        for i, r in enumerate(result["next_recommendations"], 1):
+            parts.append(f"{i}. {r}")
+
+    result["instruction_text"] = "\n".join(parts)
+
+    return result
+
+
+def auto_fix_a29_violations(text: str) -> tuple:
+    """v3.3 — A29 시간 정밀 표기 자동 후처리.
+
+    "한 박자", "찰나", "0.3초" 등을 모호한 시간어로 자동 치환.
+
+    Args:
+        text: 시나리오 본문 텍스트
+
+    Returns:
+        (fixed_text, replacement_count)
+    """
+    import re as _re_v33
+
+    replacements = [
+        # 정밀 시간 표기 → 모호한 시간어
+        (r'한\s*박자', '잠깐'),
+        (r'반\s*박자', '잠깐'),
+        (r'두\s*박자', '잠시'),
+        (r'세\s*박자', '잠시'),
+        (r'찰나(다|이다)?', '잠깐'),
+        (r'(\d+(?:\.\d+)?)\s*초간\b', '잠깐'),
+        (r'(\d+(?:\.\d+)?)\s*초\s*(?:후|뒤)', '잠시 후'),
+        (r'(\d+(?:\.\d+)?)\s*초\s*(?:만에|동안)', '잠깐'),
+        # 단독 "0.3초", "1초" 같은 표현 (단어 경계 + 한국어 동사 직전)
+        (r'(\d+(?:\.\d+)?)\s*초\s+(?=[가-힣])', '잠깐 '),
+        (r'순간(이다|적으로)?', '갑자기'),  # "순간이다" 같은 연출 표현
+    ]
+
+    count = 0
+    fixed = text
+    for pat, repl in replacements:
+        new_fixed, n = _re_v33.subn(pat, repl, fixed)
+        if n > 0:
+            fixed = new_fixed
+            count += n
+
+    return fixed, count
+
+
+def export_verify_json(verify_result: dict, title: str = "",
+                        round_n: int = 1) -> bytes:
+    """v3.3 — Stage 3 검증 결과를 JSON으로 내보내기.
+
+    다음 라운드(Round N+1)에서 자동 흡수 가능한 형식.
+
+    Args:
+        verify_result: Stage 3 verify 결과 dict
+        title: 작품 제목
+        round_n: 현재 라운드 번호
+
+    Returns:
+        JSON 바이트 (UTF-8)
+    """
+    import json as _json
+    from datetime import datetime as _dt
+
+    export = {
+        "schema_version": "revise_verify_v1.0",
+        "engine_version": "BLUE JEANS REVISE ENGINE v3.3",
+        "title": title or "(제목 미지정)",
+        "round_n": round_n,
+        "report_date": _dt.now().isoformat(),
+        "verdict": verify_result.get("verdict", ""),
+        "overall_score": verify_result.get("overall_score"),
+        "instruction_compliance": verify_result.get("instruction_compliance", {}),
+        "locked_preservation": verify_result.get("locked_preservation", {}),
+        "ai_escape_check": verify_result.get("ai_escape_check", {}),
+        "genre_compliance": verify_result.get("genre_compliance", {}),
+        "key_changes": verify_result.get("key_changes", []),
+        "next_round_recommendations": verify_result.get("next_round_recommendations", [])
+                                       or verify_result.get("recommendations", []),
+        # 다음 라운드 자동 흡수용 정규화 필드
+        "normalized_for_next_round": {
+            "untouched_scenes": _extract_untouched_from_verify(verify_result),
+            "ai_escape_violations": verify_result.get("ai_escape_check", {}).get("violations", []),
+            "target_score_next_round": (verify_result.get("overall_score") or 7.0) + 1.0,
+        }
+    }
+
+    return _json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _extract_untouched_from_verify(verify_result: dict) -> list:
+    """verify_result에서 '원본 유지' 진단된 씬 ID 추출."""
+    import re as _re_v33
+
+    untouched = set()
+    # ai_escape_check.violations 내 (원본 유지) 표기
+    violations = verify_result.get("ai_escape_check", {}).get("violations", [])
+    for v in violations:
+        scene_id = v.get("scene_id", "")
+        if "원본 유지" in str(scene_id) or "원본유지" in str(scene_id):
+            ids = _re_v33.findall(r'S#\d+', str(scene_id))
+            untouched.update(ids)
+
+    # instruction_compliance 내 [N] 항목
+    ic = verify_result.get("instruction_compliance", {})
+    items = ic.get("items", []) or []
+    for item in items:
+        if item.get("status") == "N" or item.get("status") == "Partial":
+            details = str(item.get("details", "")) + " " + str(item.get("instruction", ""))
+            if "원본 유지" in details:
+                ids = _re_v33.findall(r'S#\d+', details)
+                untouched.update(ids)
+
+    return sorted(untouched, key=lambda s: int(_re_v33.search(r'\d+', s).group()))
 
 
 def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
@@ -3525,7 +3844,21 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
             content = _re.sub(r'\n{3,}', '\n\n', content)
 
             fixed_count += 1
-        
+
+        # ★ v3.3 — A29 자동 후처리 (시간 정밀 표기 → 모호한 시간어)
+        # 세션 옵션이 ON일 때만 작동 (기본 ON)
+        try:
+            if st.session_state.get("auto_fix_a29_enabled", True):
+                content_a29, a29_count = auto_fix_a29_violations(content)
+                if a29_count > 0:
+                    content = content_a29
+                    if "_a29_auto_fixed_total" not in rr:
+                        rr["_a29_auto_fixed_total"] = 0
+                    rr["_a29_auto_fixed_total"] += a29_count
+        except Exception:
+            # 세션 외부에서 호출되면 통과
+            pass
+
         # ★ A21/A22/시간 정규화로 변경된 내용도 무조건 저장
         scene["revised_content"] = content
 
@@ -3584,7 +3917,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.2.1</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -4153,6 +4486,150 @@ def show_step_0_input():
                     st.error(f"변환 실패: {e}")
             else:
                 st.warning("⚠️ JSON 파일을 업로드하거나 텍스트로 붙여넣어 주세요.")
+
+    # ★★★ v3.3 — Round N 검증 보고서 흡수 ★★★
+    with st.expander("📊 v3.3 — 직전 라운드 검증 보고서 흡수 (Round 2 이상 작업)"):
+        st.caption(
+            "이전 라운드의 검증 보고서(.docx) 또는 검증 JSON을 업로드하면, "
+            "미반영 처방 + AI 작법 위반 + 원본 유지 진단 씬이 자동으로 수정 지시문에 흡수됩니다. "
+            "8점 도달을 위한 Round 2~N 작업에 사용합니다."
+        )
+
+        vr_col1, vr_col2 = st.columns([1, 1])
+        with vr_col1:
+            uploaded_verify_docx = st.file_uploader(
+                "검증 보고서 (.docx) 업로드",
+                type=["docx"],
+                key="verify_report_docx_uploader",
+            )
+        with vr_col2:
+            uploaded_verify_json = st.file_uploader(
+                "또는 검증 JSON 업로드",
+                type=["json"],
+                key="verify_report_json_uploader",
+            )
+
+        col_round, col_a29 = st.columns([1, 1])
+        with col_round:
+            current_round = st.number_input(
+                "현재 라운드 번호",
+                min_value=1, max_value=10,
+                value=st.session_state.get("round_n", 1),
+                step=1,
+                help="1=초회 작업, 2=Round 2 (검증 보고서 흡수 후 재집필)",
+                key="round_n_input"
+            )
+            if current_round != st.session_state.get("round_n", 1):
+                st.session_state.round_n = current_round
+        with col_a29:
+            auto_fix = st.checkbox(
+                "✨ A29 자동 후처리 (한 박자 → 잠깐, 찰나 → 잠깐 등)",
+                value=st.session_state.get("auto_fix_a29_enabled", True),
+                key="auto_fix_a29_checkbox",
+                help="집필 결과에서 A29 시간 정밀 표기를 자동 치환합니다."
+            )
+            st.session_state.auto_fix_a29_enabled = auto_fix
+
+        if st.button("📥 검증 보고서 → 수정 지시문 변환", key="btn_convert_verify"):
+            verify_meta = None
+
+            # JSON 우선
+            if uploaded_verify_json is not None:
+                try:
+                    import json as _json_temp
+                    json_text = uploaded_verify_json.read().decode("utf-8")
+                    json_data = _json_temp.loads(json_text)
+                    # JSON 형식 검증 보고서를 파싱 보고서 형식으로 정규화
+                    verify_meta = {
+                        "round_n": json_data.get("round_n", 1),
+                        "previous_score": json_data.get("overall_score"),
+                        "previous_verdict": json_data.get("verdict", ""),
+                        "not_reflected": [],
+                        "partial_reflected": [],
+                        "ai_escape_violations": json_data.get("ai_escape_check", {}).get("violations", []),
+                        "untouched_scenes": json_data.get("normalized_for_next_round", {}).get("untouched_scenes", []),
+                        "next_recommendations": json_data.get("next_round_recommendations", [])
+                                                  or json_data.get("recommendations", []),
+                        "instruction_text": "",
+                    }
+                    # instruction_text 재구성
+                    parts = []
+                    if verify_meta["previous_score"]:
+                        parts.append(
+                            f"[Round 직전 검증 결과]\n"
+                            f"이전 점수: {verify_meta['previous_score']}/10 ({verify_meta['previous_verdict']})\n"
+                            f"이번 라운드 목표: 8.0/10."
+                        )
+                    if verify_meta["next_recommendations"]:
+                        parts.append("\n[재수정 권고]")
+                        for i, r in enumerate(verify_meta["next_recommendations"], 1):
+                            r_text = r if isinstance(r, str) else (
+                                r.get("recommendation", "") or r.get("text", "") or str(r)
+                            )
+                            parts.append(f"{i}. {r_text[:300]}")
+                    if verify_meta["untouched_scenes"]:
+                        parts.append(f"\n[원본 유지 진단 씬 — 우선 검토 대상]\n{', '.join(verify_meta['untouched_scenes'])}")
+                    if verify_meta["ai_escape_violations"]:
+                        parts.append("\n[AI 작법 위반 — 재집필 시 회피]")
+                        for v in verify_meta["ai_escape_violations"][:10]:
+                            v_dict = v if isinstance(v, dict) else {}
+                            parts.append(f"- {v_dict.get('pattern_id','?')} {v_dict.get('scene_id','')} : {v_dict.get('quote','')[:60]}")
+                    verify_meta["instruction_text"] = "\n".join(parts)
+                except Exception as e:
+                    st.error(f"JSON 파싱 실패: {e}")
+
+            elif uploaded_verify_docx is not None:
+                try:
+                    verify_meta = parse_verification_docx(uploaded_verify_docx)
+                except Exception as e:
+                    st.error(f"DOCX 파싱 실패: {e}")
+
+            if verify_meta and not verify_meta.get("error"):
+                st.session_state.verify_report_metadata = verify_meta
+                st.session_state.verify_report_text = verify_meta.get("instruction_text", "")
+                # round_n 자동 증가
+                if verify_meta.get("round_n"):
+                    st.session_state.round_n = verify_meta["round_n"] + 1
+                else:
+                    st.session_state.round_n = max(2, st.session_state.get("round_n", 1) + 1)
+
+                # 지시문에 자동 추가
+                vt = verify_meta.get("instruction_text", "")
+                if vt:
+                    if st.session_state.instruction.strip():
+                        st.session_state.instruction = (
+                            st.session_state.instruction.rstrip() +
+                            "\n\n--- v3.3 검증 보고서 흡수 (Round " + str(st.session_state.round_n) + ") ---\n\n" +
+                            vt
+                        )
+                    else:
+                        st.session_state.instruction = vt
+
+                # 통계 표시
+                stats = []
+                if verify_meta.get("not_reflected"):
+                    stats.append(f"미반영 처방 {len(verify_meta['not_reflected'])}개")
+                if verify_meta.get("partial_reflected"):
+                    stats.append(f"부분 반영 {len(verify_meta['partial_reflected'])}개")
+                if verify_meta.get("ai_escape_violations"):
+                    stats.append(f"AI 작법 위반 {len(verify_meta['ai_escape_violations'])}회")
+                if verify_meta.get("untouched_scenes"):
+                    stats.append(f"원본 유지 씬 {len(verify_meta['untouched_scenes'])}개")
+                if verify_meta.get("next_recommendations"):
+                    stats.append(f"재수정 권고 {len(verify_meta['next_recommendations'])}개")
+
+                st.success(
+                    f"✅ Round {st.session_state.round_n} 흡수 완료!\n\n" +
+                    "\n".join(f"  • {s}" for s in stats) +
+                    f"\n\n이전 점수: **{verify_meta.get('previous_score', 'N/A')}/10** "
+                    f"({verify_meta.get('previous_verdict', 'N/A')})\n"
+                    f"이번 라운드 목표: **8.0/10** 도달"
+                )
+                st.rerun()
+            elif verify_meta and verify_meta.get("error"):
+                st.error(f"파싱 실패: {verify_meta['error']}")
+            else:
+                st.warning("⚠️ 검증 보고서 파일(DOCX 또는 JSON)을 업로드해주세요.")
 
     st.session_state.instruction = st.text_area(
         "지시문",
@@ -5477,6 +5954,42 @@ def show_step_4_complete():
         except Exception as e:
             st.error(f"검증 보고서 DOCX 생성 오류: {e}")
 
+    # ★ v3.3 — 검증 보고서 JSON 다운로드 (다음 라운드 자동 흡수용)
+    st.markdown("---")
+    st.markdown(
+        '<div style="background:#FCE7F3; padding:10px 14px; border-radius:6px; '
+        'border-left:3px solid #EC4899; margin:8px 0; font-size:0.88rem;">'
+        '<b>🆕 v3.3 신규:</b> 검증 보고서 JSON 다운로드 — '
+        '다음 라운드 작업 시 자동 흡수 가능. '
+        '<span style="color:#666;">(이번 라운드 결과를 다음 라운드에 자동 반영해 8점 도달 사이클 구축)</span>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    cj1, cj2 = st.columns([1, 1])
+    with cj1:
+        try:
+            verify_json_bytes = export_verify_json(
+                st.session_state.verify_result,
+                title=title,
+                round_n=st.session_state.get("round_n", 1),
+            )
+            st.download_button(
+                "📊 검증 보고서 (JSON) — 다음 라운드용",
+                data=verify_json_bytes,
+                file_name=get_report_filename(title, "verify").replace(".docx", ".json"),
+                mime="application/json",
+                key="dl_verify_json",
+                help="다음 라운드 작업 시 'v3.3 검증 보고서 흡수' 영역에 업로드하면 자동 변환",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"검증 보고서 JSON 생성 오류: {e}")
+    with cj2:
+        st.caption(
+            f"💡 현재 라운드: **Round {st.session_state.get('round_n', 1)}**. "
+            f"다운로드한 JSON을 다음 작업의 입력 화면 → 'v3.3 검증 보고서 흡수' 영역에 업로드."
+        )
+
     # JSON 백업 다운로드
     st.markdown("---")
     with st.expander("🗃️ 원본 JSON 백업 다운로드 (고급)"):
@@ -5486,7 +5999,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.2.1",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -5543,13 +6056,14 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.2.1  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
     '<span style="color:#EC4899;">Beat Expansion Mode</span>  ·  '
     '<span style="color:#6366F1;">작가 친화 UI</span>  ·  '
-    '<span style="color:#0EA5E9;">Writer v3.5.1 Sync</span>'
+    '<span style="color:#0EA5E9;">Writer v3.5.1 Sync</span>  ·  '
+    '<span style="color:#8B5CF6;">Round N+1 Cycle</span>'
     '</div>',
     unsafe_allow_html=True,
 )
