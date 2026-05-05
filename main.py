@@ -64,6 +64,14 @@
 #                    「오랜만에」 S#35에서 발견된 LLM 결함 방어.
 #                    추상적 메타포 우회 ("빈 자리가 있으면 채우는 게 서점") 금지.
 #                    우회 4유형(행동/사실/침묵/직업)만 허용. 예외 케이스 명시.
+# v3.3.7 (2026-05-05) ★ A33 강화 — 결함 패턴 4·5·6·7 신설 + wiring 복원.
+#                    1) 짧은 시그니처 라인(2~7자) 3회+ 반복 검출 (패턴 4)
+#                    2) 씬 간 미러링 다이얼로그 동일 라인 2개+ 공유 검출 (패턴 5)
+#                    3) 모티프 객체(박스·봉투·찻잔 등) 3씬+ 등장 검출 (패턴 6)
+#                    4) 의문문 직후 답변 라인 5자+ verbatim 복제 검출 (패턴 7)
+#                    + auto_fix_a33_violations 호출 wiring 복원
+#                      (v3.3.5에서 함수만 정의되고 호출되지 않던 버그 fix —
+#                       이게 R2 결함 5건이 그대로 출력된 결정적 원인).
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -900,6 +908,71 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
              color=RGBColor(0x8E, 0x8E, 0x99))
     doc.add_page_break()
 
+    # ★ v3.3.7: A33 7대 결함 패턴 자동 검증 (이전엔 정의만 되고 호출되지 않던 함수 wiring)
+    # 본문 합치기 전에 dict 구조를 그대로 검증해 patterns 1·2를 자동 수정하고
+    # 패턴 3~7은 화면 경고로 보고. R2 결함 5건이 빠져나간 결정적 원인이었던
+    # 호출 누락을 v3.3.7에서 복원.
+    try:
+        _, _a33_stats = auto_fix_a33_violations(revise_result)
+
+        # Phase 1·2 자동 수정 결과
+        _auto_fixed_msgs = []
+        if _a33_stats.get("duplicate_scenes_removed", 0) > 0:
+            _auto_fixed_msgs.append(
+                f"중복 씬 ID {_a33_stats['duplicate_scenes_removed']}개 제거"
+            )
+        if _a33_stats.get("in_scene_duplicate_dialogues_removed", 0) > 0:
+            _auto_fixed_msgs.append(
+                f"씬 내 중복 대사 {_a33_stats['in_scene_duplicate_dialogues_removed']}개 제거"
+            )
+        if _auto_fixed_msgs:
+            try:
+                st.success("✅ A33 자동 수정: " + " · ".join(_auto_fixed_msgs))
+            except Exception:
+                pass
+
+        # Phase 3~7 결함 보고 (자동 수정 불가, 작가 결정 영역)
+        _warn_msgs = []
+        for w in _a33_stats.get("verbatim_repetitions_warned", [])[:5]:
+            _warn_msgs.append(
+                f"[패턴1·8자+ verbatim] {w['speaker']} {w['scenes']} "
+                f"\"{w.get('sample','')}\""
+            )
+        for w in _a33_stats.get("short_signature_repetitions_warned", [])[:5]:
+            _warn_msgs.append(
+                f"[패턴4·짧은 라인 3회+] {w['speaker']} {w['scenes']} "
+                f"\"{w.get('sample','')}\""
+            )
+        for w in _a33_stats.get("mirror_scene_violations_warned", [])[:5]:
+            _warn_msgs.append(
+                f"[패턴5·미러링 라인 공유] {w['scene_a']}↔{w['scene_b']} "
+                f"({w['shared_line_count']}쌍, {w['shared_speakers']})"
+            )
+        for w in _a33_stats.get("motif_overuse_warned", [])[:5]:
+            _warn_msgs.append(
+                f"[패턴6·모티프 과사용] '{w['motif']}' {w['scene_count']}씬 등장 "
+                f"{w['scenes']}"
+            )
+        for w in _a33_stats.get("answer_line_replication_warned", [])[:5]:
+            _warn_msgs.append(
+                f"[패턴7·답변 라인 복제] {w['speaker']} {w['scenes']} "
+                f"\"{w.get('sample','')}\""
+            )
+
+        if _warn_msgs:
+            try:
+                st.warning(
+                    "⚠️ A33 결함 검출 (작가 검토 필요 — 자동 수정 불가, 변주는 판단 영역):\n\n"
+                    + "\n\n".join(f"• {m}" for m in _warn_msgs)
+                )
+            except Exception:
+                pass
+    except Exception as _a33_err:
+        try:
+            st.info(f"A33 검증 스킵 (예외: {type(_a33_err).__name__})")
+        except Exception:
+            pass
+
     # ── 면책 자막 (실화/팩션·퓨전) ──
     _need_disclaimer = fact_based or (
         historical and ("팩션" in (historical_type or "") or "퓨전" in (historical_type or ""))
@@ -1537,42 +1610,100 @@ def auto_fix_a29_violations(text: str) -> tuple:
 
 
 # =================================================================
-# ★★★ v3.3.5 — A33 자동 검증·수정 (Verbatim Repetition Prohibition) ★★★
+# ★★★ v3.3.7 — A33 자동 검증·수정 (Verbatim Repetition Prohibition) ★★★
+# 7가지 결함 패턴 검출:
+#   Phase 1: 같은 씬 ID 두 번 등장 → 자동 제거 (패턴 2)
+#   Phase 2: 같은 씬 내 동일 대사 중복 → 자동 제거 (패턴 3)
+#   Phase 3: 작품 전체 8자+ verbatim 반복 → 보고 (패턴 1)
+#   Phase 4: 짧은 시그니처 라인(2~7자) 3회+ 반복 → 보고 (패턴 4) ★신규
+#   Phase 5: 씬 간 미러링 동일 라인 2개+ 공유 → 보고 (패턴 5) ★신규
+#   Phase 6: 모티프 객체 3씬+ 등장 → 보고 (패턴 6) ★신규
+#   Phase 7: 의문문 직후 답변 라인 5자+ verbatim 복제 → 보고 (패턴 7) ★신규
 # =================================================================
 
-def auto_fix_a33_violations(scenes_dict: dict) -> tuple:
-    """v3.3.5 — A33 위반 자동 후처리.
+# 모티프 객체 사전 (결함 패턴 6용)
+# 작품의 시각적 시그니처가 될 수 있는 핵심 소품 — 같은 객체가 같은 상태로
+# 3씬 이상 등장하면 영화의 시간이 정지된 것으로 간주.
+_A33_MOTIF_OBJECTS = [
+    "박스", "이삿짐", "이사 박스",
+    "봉투", "서류 봉투", "경매 서류",
+    "찻잔", "잔 받침", "행주",
+    "고양이",
+    "공고문", "계약서",
+    "카운터",
+    "가방", "가방끈",
+    "핸드폰", "경매 앱",
+]
 
-    3가지 결함 패턴 자동 처리:
-    1. 같은 씬 ID가 두 번 등장 → 두 번째 제거
-    2. 같은 씬 내 같은 화자 동일 대사 → 두 번째 제거
-    3. 작품 전체에서 동일 대사 verbatim 반복 → 경고만 (변주는 작가 결정 필요)
+
+def auto_fix_a33_violations(scenes_dict: dict) -> tuple:
+    """v3.3.7 — A33 위반 자동 후처리 (7가지 결함 패턴).
+
+    Phase 1: 같은 씬 ID 두 번 등장 → 두 번째 제거 (패턴 2, 자동 수정)
+    Phase 2: 같은 씬 내 동일 대사 중복 → 두 번째 제거 (패턴 3, 자동 수정)
+    Phase 3: 작품 전체 8자+ 동일 대사 verbatim → 결함 보고 (패턴 1)
+    Phase 4: 짧은 시그니처 라인(2~7자) 3회+ 반복 → 결함 보고 (패턴 4)
+    Phase 5: 씬 간 미러링 다이얼로그 동일 라인 2개+ 공유 → 결함 보고 (패턴 5)
+    Phase 6: 모티프 객체 3씬+ 등장 → 결함 보고 (패턴 6)
+    Phase 7: 의문문 직후 답변 라인 5자+ verbatim 복제 → 결함 보고 (패턴 7)
+
+    자동 수정은 Phase 1, 2만 (구조적 결함). Phase 3~7은 검출·보고만 —
+    변주는 작가 판단 영역.
 
     Args:
         scenes_dict: {"scenes": [{"scene_id": "S#1", "scene_header": "...",
                                   "revised_content": "..."}], ...}
 
     Returns:
-        (fixed_dict, stats) — 수정된 dict + 통계
+        (fixed_dict, stats) — 수정된 dict + 통계 보고서
     """
-    import re as _re_v335
+    import re as _re_v337
     from collections import defaultdict
 
     if not isinstance(scenes_dict, dict):
         return scenes_dict, {"errors": "invalid_input"}
 
-    rr = scenes_dict.get("revise_result", scenes_dict)
-    scenes = rr.get("scenes", []) if isinstance(rr, dict) else []
+    # 실제 data 구조: revise_result["revision_result"]["revised_scenes"]
+    # 호환성을 위해 여러 키 패턴 모두 지원
+    rr = (
+        scenes_dict.get("revision_result")
+        or scenes_dict.get("revise_result")
+        or scenes_dict
+    )
+    if not isinstance(rr, dict):
+        return scenes_dict, {"errors": "invalid_revision_result"}
+
+    scenes = (
+        rr.get("revised_scenes")
+        or rr.get("scenes")
+        or []
+    )
     if not scenes:
         return scenes_dict, {"no_scenes": True}
 
     stats = {
         "duplicate_scenes_removed": 0,
         "in_scene_duplicate_dialogues_removed": 0,
-        "verbatim_repetitions_warned": [],
+        "verbatim_repetitions_warned": [],          # 패턴 1 (8자+)
+        "short_signature_repetitions_warned": [],   # 패턴 4 (2~7자)
+        "mirror_scene_violations_warned": [],       # 패턴 5
+        "motif_overuse_warned": [],                 # 패턴 6
+        "answer_line_replication_warned": [],       # 패턴 7
     }
 
-    # === Phase 1: 같은 씬 ID 두 번 등장 → 두 번째 제거 ===
+    # 다이얼로그 인식 정규식 — Writer Engine과 동일 형식
+    # "수현\t\t대사" 또는 "수현    \t\t(중얼) 대사" 형태
+    dialogue_pattern = _re_v337.compile(
+        r'^([가-힣a-zA-Z0-9\s]{1,15}?)\s*(?:\([^)]*\))?\s*\t+(?:\([^)]*\))?\s*(.+)$'
+    )
+
+    def _normalize(s: str) -> str:
+        """공백·구두점 제거 정규화 — verbatim 비교용."""
+        return _re_v337.sub(r'[\s.,!?…\-~()「」"\'·]', '', s.strip())
+
+    # ─────────────────────────────────────────────────────
+    # Phase 1: 같은 씬 ID 두 번 등장 → 두 번째 제거 (패턴 2)
+    # ─────────────────────────────────────────────────────
     seen_scene_ids = set()
     deduped_scenes = []
     for sc in scenes:
@@ -1585,10 +1716,9 @@ def auto_fix_a33_violations(scenes_dict: dict) -> tuple:
         deduped_scenes.append(sc)
     scenes = deduped_scenes
 
-    # === Phase 2: 같은 씬 내 동일 대사 중복 제거 ===
-    dialogue_pattern = _re_v335.compile(
-        r'^([가-힣a-zA-Z0-9\s]{1,15}?)\s*(?:\([^)]*\))?\s*\t+(?:\([^)]*\))?\s*(.+)$'
-    )
+    # ─────────────────────────────────────────────────────
+    # Phase 2: 같은 씬 내 동일 대사 중복 제거 (패턴 3)
+    # ─────────────────────────────────────────────────────
     for sc in scenes:
         content = sc.get("revised_content", "")
         if not content:
@@ -1600,41 +1730,178 @@ def auto_fix_a33_violations(scenes_dict: dict) -> tuple:
             m = dialogue_pattern.match(ln.strip())
             if m and "\t\t" in ln:
                 speaker = m.group(1).strip()
-                dialogue = _re_v335.sub(r'[\s.,!?…\-]', '', m.group(2).strip())
-                key = f"{speaker}::{dialogue}"
-                if dialogue and len(dialogue) >= 5 and key in seen_dialogues:
-                    # 같은 씬 내 동일 대사 중복 — 제거
+                norm = _normalize(m.group(2))
+                key = f"{speaker}::{norm}"
+                if norm and len(norm) >= 5 and key in seen_dialogues:
                     stats["in_scene_duplicate_dialogues_removed"] += 1
                     continue
                 seen_dialogues[key] = True
             new_lines.append(ln)
         sc["revised_content"] = '\n'.join(new_lines)
 
-    # === Phase 3: 작품 전체 verbatim 반복 검출 → 경고만 ===
-    # (자동 변주는 LLM 영역이므로 코드는 식별만 함)
-    global_dialogues = defaultdict(list)
+    # ─────────────────────────────────────────────────────
+    # 작품 전체 다이얼로그·답변 시퀀스 추출 (Phase 3·4·5·7 공유)
+    # ─────────────────────────────────────────────────────
+    # 구조: [{scene_id, speaker, normalized, original, is_answer}, ...]
+    all_lines = []
     for sc in scenes:
-        content = sc.get("revised_content", "")
         sid = sc.get("scene_id", "")
+        content = sc.get("revised_content", "")
+        prev_was_question = False
         for ln in content.split('\n'):
-            m = dialogue_pattern.match(ln.strip())
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            m = dialogue_pattern.match(stripped)
             if m and "\t\t" in ln:
                 speaker = m.group(1).strip()
-                dialogue = _re_v335.sub(r'[\s.,!?…\-]', '', m.group(2).strip())
-                if dialogue and len(dialogue) >= 8:  # 8자 이상만 (짧은 응답 제외)
-                    key = f"{speaker}::{dialogue}"
-                    global_dialogues[key].append(sid)
+                original = m.group(2).strip()
+                norm = _normalize(original)
+                if not norm:
+                    continue
+                # is_answer: 이전 다이얼로그 라인이 의문문이었는가
+                is_answer = prev_was_question
+                all_lines.append({
+                    "scene_id": sid,
+                    "speaker": speaker,
+                    "normalized": norm,
+                    "original": original,
+                    "is_answer": is_answer,
+                })
+                # 다음 라인 판정용 — 이 라인이 의문문인가
+                prev_was_question = original.rstrip().endswith(
+                    ("?", "요?", "까?", "니?", "냐?")
+                )
+            else:
+                # 다이얼로그가 아닌 줄(지문)이 끼면 답변 시퀀스 끊김
+                prev_was_question = False
 
-    for key, scene_ids in global_dialogues.items():
-        if len(scene_ids) >= 2:
-            speaker = key.split("::")[0]
+    # ─────────────────────────────────────────────────────
+    # Phase 3: 작품 전체 8자+ verbatim 반복 (패턴 1)
+    # ─────────────────────────────────────────────────────
+    bucket_long = defaultdict(list)  # (speaker, norm) → [scene_ids]
+    for item in all_lines:
+        if len(item["normalized"]) >= 8:
+            key = (item["speaker"], item["normalized"])
+            bucket_long[key].append(item["scene_id"])
+
+    for (speaker, norm), sids in bucket_long.items():
+        if len(sids) >= 2:
+            sample = next(
+                (it["original"] for it in all_lines
+                 if it["speaker"] == speaker and it["normalized"] == norm),
+                "",
+            )
             stats["verbatim_repetitions_warned"].append({
                 "speaker": speaker,
-                "occurrence_count": len(scene_ids),
-                "scenes": scene_ids,
+                "occurrence_count": len(sids),
+                "scenes": sids,
+                "sample": sample[:60],
             })
 
-    rr["scenes"] = scenes
+    # ─────────────────────────────────────────────────────
+    # Phase 4: 짧은 시그니처 라인 (2~7자) 3회+ 반복 (패턴 4)
+    # ─────────────────────────────────────────────────────
+    bucket_short = defaultdict(list)
+    for item in all_lines:
+        if 2 <= len(item["normalized"]) <= 7:
+            key = (item["speaker"], item["normalized"])
+            bucket_short[key].append(item["scene_id"])
+
+    for (speaker, norm), sids in bucket_short.items():
+        if len(sids) >= 3:
+            sample = next(
+                (it["original"] for it in all_lines
+                 if it["speaker"] == speaker and it["normalized"] == norm),
+                "",
+            )
+            stats["short_signature_repetitions_warned"].append({
+                "speaker": speaker,
+                "occurrence_count": len(sids),
+                "scenes": sids,
+                "sample": sample[:30],
+            })
+
+    # ─────────────────────────────────────────────────────
+    # Phase 5: 씬 간 미러링 다이얼로그 — 두 씬 사이 동일 화자
+    #          동일 라인 2개+ 공유 시 결함 (패턴 5)
+    # ─────────────────────────────────────────────────────
+    scene_to_lines = defaultdict(set)
+    for item in all_lines:
+        if len(item["normalized"]) >= 3:  # 최소 길이
+            scene_to_lines[item["scene_id"]].add(
+                (item["speaker"], item["normalized"])
+            )
+
+    scene_ids_list = [sc.get("scene_id", "") for sc in scenes if sc.get("scene_id")]
+    for i, sid_a in enumerate(scene_ids_list):
+        for sid_b in scene_ids_list[i + 1:]:
+            shared = scene_to_lines[sid_a] & scene_to_lines[sid_b]
+            if len(shared) >= 2:
+                stats["mirror_scene_violations_warned"].append({
+                    "scene_a": sid_a,
+                    "scene_b": sid_b,
+                    "shared_line_count": len(shared),
+                    "shared_speakers": sorted({sp for sp, _ in shared}),
+                })
+
+    # ─────────────────────────────────────────────────────
+    # Phase 6: 모티프 객체 3씬+ 등장 (패턴 6)
+    # ─────────────────────────────────────────────────────
+    motif_to_scenes = defaultdict(list)
+    for sc in scenes:
+        sid = sc.get("scene_id", "")
+        content = sc.get("revised_content", "")
+        # 지문(다이얼로그가 아닌 줄)에서만 모티프 검색
+        for ln in content.split('\n'):
+            stripped = ln.strip()
+            if not stripped:
+                continue
+            # 다이얼로그 라인 제외
+            if "\t\t" in ln:
+                continue
+            for motif in _A33_MOTIF_OBJECTS:
+                if motif in stripped:
+                    if sid not in motif_to_scenes[motif]:
+                        motif_to_scenes[motif].append(sid)
+
+    for motif, sids in motif_to_scenes.items():
+        if len(sids) >= 3:
+            stats["motif_overuse_warned"].append({
+                "motif": motif,
+                "scene_count": len(sids),
+                "scenes": sids,
+            })
+
+    # ─────────────────────────────────────────────────────
+    # Phase 7: 의문문 직후 답변 라인 5자+ verbatim 복제 (패턴 7)
+    # ─────────────────────────────────────────────────────
+    answer_bucket = defaultdict(list)
+    for item in all_lines:
+        if item["is_answer"] and len(item["normalized"]) >= 5:
+            key = (item["speaker"], item["normalized"])
+            answer_bucket[key].append(item["scene_id"])
+
+    for (speaker, norm), sids in answer_bucket.items():
+        if len(sids) >= 2:
+            sample = next(
+                (it["original"] for it in all_lines
+                 if it["speaker"] == speaker and it["normalized"] == norm
+                 and it["is_answer"]),
+                "",
+            )
+            stats["answer_line_replication_warned"].append({
+                "speaker": speaker,
+                "occurrence_count": len(sids),
+                "scenes": sids,
+                "sample": sample[:60],
+            })
+
+    # 실제 데이터 구조에 따라 적절한 키로 다시 저장
+    if "revised_scenes" in rr:
+        rr["revised_scenes"] = scenes
+    else:
+        rr["scenes"] = scenes
     rr["_a33_auto_fix_stats"] = stats
 
     return scenes_dict, stats
@@ -4315,7 +4582,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.6</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.7</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6454,7 +6721,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.6",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.7",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6511,7 +6778,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.6  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.7  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
