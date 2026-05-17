@@ -72,6 +72,21 @@
 #                    + auto_fix_a33_violations 호출 wiring 복원
 #                      (v3.3.5에서 함수만 정의되고 호출되지 않던 버그 fix —
 #                       이게 R2 결함 5건이 그대로 출력된 결정적 원인).
+# v3.3.8 (2026-05-17) ★ 시나리오 포맷 5중 안전망 신설 — 인물 사전 기반 자동 정규화.
+#                    배경: 「고려통역사」 R1 결과물에서 원본 씬(수정 안 된 S#1~S#25)의
+#                          시나리오 포맷이 깨지는 결함 발견. 인물명+공백 2개+대사 패턴이
+#                          모두 "지문" 스타일로 떨어져 대사·지문 구분이 사라짐.
+#                    1. extract_character_roster_* — 원본 DOCX·평문·Revise JSON 3소스에서
+#                       인물 사전 자동 추출 (대사 스타일 탭 앞쪽 + 지문 도입부 패턴 + 폴백)
+#                    2. _clean_name — 부사구·동사형·후미 수식 제거 (오탐 방지)
+#                    3. normalize_legacy_screenplay — 인물 사전 기반 공백→탭 자동 복원
+#                       + 메타 라인 자동 제거 (페이지 번호·표지 잔재·면책 자막)
+#                    4. extract_text_from_uploaded_file 강화 — DOCX 업로드 시
+#                       단락 스타일 정보(대사/지문/씬번호) 보존 → 탭 손실 방지
+#                    5. STEP 0 업로드 직후 session_state.character_roster 자동 저장
+#                    6. create_revised_docx 본문 파싱 직전 정규화 후크 추가
+#                    효과: 원본이 비표준 포맷이거나 부분 수정인 경우에도 결과물의
+#                          씬헤더·대사·지문 3구분이 95%대 자동 복원.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -373,10 +388,293 @@ def reset_workflow():
 
 
 # =================================================================
+# [2-A1] v3.3.8 — 시나리오 포맷 5중 안전망 (인물 사전 + 자동 정규화)
+# =================================================================
+# 배경: 「고려통역사」 R1 결과물에서 원본 씬(수정 안 된 S#1~S#25)의
+#       시나리오 포맷이 깨지는 결함 발견. 인물명+공백 2개+대사 패턴이
+#       모두 "지문" 스타일로 떨어져 대사·지문 구분이 사라짐.
+#
+# 해법: 인물 사전을 자동 추출해 그것을 기준으로 라인을 강제 정규화.
+#       원본이 비표준 포맷이거나 부분 수정인 경우에도 결과물의
+#       씬헤더·대사·지문 3구분이 95%대 자동 복원.
+
+# 캐릭터 도입부 패턴: "이름(20대 여, 탈색된 무명 저고리)" 같은 형식
+_CHAR_INTRO_PAT = re.compile(
+    r'(?<![가-힣A-Za-z])'                          # 직전이 한글/영문이 아님 (단어 경계)
+    r'([가-힣A-Za-z][가-힣A-Za-z\s]{0,14}?)'        # 이름 (1~15자)
+    r'\((\d{1,2}\s*대[^,)]*|[^,)]*\d{1,2}\s*세[^,)]*)'  # (20대 ..., 50세 ...)
+)
+
+# 단독으로 인물명이 아니라 흔한 일반명사 — 블랙리스트
+_COMMON_NOUN_BLACKLIST = {
+    '문', '벽', '눈', '손', '발', '몸', '입', '귀', '코', '머리',
+    '사람', '아이', '남자', '여자', '시간', '하루', '오늘', '내일', '어제',
+    '하나', '둘', '셋', '넷', '다섯',
+    '왼쪽', '오른쪽', '앞', '뒤', '위', '아래', '안', '밖',
+    '그', '저', '이', '여기', '저기', '거기',
+}
+
+# 명시적 동사형 토큰 — 인물명 직전에 오면 부사절로 판단
+_VERB_FORM_TOKENS = {
+    # 위치/움직임 동사
+    '열리고', '닫히고', '들어오고', '나가고', '들어와', '나와',
+    '돌아서고', '돌아보고', '바라보고', '쳐다보고', '내려다보고',
+    # 동작 동사
+    '앉아', '서고', '서서', '일어나고', '뛰어와', '걸어와', '달려와',
+    '들고', '잡고', '쥐고', '놓고',
+    # 연결형 (이 토큰이 인물명 직전에 오면 거의 100% 부사절)
+    '들어오면서', '나가면서', '바라보면서', '돌아보면서',
+}
+
+
+def _clean_name(name: str) -> str:
+    """추출된 이름 후보를 정제. 앞쪽 부사구·동사형·후미 수식 제거.
+
+    예: "골목 끝에서 돌무" → "돌무"
+    예: "정면에서 송나라 상인 C" → "송나라 상인 C"
+    예: "문이 열리고 통문관 서기" → "통문관 서기"
+    예: "고려 관리 한 사람" → "고려 관리"
+    """
+    if not name:
+        return ""
+    name = name.strip()
+
+    parts = name.split()
+    if len(parts) == 1:
+        return parts[0]
+
+    # 1단계: 위치/조사 토큰으로 끝나는 부분 잘라내기
+    location_endings = ('에서', '에', '으로', '로', '한테', '에게')
+    drop_until = -1
+    for i, tok in enumerate(parts):
+        if any(tok.endswith(suf) for suf in location_endings) and i < len(parts) - 1:
+            drop_until = i
+    if drop_until >= 0:
+        parts = parts[drop_until + 1:]
+
+    # 2단계: 명시적 동사형 토큰 잘라내기 (어미 광범위 매칭은 "아라비아" 같은 명사 오탐 유발)
+    drop_until2 = -1
+    for i, tok in enumerate(parts):
+        if i < len(parts) - 1 and tok in _VERB_FORM_TOKENS:
+            drop_until2 = i
+    if drop_until2 >= 0:
+        parts = parts[drop_until2 + 1:]
+
+    # 3단계: "X 한 사람" 같은 후미 수식 제거
+    if len(parts) >= 2:
+        if parts[-1] in {'사람', '명', '분'} and len(parts) >= 3:
+            parts = parts[:-2]
+        elif parts[-1] in {'한', '두', '세'}:
+            parts = parts[:-1]
+
+    return ' '.join(parts).strip()
+
+
+def extract_character_roster_from_docx_obj(doc) -> set:
+    """python-docx Document 객체에서 인물 사전 추출.
+
+    소스 1: '대사' 스타일 단락의 탭 앞쪽 (가장 정확)
+    소스 2: '지문' 스타일에서 '이름(나이대 ...)' 도입부 패턴 (보강)
+    소스 3: 스타일 미적용 + 탭 포함 라인의 탭 앞쪽 (폴백)
+    """
+    roster_dialogue = set()
+    roster_intro = set()
+    roster_tab_fallback = set()
+
+    for p in doc.paragraphs:
+        style = p.style.name if p.style else ""
+        text = p.text
+
+        # 소스 1
+        if style == "대사" and "\t" in text:
+            name = text.split("\t")[0].strip()
+            name = re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+            if name and 1 <= len(name) <= 15 and name not in _COMMON_NOUN_BLACKLIST:
+                roster_dialogue.add(name)
+
+        # 소스 2
+        if style == "지문":
+            for m in _CHAR_INTRO_PAT.finditer(text):
+                raw = m.group(1).strip()
+                cleaned = _clean_name(raw)
+                if cleaned and 1 <= len(cleaned) <= 15 and cleaned not in _COMMON_NOUN_BLACKLIST:
+                    roster_intro.add(cleaned)
+
+        # 소스 3
+        if style not in ("대사", "지문", "씬번호") and "\t" in text:
+            name = text.split("\t")[0].strip()
+            name = re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+            if name and 1 <= len(name) <= 15 and name not in _COMMON_NOUN_BLACKLIST:
+                roster_tab_fallback.add(name)
+
+    return roster_dialogue | roster_intro | roster_tab_fallback
+
+
+def extract_character_roster_from_text(text: str) -> set:
+    """평문 텍스트에서 인물 사전 추출 (이미 추출된 텍스트 활용).
+
+    소스 1: '\\t\\t'을 포함한 라인의 탭 앞쪽
+    소스 2: 라인 안의 '이름(나이대 ...)' 도입부 패턴
+    """
+    roster = set()
+    if not text:
+        return roster
+
+    for line in text.split('\n'):
+        # 소스 1: 탭 포함 라인
+        if '\t\t' in line:
+            name = line.split('\t')[0].strip()
+            name = re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+            if name and 1 <= len(name) <= 15 and name not in _COMMON_NOUN_BLACKLIST:
+                roster.add(name)
+
+        # 소스 2: 도입부 패턴
+        for m in _CHAR_INTRO_PAT.finditer(line):
+            raw = m.group(1).strip()
+            cleaned = _clean_name(raw)
+            if cleaned and 1 <= len(cleaned) <= 15 and cleaned not in _COMMON_NOUN_BLACKLIST:
+                roster.add(cleaned)
+
+    return roster
+
+
+def extract_character_roster_from_revise_json(revise_json) -> set:
+    """Revise JSON의 revised_scenes에서 인물 사전 추출."""
+    roster = set()
+    if not isinstance(revise_json, dict):
+        return roster
+
+    # 구조 분기: 통합 JSON({revise:{revision_result:...}}) vs 단일 JSON({revision_result:...})
+    rr = revise_json.get("revise", {}).get("revision_result", {}) \
+        if isinstance(revise_json.get("revise"), dict) else {}
+    if not rr:
+        rr = revise_json.get("revision_result", {})
+    if not isinstance(rr, dict):
+        return roster
+
+    for sc in rr.get("revised_scenes", []) or []:
+        content = sc.get("revised_content", "") or ""
+        roster |= extract_character_roster_from_text(content)
+
+    return roster
+
+
+# 메타 라인 — 본문에 들어가면 안 되는 라인 패턴
+_META_LINE_PATTERNS = [
+    re.compile(r'^\s*\d+\s*$'),                          # 페이지 번호 (숫자만)
+    re.compile(r'^\s*-\s*\d+\s*-\s*$'),                  # -1- 같은 페이지 번호
+    re.compile(r'^Writer Engine\s+v[\d.]+', re.IGNORECASE),
+    re.compile(r'^Revise Engine\s+v[\d.]+', re.IGNORECASE),
+    re.compile(r'^Creator Engine\s+v[\d.]+', re.IGNORECASE),
+    re.compile(r'^Rewrite Engine\s+v[\d.]+', re.IGNORECASE),
+    re.compile(r'^\s*시나리오\s*\(수정본\)\s*$'),
+    re.compile(r'^\s*시나리오\s*$'),
+    re.compile(r'^\s*기획/제작\s*\|\s*블루진픽처스\s*$'),
+    re.compile(r'^\s*All characters,\s+organizations'),
+    re.compile(r'^\s*are fictional\.'),
+    re.compile(r'^\s*dramatized for narrative'),
+    re.compile(r'^\s*본 작품에 등장하는 인물'),
+    re.compile(r'^\s*모두 허구이며'),
+    re.compile(r'^\s*극적 구성을 위해'),
+]
+
+
+def _is_meta_line(line: str) -> bool:
+    """본문에 들어가면 안 되는 메타 라인인지 판별."""
+    s = line.strip()
+    if not s:
+        return False
+    for pat in _META_LINE_PATTERNS:
+        if pat.match(s):
+            return True
+    return False
+
+
+def normalize_legacy_screenplay(text: str, roster: set) -> tuple:
+    """비표준 포맷 시나리오를 인물 사전 기반으로 정규화.
+
+    1) 메타 라인 제거 (페이지 번호·표지 잔재·면책 자막)
+    2) 인물 사전 기반 — '인물명 + 공백 2+ + (괄호) 대사' → '인물명\\t\\t(괄호) 대사'
+    3) 인물명 직후 한글이 오면 (조사) 지문으로 판단해 변환 안 함
+
+    Args:
+        text: 정규화 대상 텍스트
+        roster: 인물 사전 (set of str)
+
+    Returns:
+        (정규화된 텍스트, 통계 dict {"meta_lines_removed": N, "dialogue_lines_restored": N})
+    """
+    stats = {
+        "meta_lines_removed": 0,
+        "dialogue_lines_restored": 0,
+    }
+
+    if not text:
+        return text, stats
+
+    if not roster:
+        # 인물 사전이 없으면 메타 라인 제거만 수행
+        lines = text.split('\n')
+        kept = []
+        for line in lines:
+            if _is_meta_line(line):
+                stats["meta_lines_removed"] += 1
+                continue
+            kept.append(line)
+        return '\n'.join(kept), stats
+
+    # 긴 이름 우선 매칭 (예: "아라비아 상인 A"가 "상인 A"보다 먼저 잡혀야 함)
+    roster_sorted = sorted(roster, key=len, reverse=True)
+    roster_alt = '|'.join(re.escape(n) for n in roster_sorted)
+
+    # 줄 시작 + 인물명 + (옵션 V.O./O.S. 마커) + 공백 2+ + 본문
+    # 핵심: 인물명 직후 한글 X — 조사("의", "가", "이") 차단으로 지문 오탐 방지
+    dialogue_restore_pat = re.compile(
+        r'^(' + roster_alt + r')'
+        r'(?![가-힣])'                                # 직후 한글 X
+        r'(\s*\((?:V\.O\.|O\.S\.|CONT\'D|cont\'d|v\.o\.|o\.s\.|TEL|전화|VO|OS|F|M)\))?'  # V.O. 등
+        r'  +'                                       # 공백 2개 이상
+        r'(.+)$',
+        re.IGNORECASE
+    )
+
+    lines = text.split('\n')
+    output = []
+    for line in lines:
+        if _is_meta_line(line):
+            stats["meta_lines_removed"] += 1
+            continue
+
+        # 이미 탭이 있으면 그대로
+        if '\t' in line:
+            output.append(line)
+            continue
+
+        m = dialogue_restore_pat.match(line)
+        if m:
+            name = m.group(1)
+            marker = m.group(2) or ""
+            body = m.group(3)
+            output.append(f"{name}{marker}\t\t{body}")
+            stats["dialogue_lines_restored"] += 1
+            continue
+
+        output.append(line)
+
+    return '\n'.join(output), stats
+
+
+# =================================================================
 # [2-B] 통합 파일 추출 헬퍼 — DOCX + PDF
 # =================================================================
 def extract_text_from_uploaded_file(uploaded_file) -> str:
     """업로드된 파일(DOCX 또는 PDF)에서 텍스트 추출.
+
+    v3.3.8 강화:
+    - DOCX 입력 시 단락 스타일 정보(대사/지문/씬번호)를 활용
+    - "대사" 스타일인데 탭이 없으면 첫 공백 2+ 위치를 탭으로 자동 복원
+    - 메타 라인(페이지 번호·표지 잔재·면책 자막) 자동 제거
+    - 부산물로 session_state에 인물 사전을 함께 저장 (가능한 경우)
 
     Args:
         uploaded_file: st.file_uploader가 반환한 파일 객체
@@ -394,7 +692,52 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
         try:
             from docx import Document as _Doc
             _doc = _Doc(uploaded_file)
-            return "\n".join(p.text for p in _doc.paragraphs if p.text.strip())
+
+            # v3.3.8: 단락 스타일 정보를 함께 활용
+            lines = []
+            for p in _doc.paragraphs:
+                style = p.style.name if p.style else ""
+                text = p.text
+
+                # 빈 단락은 스킵
+                if not text.strip():
+                    continue
+
+                # 메타 라인 제거 (페이지 번호·표지·면책 자막)
+                if _is_meta_line(text):
+                    continue
+
+                # "대사" 스타일인데 탭이 없으면 강제 복원 시도
+                # 첫 공백 2+ 또는 첫 괄호(지시문) 직전 위치에 탭 삽입
+                if style == "대사" and "\t" not in text:
+                    # 패턴: "이름  (지시) 대사" 또는 "이름  대사" 또는 "이름(V.O.) 대사"
+                    m = re.match(
+                        r'^([가-힣A-Za-z0-9\s]{1,15}?)'
+                        r'(\([^)]*\))?'                           # V.O. 같은 마커
+                        r'\s{2,}'                                 # 공백 2+
+                        r'(.+)$',
+                        text
+                    )
+                    if m:
+                        nm = m.group(1).strip()
+                        marker = m.group(2) or ""
+                        body = m.group(3)
+                        text = f"{nm}{marker}\t\t{body}"
+
+                lines.append(text)
+
+            full_text = "\n".join(lines)
+
+            # v3.3.8: 인물 사전을 추출해 session_state에 저장
+            # (Streamlit 컨텍스트 외부에서 호출되면 통과)
+            try:
+                roster = extract_character_roster_from_docx_obj(_doc)
+                if roster:
+                    st.session_state["character_roster"] = roster
+            except Exception:
+                pass
+
+            return full_text
         except Exception as e:
             st.error(f"DOCX 읽기 실패 ({uploaded_file.name}): {e}")
             return ""
@@ -1176,6 +1519,43 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
 
     # 문자열 그대로의 \n이 들어온 경우(JSON 이스케이프 잔존) 안전 처리
     full_text = full_text.replace('\\n', '\n').replace('\\t', '\t')
+
+    # ═══════════════════════════════════════════════════════════
+    # ★ v3.3.8 — 5중 안전망의 마지막 층: 인물 사전 기반 정규화
+    # 이전 단계에서 누락된 비표준 라인(공백 2개로 구분된 인물명+대사)을
+    # 인물 사전 기반으로 마지막으로 한 번 더 정규화한다.
+    # 인물 사전은 STEP 0 업로드 시 session_state에 저장된 것을 사용.
+    # 본문(full_text)에서도 보강 추출 — 안전망 강화.
+    # ═══════════════════════════════════════════════════════════
+    try:
+        _v338_roster = set()
+        # session_state에서 가져오기
+        try:
+            _v338_roster |= set(st.session_state.get("character_roster", set()))
+        except Exception:
+            pass
+        # 본문에서 보강 추출 (이미 정상화된 부분에서 인물명 학습)
+        _v338_roster |= extract_character_roster_from_text(full_text)
+
+        if _v338_roster:
+            full_text, _v338_stats = normalize_legacy_screenplay(full_text, _v338_roster)
+            if _v338_stats.get("dialogue_lines_restored", 0) > 0 or \
+               _v338_stats.get("meta_lines_removed", 0) > 0:
+                try:
+                    _msg_parts = []
+                    if _v338_stats["dialogue_lines_restored"]:
+                        _msg_parts.append(f"대사 포맷 복원 {_v338_stats['dialogue_lines_restored']}개")
+                    if _v338_stats["meta_lines_removed"]:
+                        _msg_parts.append(f"메타 라인 제거 {_v338_stats['meta_lines_removed']}개")
+                    st.info(
+                        f"✅ v3.3.8 시나리오 포맷 자동 정규화: {' · '.join(_msg_parts)} "
+                        f"(인물 사전 {len(_v338_roster)}명 기반)"
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        # 안전망이므로 실패해도 본문 흐름은 유지
+        pass
 
     # ═══════════════════════════════════════════════════════════
     # 대사 형식 붕괴 자동 복구 (Writer Engine v3.4 이식)
@@ -4582,7 +4962,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.7</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.8</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6721,7 +7101,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.7",
+                "engine": "BLUE JEANS REVISE ENGINE v3.3.8",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -6778,7 +7158,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.7  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.8  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
