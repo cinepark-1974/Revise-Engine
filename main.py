@@ -87,6 +87,30 @@
 #                    6. create_revised_docx 본문 파싱 직전 정규화 후크 추가
 #                    효과: 원본이 비표준 포맷이거나 부분 수정인 경우에도 결과물의
 #                          씬헤더·대사·지문 3구분이 95%대 자동 복원.
+# v3.4.0 (2026-06-23) ★ A35 신규 룰 + 자동 후처리 — 씬 헤딩 시간대 5단계 한글 표기.
+#                    배경: 「상속」 R2 결과물에서 씬 헤딩 시간대 표기가 혼용됨.
+#                          DAY/NIGHT 영문 + 낮/밤/점심/아침/해질녘 한글이 뒤섞임.
+#                    1. prompt.py A35 룰 신설 — 집필 단계에서 새벽/오전/오후/저녁/밤
+#                       5개로만 표기하도록 강제 + 매핑 기준·자가 점검 명시.
+#                    2. auto_fix_a35_scene_time — 출력 단계 자동 후처리.
+#                       씬 헤딩 라인만 정밀 매칭해 시간대를 5단계로 치환.
+#                       본문 대사·지문은 건드리지 않음.
+#                    3. 매핑: 점심·정오→오후, 해질녘·황혼→저녁, 아침→오전,
+#                       DAY/낮→오후(기본값), NIGHT/밤→밤, 새벽→새벽.
+#                    4. create_revised_docx 본문 처리부에 호출 후크 추가
+#                       (auto_fix_duplicate_scene_blocks 직후).
+# v3.4.1 (2026-06-23) ★ 대사 포맷 개선 — 인물명 정렬 + 긴 대사 hanging indent.
+#                    배경: 「상속」 결과물에서 (1) 인물명 길이에 따라 대사 시작
+#                          위치가 어긋나고, (2) 긴 대사가 둘째 줄로 넘어가면
+#                          대사 시작 위치로 들여쓰기되지 않고 왼쪽으로 떨어지는 결함.
+#                    원인: '대사' 스타일에 탭스톱·hanging indent 미정의.
+#                          인물명 뒤 \t\t가 워드 기본 탭에 의존 → 길이 따라 밀림.
+#                    1. '대사' 스타일에 3.0cm 인물명 영역 폭 + 4.25cm 탭스톱 +
+#                       hanging indent(-3.0cm) 적용 → 인물명 길이 무관 정렬,
+#                       긴 대사 둘째 줄도 대사 시작 위치에 정렬.
+#                    2. add_dialogue 인물명 뒤 탭 2개 → 1개 (단일 탭스톱 정렬).
+#                    3. WD_TAB_ALIGNMENT import 추가.
+#                    검증: 화자 표기 포함 긴 인물명(오성환 (V.O.) 등)까지 정렬 확인.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -101,7 +125,7 @@ import streamlit as st
 import anthropic
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -1027,7 +1051,16 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
     style_dialogue.font.name = '함초롬바탕'
     style_dialogue.font.size = Pt(10)
     style_dialogue.font.bold = True
-    style_dialogue.paragraph_format.left_indent = Cm(1.25)
+    # ★ v3.4.1 — 인물명 정렬 + 긴 대사 hanging indent (한국 시나리오 표준 포맷)
+    #   - 인물명 영역 폭 3.0cm 고정 → 인물명 길이와 무관하게 대사 시작 위치 동일
+    #   - hanging indent → 긴 대사가 둘째 줄로 넘어가도 대사 시작 위치에 정렬
+    #   - 들여쓰기 기준선 1.25cm + 인물명 폭 3.0cm = 대사 시작 4.25cm
+    _DLG_BASE_INDENT_CM = 1.25     # 대사 블록 좌측 기준선
+    _DLG_NAME_WIDTH_CM = 3.0       # 인물명 영역 폭 (대사 시작 탭스톱)
+    _DLG_TAB_CM = _DLG_BASE_INDENT_CM + _DLG_NAME_WIDTH_CM  # = 4.25
+    style_dialogue.paragraph_format.left_indent = Cm(_DLG_TAB_CM)
+    style_dialogue.paragraph_format.first_line_indent = Cm(-_DLG_NAME_WIDTH_CM)  # hanging
+    style_dialogue.paragraph_format.tab_stops.add_tab_stop(Cm(_DLG_TAB_CM), WD_TAB_ALIGNMENT.LEFT)
     style_dialogue.paragraph_format.space_before = Pt(8)
     style_dialogue.paragraph_format.space_after = Pt(2)
     style_dialogue.paragraph_format.line_spacing = 1.5
@@ -1120,10 +1153,10 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
         run을 분할하여 bold를 해제. 화자 표기의 괄호(예: V.O.)는 유지."""
         if continuation:
             p = doc.add_paragraph(style='대사연속')
-            speaker_part = "\t\t"
+            speaker_part = "\t"
         else:
             p = doc.add_paragraph(style='대사')
-            speaker_part = f"{char_name}\t\t"
+            speaker_part = f"{char_name}\t"
 
         # 대사 본문 영역 조립: parenthetical 인자 + 실제 대사
         body_parts = []  # [(text, is_paren), ...]
@@ -1493,6 +1526,18 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
             st.warning(
                 f"⚠️ A33 위반 자동 처리: {_dup_removed}개 씬이 통째로 중복 출력됨 → 두 번째 블록 자동 제거. "
                 f"(LLM이 ADD 처방 시 같은 씬을 두 번 쓰는 결함 — 정상 처리)"
+            )
+        except Exception:
+            pass
+
+    # ★ v3.4.0: 씬 헤딩 시간대 5단계 한글 표기 강제 (A35 후처리)
+    full_text, _a35_fixed = auto_fix_a35_scene_time(full_text)
+    if _a35_fixed > 0:
+        try:
+            st.info(
+                f"✅ A35 시간대 표기 자동 정규화: {_a35_fixed}개 씬 헤딩의 시간대를 "
+                f"새벽/오전/오후/저녁/밤 5단계로 통일. "
+                f"(DAY/NIGHT 영문·점심·아침 등 혼용 표기 → 5단계 한글 강제)"
             )
         except Exception:
             pass
@@ -1987,6 +2032,122 @@ def auto_fix_a29_violations(text: str) -> tuple:
             count += n
 
     return fixed, count
+
+
+# =================================================================
+# ★★★ v3.4.0 — A35 자동 후처리 (씬 헤딩 시간대 5단계 한글 표기) ★★★
+# 씬 헤딩(S#... — 시간대)의 시간대만 정밀하게 잡아
+# 새벽/오전/오후/저녁/밤 5개로 강제 치환한다.
+# 본문 대사·지문은 절대 건드리지 않는다 (씬 헤딩 라인만 대상).
+# 매핑 기준 (사용자 확정):
+#   점심·정오·한낮 → 오후
+#   해질녘·황혼·노을 → 저녁
+#   아침·이른 아침 → 오전
+#   DAY/낮/주간 → 오후 (시간 단서 없을 때 기본값)
+#   NIGHT/밤/야간/자정 → 밤
+#   새벽 → 새벽
+# =================================================================
+
+# 시간대 표기 → 5단계 매핑 사전 (긴 표기부터 먼저 매칭되도록 순서 중요)
+_A35_TIME_MAP = [
+    # (정규식 패턴, 5단계 표기)
+    # ── 새벽
+    (r'동트기?\s*전', '새벽'),
+    (r'새벽녘', '새벽'),
+    (r'새벽', '새벽'),
+    # ── 저녁 (해질녘·황혼 계열 — '밤'보다 먼저 잡아야 함)
+    (r'해\s*질\s*녘', '저녁'),
+    (r'해질녘', '저녁'),
+    (r'황혼', '저녁'),
+    (r'노을', '저녁'),
+    (r'땅거미', '저녁'),
+    (r'일몰', '저녁'),
+    (r'저녁', '저녁'),
+    (r'초저녁', '저녁'),
+    (r'EVENING', '저녁'),
+    (r'DUSK', '저녁'),
+    # ── 오전 (아침 계열)
+    (r'이른\s*아침', '오전'),
+    (r'아침', '오전'),
+    (r'동틀\s*무렵', '오전'),
+    (r'오전', '오전'),
+    (r'MORNING', '오전'),
+    (r'DAWN', '새벽'),  # DAWN은 새벽
+    # ── 오후 (점심·정오·한낮 계열)
+    (r'점심', '오후'),
+    (r'정오', '오후'),
+    (r'한낮', '오후'),
+    (r'오후', '오후'),
+    (r'AFTERNOON', '오후'),
+    (r'NOON', '오후'),
+    # ── 밤 (야간 계열)
+    (r'한밤중', '밤'),
+    (r'자정', '밤'),
+    (r'NIGHT', '밤'),
+    (r'야간', '밤'),
+    (r'밤', '밤'),
+    # ── 낮/주간/DAY → 오후 (기본값, 가장 마지막)
+    (r'주간', '오후'),
+    (r'DAY', '오후'),
+    (r'낮', '오후'),
+]
+
+
+def auto_fix_a35_scene_time(text: str) -> tuple:
+    """v3.4.0 — A35 씬 헤딩 시간대 자동 후처리.
+
+    씬 헤딩 라인의 시간대를 새벽/오전/오후/저녁/밤 5개로 강제 치환.
+    씬 헤딩만 대상으로 하며 본문(대사·지문)은 건드리지 않는다.
+
+    씬 헤딩 판정: 'S#...'로 시작하고 ' — '(또는 '—', '-') 뒤에 시간대가 오는 라인.
+
+    Args:
+        text: 시나리오 본문 텍스트
+
+    Returns:
+        (fixed_text, replacement_count)
+    """
+    import re as _re_a35
+
+    # 씬 헤딩 라인 패턴:
+    #   그룹1: 'S#번호. ... ' (장소까지 포함한 앞부분)
+    #   구분자: — / – / - (앞뒤 공백 유무 무관)
+    #   그룹2: 시간대 부분 (라인 끝까지)
+    # 예: "S#6. INT. 사무실 — DAY"  /  "S#18. EXT. 본사 앞 —오전"
+    heading_re = _re_a35.compile(
+        r'^(\s*S#[\w\-]+\..*?)\s*[—–\-]\s*(.+?)\s*$'
+    )
+
+    count = 0
+    out_lines = []
+
+    for line in text.split('\n'):
+        m = heading_re.match(line)
+        if not m:
+            out_lines.append(line)
+            continue
+
+        head_part = m.group(1)   # "S#6. INT. 사무실"
+        time_part = m.group(2)   # "DAY" / "오전" / "점심" 등
+
+        # 시간대 부분에서 5단계 표기를 찾아 치환
+        mapped = None
+        for pat, repl in _A35_TIME_MAP:
+            if _re_a35.search(pat, time_part, _re_a35.IGNORECASE):
+                mapped = repl
+                break
+
+        if mapped is None:
+            # 매핑되는 시간대 단서가 없으면 원본 유지 (오인 치환 방지)
+            out_lines.append(line)
+            continue
+
+        new_line = f"{head_part} — {mapped}"
+        if new_line != line:
+            count += 1
+        out_lines.append(new_line)
+
+    return '\n'.join(out_lines), count
 
 
 # =================================================================
@@ -4962,7 +5123,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.3.8</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.4.1</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -7101,7 +7262,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.3.8",
+                "engine": "BLUE JEANS REVISE ENGINE v3.4.1",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -7158,7 +7319,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.3.8  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.4.1  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
