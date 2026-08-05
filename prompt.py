@@ -29,6 +29,20 @@
 # - 시간대를 새벽/오전/오후/저녁/밤 5개로만 강제. 그 외 표기 전부 금지.
 # - 매핑: 점심·정오→오후, 해질녘·황혼→저녁, 아침→오전, DAY/낮→맥락 판단(기본 오후).
 # - 집필 단계 강제(A35 룰) + 출력 단계 자동 후처리(auto_fix_a35_scene_time, main.py) 이중 방어.
+#
+# v3.5.0 (2026-08-05) ★ 처방 이행 감사 계층 신설 (개선안 우선순위 1).
+# - 「연애.결혼」R1 결함: revision_plan.target_scenes 12개 중 4개가 처방 미이행 상태로
+#   unchanged_scenes_note에 흡수되어 소실. 이 필드가 미처리 항목의 무덤으로 기능함.
+# - 대응 1 — 자가 신고 의무화: revision_notes.prescription_applied (Y / Partial / N + 사유) 필수 필드 신설.
+#   엔진이 처방을 못 지켰을 때 씬을 숨기지 않고 사유를 남기도록 강제.
+# - 대응 2 — [처방 이행 강제] 블록 신설: 배정 씬 전원 출력 의무 +
+#   unchanged_scenes_note에 배정 씬 기재 금지.
+# - 대응 3 — 신규 함수 4종:
+#   extract_scene_keys / sanitize_unchanged_scenes_note /
+#   audit_prescription_coverage / build_pending_retry_block
+# - 대응 4 — split_into_batches(index_offset) : 미이행 씬 재투입 배치를 기존 배치 뒤에 이어붙임.
+# - 대응 5 — merge_batch_results(diagnose_result) : 통합 시 note 자동 정제 +
+#   batch_summary를 "산출 개수"가 아니라 "처방 이행률" 기준으로 산출 + prescription_audit 첨부.
 # =================================================================
 
 
@@ -2801,15 +2815,29 @@ def build_revise_prompt(
             }
         }
         plan_json = _json.dumps(batch_plan, ensure_ascii=False, indent=2)
+
+        # ★ v3.5.0 — 미이행 재투입 배치면 경고 블록을 앞에 붙인다
+        _retry_items = [s for s in batch_scenes
+                        if isinstance(s, dict) and s.get("_pending_retry")]
+        retry_block = build_pending_retry_block(_retry_items)
+
+        _assigned_ids = ", ".join(
+            str(s.get("scene_id", "?")) for s in batch_scenes if isinstance(s, dict)
+        )
+
         batch_header = f"""
 [배치 진행 상황]
 ━━━━━━━━━━━━━━━━━━━━━━━━
 현재 배치: {batch_index} / {total_batches}
 이번 배치에서 집필할 씬: {len(batch_scenes)}개
+배정 씬 목록: {_assigned_ids}
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 ※ 이번 배치의 씬들에만 집중하라. 다른 배치의 씬들은 다른 호출에서 처리된다.
-  단, 다른 배치 씬과 연결되는 부분은 자연스럽게 이어지도록 주의하라."""
+  단, 다른 배치 씬과 연결되는 부분은 자연스럽게 이어지도록 주의하라.
+※ 위 배정 씬 {len(batch_scenes)}개는 **전원** revised_scenes 배열에 나와야 한다.
+  하나라도 빠지면 실패로 처리된다. 자세한 규칙은 아래 [처방 이행 강제] 참조.
+{retry_block}"""
     else:
         # 전체 모드 (구버전 호환)
         plan_json = _json.dumps(diagnose_result, ensure_ascii=False, indent=2)
@@ -3193,6 +3221,32 @@ revised_content 안의 시나리오 본문은 다음 한국 시나리오 표준�
 
 이 형식을 어기면 SEVERE VIOLATION이다.
 
+[처방 이행 강제 — Prescription Compliance Mandate]
+━━━━━━━━━━━━━━━━━━━━━━━━
+1. 이번 작업에 배정된 target_scenes는 **전원** revised_scenes 배열에 나와야 한다.
+   배정된 씬을 배열에서 빼는 것은 SEVERE VIOLATION이다.
+
+2. unchanged_scenes_note에는 **배정되지 않은 씬만** 적을 수 있다.
+   배정된 씬을 "원본 유지"로 처리해 이 필드에 적는 것은 절대 금지한다.
+   이 필드는 미처리 항목의 도피처가 아니다.
+
+3. 처방을 반영하기 어렵다고 판단되더라도 씬을 누락시키지 마라.
+   씬은 그대로 출력하고, revision_notes.prescription_applied에 사유를 남겨라.
+   판단은 작가(Mr. MOON)가 한다. 엔진이 판단을 감추는 것이 가장 나쁜 결과다.
+
+4. revision_notes.prescription_applied는 **모든 씬에 필수**다. 생략 금지.
+   - "Y"                : 그 씬의 revision_items 처방을 전부 반영했다.
+   - "Partial — 사유"   : 일부만 반영했다. 무엇을 못 했는지 반드시 적는다.
+   - "N — 사유"         : 반영하지 못했다. 사유를 반드시 적는다.
+
+5. "원본이 이미 충분히 좋아서 손대지 않았다"는 Y가 아니다. Partial 또는 N이다.
+   처방이 부당하다고 생각되면 그 판단을 사유에 적어라. 침묵하지 마라.
+
+6. MERGE로 두 씬을 합쳤다면 합쳐진 씬 하나만 출력하되,
+   scene_id에 원본 두 씬 번호를 모두 남겨라 (예: "S#9-10").
+   그래야 감사 단계에서 두 처방이 모두 이행된 것으로 인정된다.
+━━━━━━━━━━━━━━━━━━━━━━━━
+
 [출력 형식 — JSON 단일 객체]
 {{
   "revision_result": {{
@@ -3211,6 +3265,7 @@ revised_content 안의 시나리오 본문은 다음 한국 시나리오 표준�
         "revised_content": "수정된 씬 전문 (DELETE면 빈 문자열). 지문+대사+전환 모두 포함. 줄바꿈은 \\n으로.",
         "insert_position": "ADD/MERGE/SPLIT 시 삽입·합침·분할 위치 정보",
         "revision_notes": {{
+          "prescription_applied": "★필수★ Y | Partial — 사유 | N — 사유 (생략 금지)",
           "what_changed": "무엇이 어떻게 바뀌었는지 구체적으로",
           "what_preserved": "원본에서 유지한 요소들",
           "intensity_check": "이 씬에서 실제 보존 비율 (추정)",
@@ -3218,7 +3273,7 @@ revised_content 안의 시나리오 본문은 다음 한국 시나리오 표준�
         }}
       }}
     ],
-    "unchanged_scenes_note": "수정 대상이 아닌 씬들에 대한 안내 (원본 그대로 사용)",
+    "unchanged_scenes_note": "이번 배치에 **배정되지 않은** 씬들에 대한 안내만. 배정 씬 기재 금지.",
     "cross_scene_impact": "이 수정이 다른 씬들과 플롯 흐름에 미치는 영향 설명"
   }}
 }}
@@ -3884,12 +3939,18 @@ def build_beat_aware_diagnose_block(beat_map: dict, distribution: dict, target_a
 # =================================================================
 # [10] 배치 분할 헬퍼 (DIAGNOSE 결과 → 우선순위·시간순 정렬된 배치 리스트)
 # =================================================================
-def split_into_batches(diagnose_result: dict, batch_size: int = 6) -> list:
+def split_into_batches(diagnose_result: dict, batch_size: int = 6,
+                       index_offset: int = 0) -> list:
     """DIAGNOSE 결과의 target_scenes를 배치 단위로 나눈다.
 
     정렬 우선순위:
     1. Priority: HIGH → MEDIUM → LOW
     2. 같은 Priority 내에서는 batch_recommended 값 → scene_position 순
+
+    v3.5.0 — index_offset:
+        미이행 씬 재투입 배치를 만들 때 사용한다. 기존 배치가 3개면
+        index_offset=3을 넘겨 4번부터 번호가 매겨지게 한다. 기본값 0이므로
+        기존 호출부는 그대로 동작한다.
 
     Returns:
         배치 리스트. 각 배치는 dict:
@@ -3937,7 +3998,7 @@ def split_into_batches(diagnose_result: dict, batch_size: int = 6) -> list:
         type_summary = ", ".join(f"{k} {v}개" for k, v in type_count.items())
 
         batches.append({
-            "batch_index": len(batches) + 1,
+            "batch_index": len(batches) + 1 + int(index_offset or 0),
             "scenes": chunk,
             "priority_summary": priority_summary,
             "type_summary": type_summary,
@@ -3947,11 +4008,14 @@ def split_into_batches(diagnose_result: dict, batch_size: int = 6) -> list:
     return batches
 
 
-def merge_batch_results(batch_results: list) -> dict:
+def merge_batch_results(batch_results: list, diagnose_result: dict = None) -> dict:
     """여러 배치의 REVISE 결과를 하나로 합친다.
 
     Args:
         batch_results: [batch1_result, batch2_result, ...] 형태의 리스트
+        diagnose_result: (v3.5.0, 선택) 진단 결과. 넘기면 다음 두 가지가 추가 작동한다.
+            1. unchanged_scenes_note에서 처방 대상 씬 언급을 자동 제거
+            2. 처방 이행 감사(prescription_audit) 첨부 + batch_summary를 이행률 기준으로 산출
 
     Returns:
         통합된 revision_result (Stage 3 VERIFY 입력으로 사용 가능)
@@ -3979,15 +4043,294 @@ def merge_batch_results(batch_results: list) -> dict:
         if un:
             unchanged_notes.append(un)
 
-    return {
+    merged_note = "\n".join(unchanged_notes)
+
+    # ★ v3.5.0 — 처방 대상 씬이 unchanged_scenes_note에 흡수되는 것을 차단
+    contaminated = []
+    if diagnose_result:
+        target_scenes = (diagnose_result.get("revision_plan", {}) or {}).get("target_scenes", []) or []
+        target_keys = set()
+        for t in target_scenes:
+            if isinstance(t, dict):
+                target_keys.update(extract_scene_keys(t.get("scene_id", "")))
+        merged_note, contaminated = sanitize_unchanged_scenes_note(merged_note, target_keys)
+
+    result = {
         "revision_result": {
             "summary": "\n\n".join(summaries) if summaries else "",
             "revised_scenes": all_scenes,
             "cross_scene_impact": "\n\n".join(cross_impacts) if cross_impacts else "",
-            "unchanged_scenes_note": unchanged_notes[0] if unchanged_notes else "",
-            "batch_summary": f"총 {len(batch_results)}개 배치, {len(all_scenes)}개 씬 처리 완료"
+            "unchanged_scenes_note": merged_note,
+            "batch_summary": f"총 {len(batch_results)}개 배치, {len(all_scenes)}개 씬 산출"
         }
     }
+
+    # ★ v3.5.0 — 처방 이행 감사
+    if diagnose_result:
+        audit = audit_prescription_coverage(diagnose_result, result)
+        result["revision_result"]["prescription_audit"] = audit
+        result["revision_result"]["pending_scene_ids"] = [
+            p.get("scene_id", "") for p in audit.get("pending", [])
+        ]
+        result["revision_result"]["batch_summary"] = (
+            f"총 {len(batch_results)}개 배치 · {len(all_scenes)}개 씬 산출 · "
+            f"처방 {audit['target_total']}개 중 이행 {audit['done_count']}개 "
+            f"(미이행 {audit['pending_count']}개, 이행률 {audit['coverage_rate']}%)"
+        )
+        if contaminated:
+            result["revision_result"]["sanitized_unchanged_note_items"] = contaminated
+
+    return result
+
+
+# =================================================================
+# [12] ★ v3.5.0 — 처방 이행 감사 계층 (Prescription Compliance Audit)
+# =================================================================
+# 「연애.결혼」R1에서 발견된 결함 대응.
+# target_scenes에 배정된 씬이 revised_scenes에 나오지 않거나, 나왔더라도
+# 처방을 반영하지 않은 채 unchanged_scenes_note로 흡수되어 소실되는 것을 막는다.
+# =================================================================
+
+def extract_scene_keys(text) -> list:
+    """씬 식별 문자열에서 씬 키를 전부 뽑아낸다.
+
+    입력 예 → 출력 예
+      "S#35 INT. 카페 — 오후"  → ["S#35"]
+      "S#48-1"                 → ["S#48-1"]         (하위 씬 번호)
+      "S#9-10 통합"            → ["S#9-10", "S#9", "S#10"]  (구간 병합)
+      "ADD-1"                  → ["ADD-1"]
+      ""                       → []
+
+    'S#9-10'처럼 뒤 숫자가 더 크면 구간(MERGE)으로 보고 양 끝 번호를 함께 반환한다.
+    'S#48-1'처럼 뒤 숫자가 작거나 같으면 하위 씬 번호로 보고 그대로 둔다.
+    """
+    import re as _re
+    if not text or not isinstance(text, str):
+        return []
+
+    keys = []
+
+    for m in _re.finditer(r'S\s*#\s*(\d+)(?:\s*[-–~]\s*(\d+))?', text, _re.IGNORECASE):
+        first, second = m.group(1), m.group(2)
+        if second is None:
+            k = f"S#{int(first)}"
+            if k not in keys:
+                keys.append(k)
+        else:
+            k = f"S#{int(first)}-{int(second)}"
+            if k not in keys:
+                keys.append(k)
+            if int(second) > int(first):
+                # 구간 병합 — 양 끝 번호도 커버한 것으로 인정
+                for n in (int(first), int(second)):
+                    kk = f"S#{n}"
+                    if kk not in keys:
+                        keys.append(kk)
+
+    for m in _re.finditer(r'\bADD\s*[-–_ ]?\s*(\d+)', text, _re.IGNORECASE):
+        k = f"ADD-{int(m.group(1))}"
+        if k not in keys:
+            keys.append(k)
+
+    return keys
+
+
+def _primary_scene_key(text) -> str:
+    """대표 키 하나만 반환. 씬 번호가 없으면 원문을 정규화해 키로 쓴다."""
+    keys = extract_scene_keys(text)
+    if keys:
+        return keys[0]
+    import re as _re
+    norm = _re.sub(r'\s+', ' ', (text or "").strip())
+    return norm[:40] if norm else "(무명 씬)"
+
+
+def sanitize_unchanged_scenes_note(note: str, target_keys) -> tuple:
+    """unchanged_scenes_note에서 처방 대상 씬 언급을 제거한다.
+
+    이 필드는 '수정 대상이 아닌 씬' 안내용이다. 처방이 배정된 씬이 여기
+    적히면 미이행이 '원본 유지'로 위장되므로 문장 단위로 걷어낸다.
+
+    Args:
+        note: 원본 unchanged_scenes_note 문자열
+        target_keys: 처방 대상 씬 키 집합 (extract_scene_keys 결과들의 합집합)
+
+    Returns:
+        (정제된 note, 제거된 문장 리스트)
+    """
+    import re as _re
+    if not note or not target_keys:
+        return (note or "", [])
+
+    target_keys = set(target_keys)
+
+    # 줄 단위로 먼저 나누고, 각 줄을 다시 문장 단위로 나눈다.
+    kept, removed = [], []
+    for line in note.split('\n'):
+        if not line.strip():
+            kept.append(line)
+            continue
+        sentences = _re.split(r'(?<=[.!?다])\s+', line)
+        kept_sent = []
+        for s in sentences:
+            if not s.strip():
+                continue
+            s_keys = set(extract_scene_keys(s))
+            if s_keys & target_keys:
+                removed.append(s.strip())
+            else:
+                kept_sent.append(s.strip())
+        if kept_sent:
+            kept.append(' '.join(kept_sent))
+
+    return ('\n'.join(kept).strip(), removed)
+
+
+def audit_prescription_coverage(diagnose_result: dict, revise_result: dict,
+                                target_scenes: list = None) -> dict:
+    """처방(target_scenes)이 실제로 이행됐는지 씬 단위로 대조한다.
+
+    판정 기준 (모두 결정론적 — 추론 없음):
+      MISSING      : 배정됐는데 revised_scenes에 아예 없다
+      EMPTY        : 나왔지만 revised_content가 비어 있다 (DELETE 제외)
+      NOT_APPLIED  : 엔진이 스스로 prescription_applied = "N"으로 신고했다
+      PARTIAL      : 엔진이 스스로 "Partial"로 신고했다
+      UNVERIFIED   : prescription_applied 필드가 없다 (구버전 산출물)
+      DONE         : 이행 완료
+
+    pending = MISSING + EMPTY + NOT_APPLIED + PARTIAL
+    UNVERIFIED는 pending에 넣지 않되 별도 집계해 화면에 표시한다.
+
+    Args:
+        diagnose_result: 진단 결과 (revision_plan.target_scenes 보유)
+        revise_result:   집필 결과 (revision_result.revised_scenes 보유)
+        target_scenes:   (선택) 특정 배치만 감사할 때 그 배치의 씬 리스트
+
+    Returns:
+        {
+          "target_total": int, "done_count": int, "pending_count": int,
+          "unverified_count": int, "coverage_rate": float,
+          "pending": [ {원본 target 항목 + "_audit_status" + "_audit_reason"} ],
+          "unverified": [...], "detail": [ {scene_id, status, reason} ]
+        }
+    """
+    if target_scenes is None:
+        target_scenes = (diagnose_result or {}).get("revision_plan", {}).get("target_scenes", []) or []
+
+    rr = (revise_result or {}).get("revision_result", {}) or {}
+    delivered = rr.get("revised_scenes", []) or []
+
+    # 산출된 씬을 키로 색인
+    delivered_index = {}
+    for sc in delivered:
+        if not isinstance(sc, dict):
+            continue
+        keys = extract_scene_keys(sc.get("scene_id", "")) + extract_scene_keys(sc.get("scene_header", ""))
+        if not keys:
+            keys = [_primary_scene_key(sc.get("scene_id", "") or sc.get("scene_header", ""))]
+        for k in keys:
+            delivered_index.setdefault(k, sc)
+
+    pending, unverified, detail = [], [], []
+    done_count = 0
+
+    for t in target_scenes:
+        if not isinstance(t, dict):
+            continue
+        raw_id = t.get("scene_id", "")
+        t_keys = extract_scene_keys(raw_id) or [_primary_scene_key(raw_id)]
+        t_type = (t.get("type") or "REWRITE").upper()
+
+        matched = None
+        for k in t_keys:
+            if k in delivered_index:
+                matched = delivered_index[k]
+                break
+
+        if matched is None:
+            status, reason = "MISSING", "배정된 씬이 집필 결과에 없습니다."
+        else:
+            content = (matched.get("revised_content") or "").strip()
+            notes = matched.get("revision_notes", {}) or {}
+            applied = str(notes.get("prescription_applied", "") or "").strip()
+            applied_head = applied.split("—")[0].split("-")[0].strip().upper()
+
+            if not content and t_type != "DELETE":
+                status, reason = "EMPTY", "씬은 나왔으나 본문이 비어 있습니다."
+            elif applied_head.startswith("N"):
+                status, reason = "NOT_APPLIED", (applied or "엔진이 미이행으로 신고했습니다.")
+            elif applied_head.startswith("PARTIAL") or applied_head.startswith("P"):
+                status, reason = "PARTIAL", (applied or "엔진이 부분 이행으로 신고했습니다.")
+            elif applied_head.startswith("Y"):
+                status, reason = "DONE", ""
+            else:
+                status, reason = "UNVERIFIED", "prescription_applied 자가 신고가 없습니다."
+
+        detail.append({"scene_id": raw_id, "status": status, "reason": reason})
+
+        if status == "DONE":
+            done_count += 1
+        elif status == "UNVERIFIED":
+            done_count += 1  # 이행으로 간주하되 별도 표시
+            item = dict(t)
+            item["_audit_status"] = status
+            item["_audit_reason"] = reason
+            unverified.append(item)
+        else:
+            item = dict(t)
+            item["_audit_status"] = status
+            item["_audit_reason"] = reason
+            item["_pending_retry"] = True
+            pending.append(item)
+
+    total = len(detail)
+    rate = round(done_count / total * 100, 1) if total else 100.0
+
+    return {
+        "target_total": total,
+        "done_count": done_count,
+        "pending_count": len(pending),
+        "unverified_count": len(unverified),
+        "coverage_rate": rate,
+        "pending": pending,
+        "unverified": unverified,
+        "detail": detail,
+    }
+
+
+def build_pending_retry_block(pending_items: list) -> str:
+    """미이행 씬 재투입 배치용 경고 블록.
+
+    한 번 실패한 처방이라는 사실과 실패 사유를 집필 프롬프트에 명시해,
+    같은 이유로 또 빠지는 것을 막는다.
+    """
+    if not pending_items:
+        return ""
+
+    lines = []
+    for p in pending_items:
+        if not isinstance(p, dict):
+            continue
+        sid = p.get("scene_id", "(씬 ID 없음)")
+        st = p.get("_audit_status", "")
+        rs = p.get("_audit_reason", "")
+        lines.append(f"  · {sid} — [{st}] {rs}")
+
+    if not lines:
+        return ""
+
+    body = "\n".join(lines)
+    return f"""
+[⚠ 재투입 배치 — 이전 회차 처방 미이행분]
+━━━━━━━━━━━━━━━━━━━━━━━━
+이번 배치의 씬들은 이전 회차에서 처방이 이행되지 않아 다시 투입된 것이다.
+{body}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+※ 이번에는 반드시 처방을 반영하라. 다시 누락시키면 SEVERE VIOLATION이다.
+※ 그럼에도 반영이 불가능하다고 판단되면, 씬을 빼지 말고
+  revision_notes.prescription_applied에 "N — 구체적 사유"를 반드시 남겨라.
+  작가(Mr. MOON)가 그 사유를 보고 직접 판단한다."""
 
 
 # =================================================================

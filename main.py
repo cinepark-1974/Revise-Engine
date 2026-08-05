@@ -111,6 +111,34 @@
 #                    2. add_dialogue 인물명 뒤 탭 2개 → 1개 (단일 탭스톱 정렬).
 #                    3. WD_TAB_ALIGNMENT import 추가.
 #                    검증: 화자 표기 포함 긴 인물명(오성환 (V.O.) 등)까지 정렬 확인.
+# v3.5.0 (2026-08-05) ★ 처방 이행 감사 계층 — 미이행 씬 큐 승계 (개선안 우선순위 1).
+#                    배경: 「연애.결혼」R1에서 target_scenes 12개 중 4개가 처방
+#                          미이행 상태로 unchanged_scenes_note에 흡수되어 소실.
+#                          batch_summary는 "12개 씬 처리 완료"로 표시되어
+#                          작가가 미이행 사실을 인지할 수 없었음.
+#                    1. Stage 2에 '처방 이행 감사' 패널 신설 — 배치 완료 시마다
+#                       target_scenes ↔ revised_scenes 대조. 이행률·미이행 목록 표시.
+#                    2. 미이행 씬 재투입 배치 자동 생성 버튼 —
+#                       split_into_batches(index_offset=)로 기존 배치 뒤에 이어붙임.
+#                    3. 검증(Stage 3) 진입 게이트 — 미이행이 남아 있으면 기본 차단.
+#                       작가가 '미이행 인지하고 진행' 체크 시에만 통과 (통제권 유지).
+#                    4. merge_batch_results에 diagnose_result 전달 →
+#                       unchanged_scenes_note 오염 자동 정제 + 감사 결과 첨부.
+#                    5. prompt.py [처방 이행 강제] 블록 + prescription_applied
+#                       자가 신고 필드와 연동 (엔진이 미이행을 숨기지 못하게 함).
+# v3.5.1 (2026-08-05) ★ 각색 화면 작업 순서 안내 — 버튼 순서 혼선 해소.
+#                    배경: Stage 2 한 화면에 각색 실행·백업·감사·재투입·검증·되돌아가기가
+#                          동시에 노출되어 다음에 무엇을 눌러야 하는지 판단이 어려웠음.
+#                    1. render_stage2_guide — 상단 '🧭 각색 작업 순서' 안내판 신설.
+#                       ① 각색 실행 → ② 처방 이행 감사 → ③ 검증 시작 3단계를 카드로 표시하고
+#                       현재 위치에 '지금 여기' 배지 부착.
+#                    2. '📍 지금 하실 일' 박스 — 다음에 누를 버튼 이름을 그대로 명시.
+#                       상태 4종 분기(미완료 / 미이행 잔존 / 전부 이행 / 완료).
+#                    3. 버튼 라벨에 단계 번호 부여 (▶️ ① N차 각색 시작 / ✅ ③ 검증 시작).
+#                    4. 보조 기능(백업·복구·자동진행·되돌아가기)은 '순서와 무관' 명시 +
+#                       파괴적 동작에 help 경고 부착.
+#                    5. compute_prescription_audit 분리 — 감사 계산과 렌더링 분리로
+#                       상단 안내판이 미이행 개수를 먼저 참조 가능 (중복 계산 없음).
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -160,6 +188,11 @@ from prompt import (
     build_beat_mapping_prompt,
     distribute_added_scenes_across_beats,
     SAVE_THE_CAT_15_BEATS,
+    # ★ v3.5.0 신규 — 처방 이행 감사 계층
+    extract_scene_keys,
+    sanitize_unchanged_scenes_note,
+    audit_prescription_coverage,
+    build_pending_retry_block,
 )
 
 # =================================================================
@@ -382,6 +415,10 @@ INIT_STATE = {
     "verify_report_metadata": None,  # 파싱된 검증 보고서 dict
     "round_n": 1,                  # 현재 라운드 번호 (1=초회, 2=Round 2 ...)
     "auto_fix_a29_enabled": True,  # 집필 후 A29 자동 후처리 ON/OFF
+    # ★ v3.5.0 — 처방 이행 감사 계층
+    "prescription_audit": None,      # 최근 감사 결과 (audit_prescription_coverage 반환값)
+    "retry_rounds": 0,               # 미이행 재투입을 몇 번 돌렸는지
+    "allow_pending_verify": False,   # 미이행이 남은 상태로 검증 진입을 허용할지 (작가 판단)
     # v2.1 — 장르 DNA (참고작 1~3편에서 추출)
     "genre_ref_texts": [],      # [참고작1 텍스트, 참고작2, ...] 최대 3편
     "genre_ref_filenames": [],  # 파일명 리스트
@@ -5123,7 +5160,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.4.1</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.5.1</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6591,6 +6628,298 @@ def _type_badge(t: str) -> str:
     return f'<span style="display:inline-block; padding:2px 8px; background:#EEEEF6; color:#191970; border-radius:4px; font-size:0.72rem; font-weight:700; margin-left:4px;">{icon} {t}</span>'
 
 
+# ═══════════════════════════════════════════════════════════
+# ★ v3.5.0 — 처방 이행 감사 패널 (개선안 우선순위 1)
+# ═══════════════════════════════════════════════════════════
+
+_AUDIT_STATUS_LABEL = {
+    "MISSING":     ("🔴", "누락", "배정됐는데 집필 결과에 씬 자체가 없습니다"),
+    "EMPTY":       ("🔴", "빈 본문", "씬은 나왔으나 본문이 비어 있습니다"),
+    "NOT_APPLIED": ("🟠", "미이행", "엔진이 처방을 반영하지 못했다고 신고했습니다"),
+    "PARTIAL":     ("🟡", "부분 이행", "처방 중 일부만 반영됐습니다"),
+    "UNVERIFIED":  ("⚪", "확인 불가", "자가 신고 필드가 없습니다 (구버전 산출물)"),
+}
+
+
+# ═══════════════════════════════════════════════════════════
+# ★ v3.5.1 — 각색 작업 순서 안내판 (무슨 버튼을 눌러야 하는지)
+# ═══════════════════════════════════════════════════════════
+
+def render_stage2_guide(total_batches: int, completed_count: int,
+                        audit: dict = None) -> None:
+    """각색 화면 상단에 '① → ② → ③' 작업 순서와 '지금 하실 일'을 표시한다.
+
+    한 화면에 버튼이 여러 개 떠 있어도 다음에 누를 것 하나만 짚어준다.
+    """
+    pending = audit.get("pending_count", 0) if audit else 0
+    all_done = (completed_count >= total_batches and total_batches > 0)
+
+    # ── 현재 위치 판정 ──
+    if not all_done:
+        cur = 1
+        next_batch = completed_count + 1
+        todo_button = f"▶️ ① {next_batch}차 각색 시작"
+        todo_desc = (
+            f"아래 <b>각색 {next_batch}차</b> 카드에서 "
+            f"[{todo_button}] 버튼을 눌러 주세요."
+        )
+        if completed_count > 0:
+            todo_desc += (
+                "<br><span style='color:#8E8E99;'>그 전에 위쪽 "
+                "[💾 진행 상황 백업]을 한 번 받아두시면 안전합니다.</span>"
+            )
+    elif pending > 0:
+        cur = 2
+        todo_button = f"🔁 미이행 {pending}개 씬 재투입 배치 생성"
+        todo_desc = (
+            f"각색은 전부 끝났지만 처방 <b>{pending}개</b>가 이행되지 않았습니다.<br>"
+            f"아래 <b>② 처방 이행 감사</b>에서 [{todo_button}] 버튼을 눌러 주세요."
+            "<br><span style='color:#8E8E99;'>처방 자체가 부적절하다고 판단되시면 "
+            "그 아래 체크박스를 켜고 ③으로 넘어가셔도 됩니다.</span>"
+        )
+    else:
+        cur = 3
+        todo_button = "✅ ③ 검증 시작"
+        todo_desc = (
+            f"처방이 모두 이행됐습니다. 화면 맨 아래 "
+            f"[{todo_button}] 버튼을 눌러 주세요."
+        )
+
+    # ── 3단계 표시 ──
+    steps = [
+        (1, "각색 실행",
+         f"{total_batches}차 중 {completed_count}차 완료"),
+        (2, "처방 이행 감사",
+         "미이행 없음" if audit and pending == 0 else
+         (f"미이행 {pending}개" if pending else "각색 완료 후 자동 표시")),
+        (3, "검증 시작",
+         "각색·감사 완료 후 활성화"),
+    ]
+
+    rows = ""
+    for num, name, sub in steps:
+        if num < cur:
+            icon, border, bg, color = "✅", "#2EC484", "#F2FCF7", "#0F7A4D"
+        elif num == cur:
+            icon, border, bg, color = "▶️", "#FFCB05", "#FFFBEB", "#191970"
+        else:
+            icon, border, bg, color = "⏸️", "#E4E4EC", "#FAFAFA", "#8E8E99"
+
+        here = ('<span style="background:#FFCB05; color:#191970; font-size:0.68rem; '
+                'font-weight:800; padding:1px 7px; border-radius:8px; margin-left:8px;">'
+                '지금 여기</span>') if num == cur else ""
+
+        rows += (
+            f'<div style="flex:1; min-width:150px; background:{bg}; border:1.5px solid {border}; '
+            f'border-radius:8px; padding:9px 12px;">'
+            f'<div style="font-weight:800; color:{color}; font-size:0.92rem;">'
+            f'{icon} {num}. {name}{here}</div>'
+            f'<div style="color:#8E8E99; font-size:0.78rem; margin-top:2px;">{sub}</div>'
+            f'</div>'
+        )
+
+    st.markdown(
+        '<div style="font-size:0.95rem; font-weight:800; color:#191970; margin:10px 0 6px;">'
+        '🧭 각색 작업 순서</div>'
+        f'<div style="display:flex; gap:8px; flex-wrap:wrap;">{rows}</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div style="background:#191970; color:#FFFFFF; border-radius:8px; '
+        'padding:12px 16px; margin:10px 0 4px; font-size:0.92rem; line-height:1.55;">'
+        '<b style="color:#FFCB05;">📍 지금 하실 일</b><br>'
+        f'{todo_desc}</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("❓ 각 단계가 무엇인지 자세히 보기"):
+        st.markdown(
+            "**1. 각색 실행** — 진단이 나눈 묶음을 하나씩 집필합니다. "
+            f"이 작품은 총 **{total_batches}차**로 나뉘어 있습니다. "
+            "한 차수당 1~3분 걸리며, 순서대로만 실행됩니다.\n\n"
+            "**2. 처방 이행 감사** — 진단이 지시한 수정이 실제로 반영됐는지 씬 단위로 대조합니다. "
+            "미이행이 있으면 그 씬만 모아 재투입 차수를 새로 만들 수 있습니다.\n\n"
+            "**3. 검증 시작** — 원본과 수정본을 비교해 점수와 판정을 냅니다. "
+            "이후 검증 보고서·최종 DOCX를 받는 화면으로 넘어갑니다.\n\n"
+            "---\n"
+            "**수시로 하셔도 되는 것**\n\n"
+            "· 💾 **진행 상황 백업** — 각색 한 차수가 끝날 때마다 받아두시면 오류 시 복구됩니다.\n\n"
+            "· 👁️ **결과 보기** — 완료된 차수의 원본·수정본을 나란히 확인합니다.\n\n"
+            "· 🔄 **다시 하기** / 🗑️ **결과 삭제** — 마음에 안 드는 차수를 다시 돌립니다. "
+            "삭제하면 그 뒤 차수 결과도 함께 지워집니다(순서 의존)."
+        )
+
+
+def _collect_completed_targets(batches: list, batch_results: dict) -> list:
+    """완료된 배치에 배정된 씬만 모은다 (씬 키 기준 중복 제거).
+
+    아직 실행하지 않은 배치의 씬까지 감사하면 전부 '누락'으로 잡히므로,
+    완료된 배치의 배정 씬만 감사 대상으로 삼는다.
+    재투입으로 같은 씬이 두 배치에 들어간 경우 뒤쪽(재투입분)이 최종 판정이 된다.
+    """
+    collected = {}
+    for b in batches:
+        bidx = b.get("batch_index")
+        if bidx not in batch_results:
+            continue
+        for s in b.get("scenes", []):
+            if not isinstance(s, dict):
+                continue
+            keys = extract_scene_keys(s.get("scene_id", ""))
+            key = keys[0] if keys else str(s.get("scene_id", ""))[:40]
+            collected[key] = s
+    return list(collected.values())
+
+
+def compute_prescription_audit(batches: list, batch_results: dict) -> dict:
+    """처방 이행 감사 '계산'만 수행 (화면 출력 없음).
+
+    v3.5.1 — 화면 위쪽 작업 순서 안내판이 미이행 개수를 먼저 알아야 하므로
+    계산과 렌더링을 분리했다.
+    """
+    if not batch_results:
+        return None
+
+    completed_targets = _collect_completed_targets(batches, batch_results)
+    if not completed_targets:
+        return None
+
+    ordered = [batch_results[i] for i in sorted(batch_results.keys()) if batch_results.get(i)]
+    merged_so_far = merge_batch_results(ordered)
+
+    audit = audit_prescription_coverage(
+        st.session_state.diagnose_result or {},
+        merged_so_far,
+        target_scenes=completed_targets,
+    )
+    st.session_state.prescription_audit = audit
+    return audit
+
+
+def render_prescription_audit_panel(batches: list, batch_results: dict,
+                                    audit: dict = None) -> dict:
+    """완료된 배치를 대상으로 처방 이행 여부를 감사하고 화면에 표시한다.
+
+    Args:
+        audit: (v3.5.1) 미리 계산된 감사 결과. 없으면 여기서 계산한다.
+
+    Returns:
+        audit dict (감사 대상이 없으면 None)
+    """
+    if audit is None:
+        audit = compute_prescription_audit(batches, batch_results)
+    if audit is None:
+        return None
+
+    total = audit["target_total"]
+    done = audit["done_count"]
+    pending = audit["pending_count"]
+    unverified = audit["unverified_count"]
+    rate = audit["coverage_rate"]
+
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.0rem; font-weight:800; color:#191970; margin-bottom:6px;">'
+        '<span style="background:#191970; color:#FFCB05; border-radius:50%; '
+        'display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; '
+        'font-size:0.8rem; margin-right:7px;">2</span>'
+        '처방 이행 감사 <span style="font-size:0.72rem; background:#FFCB05; color:#191970; '
+        'padding:2px 7px; border-radius:9px; margin-left:6px;">v3.5.0</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "진단이 배정한 처방과 실제 집필 결과를 씬 단위로 대조합니다. "
+        "미이행 씬이 조용히 사라지는 것을 막는 층입니다."
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("감사 대상 처방", f"{total}개")
+    m2.metric("이행", f"{done}개")
+    m3.metric("미이행", f"{pending}개", delta=None if pending == 0 else f"-{pending}",
+              delta_color="inverse")
+    m4.metric("이행률", f"{rate}%")
+
+    if pending == 0 and unverified == 0:
+        st.success("✅ 배정된 처방이 모두 이행됐습니다.")
+        return audit
+
+    if unverified:
+        st.info(
+            f"⚪ 자가 신고 없음 {unverified}개 — 집필 결과에 "
+            "`prescription_applied` 필드가 없습니다. 이행으로 간주했으나 눈으로 확인하시기를 권합니다."
+        )
+
+    if pending:
+        st.warning(
+            f"⚠️ 처방 {pending}개가 이행되지 않았습니다. "
+            "아래 목록을 확인하고 재투입 여부를 결정해 주세요."
+        )
+        with st.expander(f"🔴 미이행 처방 {pending}건 상세", expanded=True):
+            for p in audit["pending"]:
+                sid = p.get("scene_id", "(씬 ID 없음)")
+                stt = p.get("_audit_status", "")
+                icon, label, hint = _AUDIT_STATUS_LABEL.get(stt, ("⚪", stt, ""))
+                reason = p.get("_audit_reason", "") or hint
+                pri = p.get("priority", "MEDIUM")
+                typ = p.get("type", "REWRITE")
+
+                st.markdown(
+                    f"**{icon} {sid}** &nbsp;`{label}` &nbsp;·&nbsp; {pri} · {typ}",
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"↳ {reason}")
+
+                items = p.get("revision_items", []) or []
+                if items:
+                    directions = [
+                        (it.get("proposed_direction") or "").strip()
+                        for it in items if isinstance(it, dict)
+                    ]
+                    directions = [d for d in directions if d]
+                    if directions:
+                        st.caption("📌 원래 처방: " + " / ".join(d[:120] for d in directions[:2]))
+                st.markdown("")
+
+    if audit.get("pending"):
+        st.markdown("")
+        rc1, rc2 = st.columns([2, 3])
+        with rc1:
+            if st.button(f"🔁 미이행 {pending}개 씬 재투입 배치 생성",
+                         use_container_width=True, type="primary",
+                         key="btn_requeue_pending"):
+                existing = st.session_state.revise_batches or []
+                max_idx = max([b.get("batch_index", 0) for b in existing] or [0])
+                retry_plan = {"revision_plan": {"target_scenes": audit["pending"]}}
+                new_batches = split_into_batches(
+                    retry_plan,
+                    batch_size=st.session_state.batch_size,
+                    index_offset=max_idx,
+                )
+                if new_batches:
+                    st.session_state.revise_batches = existing + new_batches
+                    st.session_state.retry_rounds = st.session_state.get("retry_rounds", 0) + 1
+                    st.session_state.allow_pending_verify = False
+                    st.success(
+                        f"✅ 재투입 배치 {len(new_batches)}개 생성 "
+                        f"({max_idx + 1}차 ~ {max_idx + len(new_batches)}차). "
+                        "아래 목록에서 실행해 주세요."
+                    )
+                    st.rerun()
+                else:
+                    st.error("재투입 배치 생성에 실패했습니다.")
+        with rc2:
+            st.caption(
+                "재투입 배치는 기존 배치 뒤에 이어붙습니다. "
+                "집필 프롬프트에 '이전 회차 미이행분'이라는 사실과 실패 사유가 함께 전달되어 "
+                "같은 이유로 또 빠지는 것을 막습니다.\n\n"
+                f"현재까지 재투입 횟수: **{st.session_state.get('retry_rounds', 0)}회** "
+                "(2회를 넘기면 처방 자체를 다시 보시는 편이 낫습니다)"
+            )
+
+    return audit
+
+
 def show_step_2_revise():
     """Step 2: 배치 단위 순차 집필 UI."""
     batches = st.session_state.revise_batches or []
@@ -6621,6 +6950,16 @@ def show_step_2_revise():
     # 진행률 바
     progress = completed_count / total_batches if total_batches else 0
     st.progress(progress, text=f"배치 {completed_count} / {total_batches} 완료  ({completed_scenes} / {total_scenes} 씬)")
+
+    # ★ v3.5.1 — 감사 결과를 먼저 계산 (안내판이 미이행 개수를 알아야 함)
+    audit = compute_prescription_audit(batches, batch_results)
+    pending_count = audit.get("pending_count", 0) if audit else 0
+
+    # ★ v3.5.1 — 작업 순서 안내판 (무슨 버튼을 눌러야 하는지)
+    render_stage2_guide(total_batches, completed_count, audit)
+
+    st.markdown("---")
+    st.caption("💾 아래는 수시로 쓰시는 보조 기능입니다 — 순서와 무관합니다.")
 
     # ── 💾 진행 상황 자동 백업 / 복구 패널 ──
     backup_col1, backup_col2 = st.columns([1, 1])
@@ -6717,6 +7056,15 @@ def show_step_2_revise():
         st.info(f"📋 **각색 진행 전략:** {strategy}")
 
     st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.0rem; font-weight:800; color:#191970; margin-bottom:2px;">'
+        '<span style="background:#191970; color:#FFCB05; border-radius:50%; '
+        'display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; '
+        'font-size:0.8rem; margin-right:7px;">1</span>각색 실행</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("위에서부터 순서대로 하나씩 실행합니다. 이전 차수가 끝나야 다음 차수가 열립니다.")
+    st.markdown("")
 
     # ── 각색 카드 목록 ──
     for batch in batches:
@@ -6871,7 +7219,7 @@ def show_step_2_revise():
                                     st.error(f"{bidx}차 각색 실패")
                 elif is_current:
                     # 다음 차례 — 집필 시작
-                    btn_label = f"▶️ {bidx}차 각색 시작 ({len(scenes)}씬)"
+                    btn_label = f"▶️ ① {bidx}차 각색 시작 ({len(scenes)}씬)"
                     if st.button(btn_label, key=f"run_batch_{bidx}", type="primary", use_container_width=True):
                         client = get_client()
                         if client:
@@ -6896,7 +7244,7 @@ def show_step_2_revise():
                                     )
                 else:
                     # 대기 중 (이전 묶음 미완료)
-                    st.button(f"⏸️ {bidx}차 각색 (대기 중)", disabled=True, use_container_width=True,
+                    st.button(f"⏸️ {bidx}차 각색 (앞 차수 완료 후 열림)", disabled=True, use_container_width=True,
                               key=f"wait_batch_{bidx}")
 
             with bc2:
@@ -6951,21 +7299,60 @@ def show_step_2_revise():
                                 st.markdown(f"**변경:** {notes.get('what_changed','')}")
                                 st.markdown(f"**보존:** {notes.get('what_preserved','')}")
 
+    # ★ v3.5.0 — 처방 이행 감사 (완료된 배치가 있을 때만)
+    # v3.5.1 — 상단 안내판이 이미 계산한 결과를 재사용
+    render_prescription_audit_panel(batches, batch_results, audit=audit)
+
     st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.0rem; font-weight:800; color:#191970; margin-bottom:2px;">'
+        '<span style="background:#191970; color:#FFCB05; border-radius:50%; '
+        'display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; '
+        'font-size:0.8rem; margin-right:7px;">3</span>검증 시작</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("원본과 수정본을 비교해 점수·판정을 냅니다. 이후 최종 DOCX를 받는 화면으로 넘어갑니다.")
+    st.markdown("")
 
     # ── 모든 각색 완료 시 다음 단계 ──
     all_done = (completed_count == total_batches)
 
     if all_done:
-        st.success(f"🎉 모든 각색 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
+        if pending_count == 0:
+            st.success(f"🎉 모든 각색 완료! 총 {completed_scenes}개 씬이 수정되었습니다.")
+        else:
+            st.warning(
+                f"⚠️ 배치는 전부 실행됐지만 처방 {pending_count}개가 미이행 상태입니다. "
+                "이대로 검증에 들어가면 미완성본이 완료본처럼 출고됩니다."
+            )
+
+    # ★ v3.5.0 — 미이행 게이트. 남아 있으면 기본 차단, 작가가 명시적으로 열어야 통과.
+    gate_open = True
+    if all_done and pending_count > 0:
+        gate_open = st.checkbox(
+            f"미이행 {pending_count}개를 인지한 상태로 검증을 진행합니다",
+            value=st.session_state.get("allow_pending_verify", False),
+            key="allow_pending_verify_checkbox",
+            help=(
+                "권장 순서: 위 '재투입 배치 생성'으로 미이행분을 먼저 처리하세요.\n"
+                "그럼에도 처방 자체가 부적절하다고 판단되시면 이 항목을 켜고 진행하시면 됩니다."
+            ),
+        )
+        st.session_state.allow_pending_verify = gate_open
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        if st.button("✅ Stage 3: 검증 시작 (VERIFY)",
-                     disabled=not all_done, use_container_width=True, type="primary"):
-            # 모든 각색 결과 통합
-            all_results = [batch_results[i] for i in range(1, total_batches + 1) if i in batch_results]
-            merged = merge_batch_results(all_results)
+        if st.button("✅ ③ 검증 시작 (VERIFY)",
+                     disabled=not (all_done and gate_open),
+                     use_container_width=True, type="primary"):
+            # 모든 각색 결과 통합 (배치 번호 순)
+            all_results = [batch_results[i] for i in sorted(batch_results.keys())
+                           if batch_results.get(i)]
+            # ★ v3.5.0 — diagnose_result 전달 → note 오염 정제 + 감사 결과 첨부
+            merged = merge_batch_results(
+                all_results,
+                diagnose_result=st.session_state.diagnose_result,
+            )
             st.session_state.revise_result = merged
 
             client = get_client()
@@ -6982,7 +7369,8 @@ def show_step_2_revise():
         # 모두 한 번에 (남은 배치 자동 순차 실행)
         remaining = total_batches - completed_count
         if remaining > 0:
-            if st.button(f"⏩ 남은 {remaining}개 자동 진행", use_container_width=True):
+            if st.button(f"⏩ ① 남은 {remaining}차 한번에", use_container_width=True,
+                         help="①을 한 차수씩 누르는 대신 남은 차수를 연속으로 돌립니다. 중간 백업을 못 받으니 시간이 없을 때만 쓰시기를 권합니다."):
                 client = get_client()
                 if client:
                     progress_bar = st.progress(0, text="배치 자동 실행 중...")
@@ -7003,10 +7391,15 @@ def show_step_2_revise():
                     progress_bar.empty()
                     st.rerun()
     with c3:
-        if st.button("◀ 진단으로", use_container_width=True):
+        if st.button("◀ 진단으로", use_container_width=True,
+                     help="⚠️ 지금까지의 각색 결과가 모두 지워집니다. 먼저 [💾 진행 상황 백업]을 받아두세요."):
             st.session_state.step = 1
             st.session_state.revise_batches = None
             st.session_state.batch_results = {}
+            # ★ v3.5.0 — 감사 상태도 함께 초기화
+            st.session_state.prescription_audit = None
+            st.session_state.retry_rounds = 0
+            st.session_state.allow_pending_verify = False
             st.rerun()
 
 
@@ -7262,7 +7655,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.4.1",
+                "engine": "BLUE JEANS REVISE ENGINE v3.5.1",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -7319,14 +7712,16 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.4.1  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.5.1  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
     '<span style="color:#EC4899;">Beat Expansion Mode</span>  ·  '
     '<span style="color:#6366F1;">작가 친화 UI</span>  ·  '
     '<span style="color:#0EA5E9;">Writer v3.5.1 Sync</span>  ·  '
-    '<span style="color:#8B5CF6;">Round N+1 Cycle</span>'
+    '<span style="color:#8B5CF6;">Round N+1 Cycle</span>  ·  '
+    '<span style="color:#DC2626;">Prescription Audit</span>  ·  '
+    '<span style="color:#0891B2;">Step Guide</span>'
     '</div>',
     unsafe_allow_html=True,
 )
