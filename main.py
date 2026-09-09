@@ -139,6 +139,26 @@
 #                       파괴적 동작에 help 경고 부착.
 #                    5. compute_prescription_audit 분리 — 감사 계산과 렌더링 분리로
 #                       상단 안내판이 미이행 개수를 먼저 참조 가능 (중복 계산 없음).
+# v3.5.2 (2026-09-09) ★ A35 역주행 결함 수정 — JSON 시간대 오염 차단 (개선안 우선순위 2).
+#                    배경: v3.4.0에서 A35(5단계 한글)를 신설했으나 구버전 정규화 함수
+#                          _normalize_scene_time_marker()가 갱신되지 않아
+#                          '한글 → DAY/NIGHT' 역변환을 계속 수행.
+#                          이 함수는 매 배치 집필 직후 _validate_and_fix_revised_format()
+#                          안에서 호출되므로 다음 상태가 발생했음.
+#                            집필 직후     : 한글 → DAY/NIGHT  (역주행, JSON 오염)
+#                            DOCX 출력 직전: DAY/NIGHT → 한글  (auto_fix_a35_scene_time 복구)
+#                          결과적으로 "JSON 백업은 오염, DOCX는 깨끗"한 불일치 발생.
+#                          JSON을 Round N+1에 재투입하면 오염된 DAY/NIGHT가 다시 유입됨.
+#                    1. _normalize_scene_time_marker — 변환 방향 반전.
+#                       DAY/NIGHT 산출 폐기 → A35 5단계(새벽/오전/오후/저녁/밤) 산출.
+#                       _A35_TIME_MAP을 단일 매핑 원천으로 공유 (이중 정의 제거).
+#                    2. 매핑 단서가 없는 시간대(요일 단독 등)는 원본 유지로 변경.
+#                       기존 '요일 → DAY' 임의 기본값 제거 — 출력 단계
+#                       auto_fix_a35_scene_time과 동일한 보수적 판단으로 통일.
+#                    3. _A35_TIME_MAP 보강 — '야경'·'심야'·'초야' 누락 패턴 추가 (→ 밤).
+#                       장소 끝에 붙은 '야경'·'새벽'을 시간대로 이관하는 기존 로직 유지.
+#                    4. 집필 단계(A35 룰) → 배치 직후(본 수정) → DOCX 출력 직전
+#                       3중 방어가 모두 같은 방향을 향하게 정렬.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -2122,6 +2142,9 @@ _A35_TIME_MAP = [
     (r'자정', '밤'),
     (r'NIGHT', '밤'),
     (r'야간', '밤'),
+    (r'야경', '밤'),   # ★ v3.5.2 추가 — '도시 야경' 등
+    (r'심야', '밤'),   # ★ v3.5.2 추가
+    (r'초야', '밤'),   # ★ v3.5.2 추가
     (r'밤', '밤'),
     # ── 낮/주간/DAY → 오후 (기본값, 가장 마지막)
     (r'주간', '오후'),
@@ -4823,40 +4846,47 @@ def _parse_insert_label(text: str) -> tuple:
 # ═══════════════════════════════════════════════════════════
 
 def _normalize_scene_time_marker(content: str) -> str:
-    """씬 헤더 시간 표기를 DAY/NIGHT 표준으로 정규화.
+    """씬 헤더 시간 표기를 A35 5단계 한글 표기로 정규화.
 
-    매핑:
-      아침 / 이른 아침 / 오전 / 낮 / 오후 / 정오 → DAY
-      저녁 / 밤 / 야경 / 새벽 / 자정              → NIGHT
-      요일만 표기                                  → DAY (보수적 기본값)
+    ★ v3.5.2 — 변환 방향 반전.
+    v3.4.0에서 A35(5단계 한글 강제) 룰을 신설했는데도 이 함수만
+    구버전 로직(한글 → DAY/NIGHT)을 유지하고 있었다. 이 함수는
+    매 배치 집필 직후 호출되므로 JSON 백업에 DAY/NIGHT가 박히고,
+    DOCX 출력 직전 auto_fix_a35_scene_time이 다시 한글로 되돌리는
+    상호 역주행 상태였다. JSON을 Round N+1에 재투입하면 오염이
+    다시 유입되므로 방향을 A35 기준으로 통일한다.
+
+    매핑은 _A35_TIME_MAP을 그대로 공유한다 (매핑 원천 단일화).
+      새벽 / 오전 / 오후 / 저녁 / 밤
+
+    매핑 단서가 없는 시간대(요일 단독 표기 등)는 원본을 유지한다.
+    출력 단계 auto_fix_a35_scene_time과 동일한 보수적 판단이다.
     """
     import re as _re
-
-    day_keywords = ['이른 아침', '아침', '오전', '낮', '오후', '정오', '대낮']
-    night_keywords = ['이른 저녁', '저녁', '밤', '야경', '새벽', '자정', '한밤', '심야']
-    weekdays = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
 
     def fix_header(match):
         scene_num = match.group(1)
         in_ex = match.group(2)
         location = match.group(3).strip()
         time_part = match.group(4).strip()
+
+        # 장소 끝에 붙어버린 시간대 단어를 시간대 자리로 이관
         for kw in ['야경', '새벽']:
             if location.endswith(' ' + kw):
                 location = location[:-len(kw)].rstrip()
                 time_part = kw + ' ' + time_part
-        is_night = any(kw in time_part for kw in night_keywords)
-        is_day = any(kw in time_part for kw in day_keywords)
-        has_weekday = any(wd in time_part for wd in weekdays)
-        if is_night:
-            time_normalized = "NIGHT"
-        elif is_day:
-            time_normalized = "DAY"
-        elif has_weekday:
-            time_normalized = "DAY"
-        else:
+
+        mapped = None
+        for pat, repl in _A35_TIME_MAP:
+            if _re.search(pat, time_part, _re.IGNORECASE):
+                mapped = repl
+                break
+
+        if mapped is None:
+            # 시간대 단서가 없으면 손대지 않는다 (오인 치환 방지)
             return match.group(0)
-        return f"S#{scene_num}. {in_ex}. {location} — {time_normalized}"
+
+        return f"S#{scene_num}. {in_ex}. {location} — {mapped}"
 
     pattern = _re.compile(
         r'S#(\d+(?:-\d+)?)\.\s*(INT|EXT)\.\s*([^\n—]+?)\s*—\s*([^\n]{1,40}?)(?=\n|$|\.\s+[가-힣A-Z])',
@@ -4960,7 +4990,7 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
     AI가 한 줄 통짜로 출력한 경우를 감지해 자동 줄바꿈 삽입.
     Writer Engine 표준에 맞춰 캐릭터명 + 탭2 + 대사 형식 강제.
     추가:
-      - 씬 헤더 시간 표기 → DAY/NIGHT 정규화
+      - 씬 헤더 시간 표기 → A35 5단계 한글 정규화 (v3.5.2)
       - A22 위반(대사·지문 융합) 자동 분리
       - A21 위반(통짜 지문) 자동 비트 분리
     """
@@ -5003,7 +5033,7 @@ def _validate_and_fix_revised_format(revise_result: dict) -> dict:
         if content != before_prop:
             prop_strip_count += 1
 
-        # ★ 2. 씬 헤더 시간 표기 정규화 (DAY/NIGHT)
+        # ★ 2. 씬 헤더 시간 표기 정규화 (A35 5단계 한글 — v3.5.2 방향 반전)
         before = content
         content = _normalize_scene_time_marker(content)
         if content != before:
@@ -5160,7 +5190,7 @@ def render_hero():
     st.markdown("""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.5.1</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.5.2</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -7655,7 +7685,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.5.1",
+                "engine": "BLUE JEANS REVISE ENGINE v3.5.2",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -7712,7 +7742,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.5.1  ·  '
+    'BLUE JEANS PICTURES · REVISE ENGINE v3.5.2  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
