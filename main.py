@@ -159,6 +159,27 @@
 #                       장소 끝에 붙은 '야경'·'새벽'을 시간대로 이관하는 기존 로직 유지.
 #                    4. 집필 단계(A35 룰) → 배치 직후(본 수정) → DOCX 출력 직전
 #                       3중 방어가 모두 같은 방향을 향하게 정렬.
+# v3.6.0 (2026-10-25) ★ 국가별 Market Lens 연동 — Rewrite Engine v2.4 (schema 1.2) 시장 정보 흡수.
+#                    근거: revise_engine_market_lens_handoff.md / Market Lens Pack v1.1 (VN 기준일 2026-10-23).
+#                    실제 샘플: 「THE CRIMSON ROBE」 Rewrite v2.4 진단 JSON (VN, market_rx 5 · 규제 플래그 3).
+#                    1. STEP 0 — 시장 선택 상자(1차·2차, KR/JP/ID/VN). JSON 시장값으로 자동 설정,
+#                       작가가 바꾸면 화면 값을 따르고 '시장 수동 변경' 기록.
+#                    2. STEP 0 — market_rx 채택 패널 (rewrite_suggestions와 분리, 기본 해제).
+#                       conflict_with_asset 있는 항목·씬 지정 없는 항목('전체')은 체크 불가.
+#                    3. 일반 각색 배치 — [시장 정보]+[시장 레드라인]만 주입. 한국 단독·플래그 없음이면
+#                       아무것도 주입하지 않음 (기존 동작 그대로).
+#                    4. STEP 2 — '시장 처방 반영' 단계 신설. 모든 배치가 끝난 뒤 채택 처방만 1회 반영
+#                       (각색 처방이 시장 처방에 덮이지 않게). 결과는 market_rx_results로 항목별 기록,
+#                       누락·사유 공란은 경고. 각색 결과가 바뀌면 자동 무효화.
+#                    5. 검증 단계 — 규제 재검사(유지/완화/강화/신규 발생) + 고증 체크리스트(판정 없음).
+#                       강화·신규 발생은 리포트 상단 표시. 원고 자동 수정 없음.
+#                    6. 검증 보고서 DOCX에 '시장 검증' 섹션 (시장 정보·처방 반영·규제 재검사·고증·VN 출처).
+#                       각색본 원고 본문에는 시장 메모를 넣지 않음.
+#                    7. 베트남어 성조 부호 글꼴 대체 — 베트남어 글자가 든 run만 라틴 글꼴을
+#                       Times New Roman으로 지정 (한글 글꼴 함초롬바탕·맑은 고딕은 그대로).
+#                    8. 전체 JSON에 market_context / market_rx_results / regulation_check /
+#                       localization_checklist 추가. 백업·복구에 시장 상태 포함.
+#                    9. 버전 표기 정리 — 수정본 표지 'v2.2'·검증 JSON 'v3.3.3' 고정값을 현재 버전으로.
 # Pipeline: DIAGNOSE → REVISE → VERIFY
 # Models: Opus 4.6 (집필) / Sonnet 4.6 (분석)
 # =================================================================
@@ -213,7 +234,27 @@ from prompt import (
     sanitize_unchanged_scenes_note,
     audit_prescription_coverage,
     build_pending_retry_block,
+    # ★ v3.6.0 신규 — 국가별 Market Lens 연동
+    absorb_market_metadata,
+    resolve_revise_market,
+    market_is_active,
+    build_market_context_block,
+    collect_market_scene_versions,
+    build_market_rx_apply_prompt,
+    normalize_market_rx_results,
+    apply_market_overlay,
+    build_final_scene_text_map,
+    build_regulation_scene_pairs,
+    build_market_regulation_check_prompt,
+    normalize_regulation_check,
+    build_market_localization_checklist,
+    get_market_label,
+    get_market_vn_sources_text,
+    has_vietnamese_chars,
+    MARKET_CODES,
 )
+
+ENGINE_VERSION = "v3.6.0"
 
 # =================================================================
 # [0] 모델 설정 & 페이지 설정
@@ -439,6 +480,13 @@ INIT_STATE = {
     "prescription_audit": None,      # 최근 감사 결과 (audit_prescription_coverage 반환값)
     "retry_rounds": 0,               # 미이행 재투입을 몇 번 돌렸는지
     "allow_pending_verify": False,   # 미이행이 남은 상태로 검증 진입을 허용할지 (작가 판단)
+    # ★ v3.6.0 — 국가별 Market Lens
+    "market_meta": None,             # absorb_market_metadata 결과 (Rewrite JSON schema 1.2+)
+    "market_ui_primary": "KR",       # 화면 1차 시장 (위젯 값 보관용 — 다른 화면에서도 유지)
+    "market_ui_secondary": "",       # 화면 2차 시장 ("" = 없음)
+    "market_rx_adopted": [],         # 작가가 체크한 market_rx의 rx_id 목록
+    "market_apply": None,            # 시장 처방 반영 단계 결과
+    "market_report": None,           # 검증 단계 시장 리포트
     # v2.1 — 장르 DNA (참고작 1~3편에서 추출)
     "genre_ref_texts": [],      # [참고작1 텍스트, 참고작2, ...] 최대 3편
     "genre_ref_filenames": [],  # 파일명 리스트
@@ -1037,6 +1085,43 @@ def _set_font(run, font_name="맑은 고딕", size_pt=10.5, bold=False, color=No
     rFonts.set(qn('w:eastAsia'), font_name)
 
 
+# ★ v3.6.0 — 외국어 표기 글꼴 대체
+# 함초롬바탕·맑은 고딕이 베트남어 성조 부호(ệ, ữ, ể 등)를 갖고 있는지는 확인되지 않았다.
+# 그래서 베트남어 글자가 들어 있는 run만 라틴 글꼴(ascii/hAnsi/cs)을 Times New Roman으로
+# 지정한다. 한글은 eastAsia 글꼴로 그려지므로 한글 모양은 바뀌지 않는다.
+FOREIGN_LATIN_FALLBACK_FONT = "Times New Roman"
+
+
+def _apply_foreign_script_fonts(doc, latin_font: str = FOREIGN_LATIN_FALLBACK_FONT) -> int:
+    """베트남어 글자가 든 run의 라틴 글꼴만 대체 글꼴로 바꾼다. 바꾼 run 수를 반환."""
+    def _iter_runs():
+        for p in doc.paragraphs:
+            for r in p.runs:
+                yield r
+        for t in doc.tables:
+            for row in t.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        for r in p.runs:
+                            yield r
+    changed = 0
+    for r in _iter_runs():
+        try:
+            if not has_vietnamese_chars(r.text):
+                continue
+            rPr = r._element.get_or_add_rPr()
+            rFonts = rPr.find(qn('w:rFonts'))
+            if rFonts is None:
+                rFonts = OxmlElement('w:rFonts')
+                rPr.insert(0, rFonts)
+            for attr in ('w:ascii', 'w:hAnsi', 'w:cs'):
+                rFonts.set(qn(attr), latin_font)
+            changed += 1
+        except Exception:
+            continue
+    return changed
+
+
 def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
                         original_text: str = "",
                         fact_based: bool = False,
@@ -1336,7 +1421,7 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
              align=WD_ALIGN_PARAGRAPH.CENTER, color=RGBColor(0x8E, 0x8E, 0x99))
     rr = revise_result.get("revision_result", {})
     scenes = rr.get("revised_scenes", [])
-    add_text(f"Revise Engine v2.2  ·  {len(scenes)}개 씬 수정",
+    add_text(f"Revise Engine {ENGINE_VERSION}  ·  {len(scenes)}개 씬 수정",
              size=Pt(9), align=WD_ALIGN_PARAGRAPH.CENTER,
              color=RGBColor(0x8E, 0x8E, 0x99))
     doc.add_page_break()
@@ -1801,6 +1886,9 @@ def create_revised_docx(revise_result: dict, title: str = "", genre: str = "",
         add_action(stripped)
         prev_block_type = "action"  # ★ v3.2
         i += 1
+
+    # ★ v3.6.0 — 베트남어 성조 부호 글꼴 대체 (원고 본문은 그대로, 글꼴 속성만)
+    _apply_foreign_script_fonts(doc)
 
     # ── 바이트 반환 ──
     buf = BytesIO()
@@ -2654,7 +2742,7 @@ def export_verify_json(verify_result: dict, title: str = "",
 
     export = {
         "schema_version": "revise_verify_v1.0",
-        "engine_version": "BLUE JEANS REVISE ENGINE v3.3.3",
+        "engine_version": f"BLUE JEANS REVISE ENGINE {ENGINE_VERSION}",
         "title": title or "(제목 미지정)",
         "round_n": round_n,
         "report_date": _dt.now().isoformat(),
@@ -2721,8 +2809,11 @@ def _extract_untouched_from_verify(verify_result: dict) -> list:
     return sorted(untouched, key=lambda s: int(_re_v33.search(r'\d+', s).group()))
 
 
-def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
-    """Stage 3 검증 보고서 DOCX."""
+def create_verify_docx(verify_result: dict, title: str = "", market_report: dict = None) -> bytes:
+    """Stage 3 검증 보고서 DOCX.
+
+    v3.6.0 — market_report가 있으면 끝에 '시장 검증' 섹션을 붙인다.
+    """
     doc = Document()
 
     section = doc.sections[0]
@@ -2917,6 +3008,11 @@ def create_verify_docx(verify_result: dict, title: str = "") -> bytes:
             p = doc.add_paragraph()
             r = p.add_run(f"  • {rec}")
             _set_font(r, size_pt=10)
+
+    # ★ v3.6.0 — 시장 검증 섹션
+    if market_report:
+        _add_market_section_to_verify_docx(doc, market_report)
+    _apply_foreign_script_fonts(doc)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -4434,6 +4530,7 @@ def run_revise_batch(client, batch_index: int, batch_scenes: list, total_batches
         revision_ranges=st.session_state.revision_ranges,
         cascade_analysis=st.session_state.cascade_analysis,
         boundary_info=st.session_state.boundary_info,
+        market_block=get_market_block_for_revise(),   # ★ v3.6.0 — 시장 레드라인 (없으면 빈 문자열)
     )
     raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
     if not raw:
@@ -5183,14 +5280,635 @@ def run_verify(client):
     return parse_json(raw)
 
 
+
+
+# =================================================================
+# [6-M] ★ v3.6.0 — 국가별 Market Lens 실행 함수
+# =================================================================
+# 처리 순서 (handoff 8절):
+#   일반 각색 배치 전부 (레드라인만 주입)
+#   → 시장 처방 반영 단계 (작가가 채택한 market_rx만, 1회)
+#   → 검증 (기존) → 규제 재검사 + 고증 체크리스트 (build_market_report)
+# 시장 정보가 없거나 한국 단독·플래그 없음이면 위 단계는 전부 건너뛰고
+# 기존 동작과 같다.
+# =================================================================
+
+MARKET_SOURCE_LABELS = {
+    "json": "Rewrite JSON 값",
+    "manual": "화면에서 수동 변경",
+    "ui": "화면 선택",
+    "default": "기본값(한국)",
+}
+
+
+def _get_base_text() -> str:
+    """통합 시 기준이 되는 원고 (Step 4 수정본 DOCX와 같은 규칙)."""
+    base_text = st.session_state.raw_text or ""
+    if (st.session_state.section_mode
+            and st.session_state.diff_refined_text
+            and st.session_state.section_input_method in ("auto", "hybrid")):
+        base_text = st.session_state.diff_refined_text
+    return base_text
+
+
+def get_market_context() -> tuple:
+    """(market_meta, market_resolution) — 화면 선택과 Rewrite JSON을 합쳐 시장을 결정."""
+    meta = st.session_state.get("market_meta") or {}
+    res = resolve_revise_market(
+        meta,
+        st.session_state.get("market_ui_primary", "KR") or "KR",
+        st.session_state.get("market_ui_secondary", "") or "",
+    )
+    return meta, res
+
+
+def get_adopted_market_rx() -> list:
+    """작가가 체크한 market_rx 중 실제로 반영 가능한 항목만 (보호 자산 충돌·씬 미지정 제외)."""
+    meta = st.session_state.get("market_meta") or {}
+    ids = set(st.session_state.get("market_rx_adopted") or [])
+    out = []
+    for rx in meta.get("market_rx") or []:
+        if (rx.get("rx_id") in ids and rx.get("scene_addressable")
+                and not rx.get("conflict_with_asset")):
+            out.append(rx)
+    return out
+
+
+def get_market_block_for_revise() -> str:
+    """일반 각색 배치 프롬프트용 [시장 정보]+[시장 레드라인] (없으면 빈 문자열)."""
+    meta, res = get_market_context()
+    return build_market_context_block(res, meta)
+
+
+def _batch_results_signature(batch_results) -> str:
+    import hashlib
+    try:
+        payload = json.dumps(batch_results or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        payload = str(batch_results)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def get_valid_market_apply(batch_results):
+    """시장 처방 반영 결과가 현재 각색 결과·채택 항목과 맞을 때만 반환. 아니면 None."""
+    ma = st.session_state.get("market_apply")
+    if not ma or not isinstance(ma, dict):
+        return None
+    if ma.get("signature") != _batch_results_signature(batch_results):
+        return None
+    adopted_ids = sorted(rx["rx_id"] for rx in get_adopted_market_rx())
+    if sorted(ma.get("adopted_ids", [])) != adopted_ids:
+        return None
+    return ma
+
+
+def run_market_rx_pass(client, batch_results: dict):
+    """시장 처방 반영 단계 (Opus, 1회). 실패하면 None."""
+    meta, res = get_market_context()
+    adopted = get_adopted_market_rx()
+    all_results = [batch_results[i] for i in sorted(batch_results.keys()) if batch_results.get(i)]
+    merged = merge_batch_results(all_results, diagnose_result=st.session_state.diagnose_result)
+
+    versions, unresolved = collect_market_scene_versions(adopted, _get_base_text(), merged)
+    sendable = [rx for rx in adopted if rx.get("rx_id") not in unresolved]
+    market_revision = {"revised_scenes": [], "market_rx_results": []}
+    extra_warn = []
+
+    if sendable and versions:
+        prompt_text = build_market_rx_apply_prompt(
+            sendable, versions, res, meta, locked=st.session_state.locked,
+        )
+        raw = call_claude(client, prompt_text, model=MODEL_WRITE, max_tokens=32000)
+        if not raw:
+            return None
+        parsed = parse_json(raw)
+        if not parsed or not isinstance(parsed, dict):
+            return None
+        mr = parsed.get("market_revision", parsed)
+        if not isinstance(mr, dict):
+            mr = {}
+
+        # 요청하지 않은 씬이 섞이면 걸러낸다 (씬 번호로 한 번 더 매칭)
+        valid_ids = {v["scene_id"] for v in versions}
+        kept = []
+        for sc in mr.get("revised_scenes") or []:
+            if not isinstance(sc, dict):
+                continue
+            sid = str(sc.get("scene_id", "")).strip()
+            if sid not in valid_ids:
+                keys = set(k for k in extract_scene_keys(sid) if k.startswith("S#"))
+                match = next((v["scene_id"] for v in versions if keys & set(v["keys"])), None)
+                if match:
+                    sc["scene_id"] = match
+                else:
+                    extra_warn.append(f"요청하지 않은 씬 '{sid}'이 산출되어 제외했습니다.")
+                    continue
+            kept.append(sc)
+
+        # 기존 배치와 같은 후처리 (A29·A33·포맷) 적용
+        wrapped = _validate_and_fix_revised_format({"revision_result": {"revised_scenes": kept}})
+        kept = (wrapped.get("revision_result", {}) or {}).get("revised_scenes", kept)
+        market_revision = {
+            "revised_scenes": kept,
+            "market_rx_results": mr.get("market_rx_results") or [],
+        }
+
+    results, warnings = normalize_market_rx_results(adopted, market_revision, unresolved)
+    return {
+        "signature": _batch_results_signature(batch_results),
+        "adopted_ids": [rx["rx_id"] for rx in adopted],
+        "scenes": market_revision["revised_scenes"],
+        "rx_results": results,
+        "warnings": extra_warn + warnings,
+        "ran_at": datetime.now().isoformat(timespec="minutes"),
+    }
+
+
+def build_market_report(client, revise_result: dict) -> dict:
+    """검증 단계 시장 리포트 — 처방 반영 결과 + 규제 재검사 + 고증 체크리스트."""
+    meta, res = get_market_context()
+    codes = [c for c in (res.get("primary"), res.get("secondary")) if c]
+    adopted = get_adopted_market_rx()
+    adopted_ids = {rx["rx_id"] for rx in adopted}
+
+    report = {
+        "market_context": {
+            "primary": res.get("primary", ""),
+            "primary_label": get_market_label(res.get("primary", "")),
+            "secondary": res.get("secondary", ""),
+            "secondary_label": get_market_label(res.get("secondary", "")) if res.get("secondary") else "없음",
+            "data_as_of": res.get("data_as_of", ""),
+            "source": res.get("source", ""),
+            "source_label": MARKET_SOURCE_LABELS.get(res.get("source", ""), res.get("source", "")),
+            "manual_override": bool(res.get("manual_override")),
+            "json_primary": res.get("json_primary", ""),
+            "json_secondary": res.get("json_secondary", ""),
+            "rewrite_schema_version": meta.get("schema_version", "") if meta else "",
+            "lens_version": meta.get("lens_version", "") if meta else "",
+        },
+        "has_market_info": bool(meta.get("has_market")) or res.get("source") in ("ui", "manual"),
+        "market_fit": meta.get("market_fit") or {},
+        "jp_track_none": ("JP" in codes and str(meta.get("jp_track", "")).strip().upper() == "NONE"),
+        "market_rx_results": [],
+        "market_rx_unadopted": [],
+        "regulation_check": [],
+        "localization_checklist": [],
+        "warnings": [],
+        "alerts": [],
+        "vn_sources": "",
+    }
+
+    # ── 1. 시장 처방 반영 결과 ──
+    ma = get_valid_market_apply(st.session_state.batch_results or {})
+    if adopted:
+        if ma:
+            report["market_rx_results"] = ma.get("rx_results", [])
+            report["warnings"].extend(ma.get("warnings", []))
+        else:
+            for rx in adopted:
+                report["market_rx_results"].append({
+                    "rx_id": rx["rx_id"], "target": rx.get("target", ""),
+                    "prescription": rx.get("prescription", ""), "keeps": rx.get("keeps", ""),
+                    "grade": rx.get("grade", ""), "status": "미반영", "where": "",
+                    "reason": "시장 처방 반영 단계를 실행하지 않고 검증으로 넘어갔습니다 (자동 기록)",
+                    "auto_recorded": True,
+                })
+            report["warnings"].append("채택한 시장 처방이 반영 단계 없이 검증되었습니다.")
+    for rx in meta.get("market_rx") or []:
+        if rx.get("rx_id") in adopted_ids:
+            continue
+        note = ""
+        if rx.get("conflict_with_asset"):
+            note = f"보호 자산 충돌로 채택 불가: {rx['conflict_with_asset']}"
+        elif not rx.get("scene_addressable"):
+            note = "씬 지정 없음 — 원고 수정 대상이 아닌 처방 (제작 조건으로 관리)"
+        report["market_rx_unadopted"].append({
+            "rx_id": rx.get("rx_id"), "target": rx.get("target", ""),
+            "prescription": rx.get("prescription", ""), "keeps": rx.get("keeps", ""),
+            "grade": rx.get("grade", ""), "status": "미채택", "note": note,
+        })
+
+    # ── 2. 규제 재검사 ──
+    base = _get_base_text()
+    if market_is_active(res, meta):
+        pairs = build_regulation_scene_pairs(base, revise_result, meta)
+        if pairs:
+            prompt_text = build_market_regulation_check_prompt(res, meta, pairs)
+            raw = call_claude(client, prompt_text, model=MODEL_ANALYZE, max_tokens=16000)
+            parsed = parse_json(raw) if raw else None
+            if not parsed:
+                report["warnings"].append("규제 재검사 호출에 실패했습니다. 플래그는 '검사 누락'으로 표시됩니다.")
+            rows, w = normalize_regulation_check(meta, parsed or {})
+            report["regulation_check"] = rows
+            report["warnings"].extend(w)
+
+    # ── 3. 고증 체크리스트 (판정 없음) ──
+    fmap = build_final_scene_text_map(base, revise_result)
+    report["localization_checklist"] = build_market_localization_checklist(res, fmap)
+
+    if "VN" in codes:
+        report["vn_sources"] = get_market_vn_sources_text()
+
+    # ── 상단 표시 ──
+    worse = [r for r in report["regulation_check"] if r.get("status") in ("강화", "신규 발생")]
+    if worse:
+        report["alerts"].append(
+            f"규제 위험 강화·신규 발생 {len(worse)}건 — 규제 재검사 표 맨 위를 확인하세요."
+        )
+    if report["jp_track_none"]:
+        report["alerts"].append("일본 진입 트랙 없음 (렌즈 판정). 각색은 그대로 진행했습니다.")
+    if res.get("manual_override"):
+        report["alerts"].append(
+            f"시장 수동 변경 — Rewrite JSON 1차 {get_market_label(res.get('json_primary',''))} → "
+            f"화면 1차 {get_market_label(res.get('primary',''))}"
+        )
+    notdone = [r for r in report["market_rx_results"] if r.get("status") != "반영"]
+    if notdone:
+        report["alerts"].append(
+            f"채택한 시장 처방 {len(report['market_rx_results'])}개 중 반영되지 않은 항목 {len(notdone)}개"
+        )
+    return report
+
+
+def build_market_json_payload(report: dict) -> dict:
+    """전체 JSON에 넣을 시장 키 4종 (handoff 7-3)."""
+    if not isinstance(report, dict) or report.get("error"):
+        return {
+            "market_context": None, "market_rx_results": [],
+            "regulation_check": [], "localization_checklist": [],
+        }
+    mc = dict(report.get("market_context") or {})
+    mc["has_market_info"] = report.get("has_market_info", False)
+    mc["jp_track_none"] = report.get("jp_track_none", False)
+    return {
+        "market_context": mc,
+        "market_rx_results": (report.get("market_rx_results") or [])
+                             + (report.get("market_rx_unadopted") or []),
+        "regulation_check": report.get("regulation_check") or [],
+        "localization_checklist": report.get("localization_checklist") or [],
+    }
+
+
+def _add_market_section_to_verify_docx(doc, report: dict):
+    """검증 보고서 DOCX 끝에 '시장 검증' 섹션 추가 (handoff 7-1)."""
+    NAVY, RED, GRAY, GREEN, ORANGE = (25, 25, 112), (225, 68, 68), (80, 80, 90), (46, 196, 132), (255, 140, 0)
+
+    def _para(text, size=10, bold=False, color=None, indent=0.0):
+        p = doc.add_paragraph()
+        if indent:
+            p.paragraph_format.left_indent = Cm(indent)
+        r = p.add_run(text)
+        _set_font(r, size_pt=size, bold=bold, color=color)
+        return p
+
+    def _table(headers, rows, widths=None):
+        t = doc.add_table(rows=1, cols=len(headers))
+        try:
+            t.style = "Table Grid"
+        except Exception:
+            pass
+        for i, h in enumerate(headers):
+            cell = t.rows[0].cells[i]
+            cell.text = ""
+            r = cell.paragraphs[0].add_run(h)
+            _set_font(r, size_pt=8.5, bold=True, color=NAVY)
+        for row in rows:
+            cells = t.add_row().cells
+            for i, v in enumerate(row):
+                cells[i].text = ""
+                r = cells[i].paragraphs[0].add_run(str(v if v is not None else ""))
+                _set_font(r, size_pt=8.5)
+        if widths:
+            # 표 너비 고정 (Word·한글·LibreOffice 모두 같은 열 비율로 보이도록)
+            t.autofit = False
+            for i, w in enumerate(widths):
+                try:
+                    t.columns[i].width = Cm(w)
+                except Exception:
+                    pass
+            for row in t.rows:
+                for i, w in enumerate(widths):
+                    try:
+                        row.cells[i].width = Cm(w)
+                    except Exception:
+                        pass
+        doc.add_paragraph()
+        return t
+
+    doc.add_page_break()
+    _para("■ 시장 검증 (Market Lens)", size=14, bold=True, color=NAVY)
+
+    if report.get("error"):
+        _para(f"시장 검증 중 오류가 발생했습니다: {report['error']}", color=RED)
+        return
+
+    mc = report.get("market_context") or {}
+    if not report.get("has_market_info"):
+        _para("시장 정보 없음 — Rewrite JSON에 시장 키가 없어(schema 1.1 이하) 화면 기본값 한국으로 진행했습니다.",
+              color=GRAY)
+        if not report.get("regulation_check"):
+            return
+
+    for a in report.get("alerts") or []:
+        _para(f"▲ {a}", size=10.5, bold=True, color=RED)
+
+    # 1. 시장 정보
+    _para("1. 시장 정보", size=12, bold=True, color=NAVY)
+    _para(f"1차 시장: {mc.get('primary_label','')}   /   2차 시장: {mc.get('secondary_label','없음')}   /   "
+          f"자료 기준일: {mc.get('data_as_of') or '미표기'}", indent=0.4)
+    src = mc.get("source_label", "")
+    if mc.get("manual_override"):
+        src += f" (Rewrite JSON: {get_market_label(mc.get('json_primary',''))}"
+        if mc.get("json_secondary"):
+            src += f" / {get_market_label(mc.get('json_secondary',''))}"
+        src += ")"
+    _para(f"시장 결정: {src}   ·   Rewrite schema {mc.get('rewrite_schema_version') or '-'}   ·   "
+          f"렌즈 {mc.get('lens_version') or '-'}", size=9.5, color=GRAY, indent=0.4)
+    mf = report.get("market_fit") or {}
+    if mf.get("verdict"):
+        _para(f"Rewrite 시장 적합성 판정: {mf.get('verdict')} — {mf.get('genre_group','')}", size=9.5, indent=0.4)
+    for c in mf.get("localization_conditions") or []:
+        _para(f"• 현지화 조건: {c}", size=9, color=GRAY, indent=0.8)
+
+    # 2. 시장 처방 반영 결과
+    _para("2. 시장 처방 반영 결과", size=12, bold=True, color=NAVY)
+    rx_rows = []
+    for r in report.get("market_rx_results") or []:
+        rx_rows.append([r.get("rx_id"), r.get("target"), r.get("prescription"), r.get("status"),
+                        r.get("where") or "-", r.get("reason") or "", r.get("grade")])
+    for r in report.get("market_rx_unadopted") or []:
+        rx_rows.append([r.get("rx_id"), r.get("target"), r.get("prescription"), "미채택",
+                        "-", r.get("note") or "", r.get("grade")])
+    if rx_rows:
+        _table(["#", "대상", "처방", "상태", "수정 씬", "사유", "근거 등급"], rx_rows,
+               widths=[0.7, 1.8, 5.6, 1.5, 1.6, 2.9, 1.9])
+    else:
+        _para("Rewrite에서 넘어온 시장 처방이 없습니다.", size=9.5, color=GRAY, indent=0.4)
+
+    # 3. 규제 재검사
+    _para("3. 규제 재검사 (신규 발생·강화 항목을 맨 위에 표시)", size=12, bold=True, color=NAVY)
+    reg = report.get("regulation_check") or []
+    if reg:
+        _table(["상태", "조항", "씬", "각색 전", "각색 후", "예상 등급", "근거 등급"],
+               [[r.get("status"), r.get("clause"), r.get("scene"), r.get("before"), r.get("after"),
+                 r.get("expected_rating"), r.get("grade")] for r in reg],
+               widths=[1.4, 3.2, 1.8, 3.2, 3.2, 1.3, 1.9])
+        _para("※ 엔진은 이 결과로 원고를 자동 수정하지 않습니다. 작가 검토용 보고입니다.",
+              size=9, color=GRAY, indent=0.4)
+    else:
+        _para("재검사 대상 없음 (레드라인·규제 플래그 없음).", size=9.5, color=GRAY, indent=0.4)
+
+    # 4. 고증 체크리스트
+    _para("4. 고증 체크리스트 (판정 없음 — 작가·현지 자문 확인용)", size=12, bold=True, color=NAVY)
+    chk = report.get("localization_checklist") or []
+    if chk:
+        _table(["시장", "확인 항목", "후보 씬", "판정"],
+               [[get_market_label(c.get("market", "")), c.get("item"),
+                 ", ".join(c.get("scenes") or []) or "(자동 탐지 없음 — 원고 전체 확인)",
+                 c.get("grade")] for c in chk],
+               widths=[1.4, 6.4, 5.4, 2.8])
+        _para("※ 후보 씬은 키워드 기반 탐지 결과입니다. 탐지되지 않았다고 문제가 없다는 뜻이 아닙니다.",
+              size=9, color=GRAY, indent=0.4)
+    else:
+        _para("해당 시장의 고증 체크리스트가 없습니다.", size=9.5, color=GRAY, indent=0.4)
+
+    # 5. 출처 (VN)
+    if report.get("vn_sources"):
+        _para("5. VN Market Lens 출처", size=12, bold=True, color=NAVY)
+        for line in report["vn_sources"].split("\n"):
+            _para(line, size=8.5, color=GRAY, indent=0.4)
+
+    if report.get("warnings"):
+        _para("엔진 경고", size=11, bold=True, color=ORANGE)
+        for w in report["warnings"]:
+            _para(f"• {w}", size=9, color=GRAY, indent=0.4)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 화면 — STEP 0 시장 패널 / STEP 2 시장 처방 반영 / STEP 3 시장 검증
+# ─────────────────────────────────────────────────────────────────
+
+def render_market_step0_panel():
+    """STEP 0 — 시장 선택 상자 + market_rx 채택 패널 (handoff 2-1·2-3)."""
+    meta = st.session_state.get("market_meta") or {}
+
+    st.markdown('<div class="rev-card-title">🌏 시장 (Market Lens) '
+                '<span style="font-weight:400; color:#8E8E99; font-size:0.85rem;">(선택사항 · 기본 한국)</span></div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="rev-caption">Rewrite Engine v2.4 JSON(schema 1.2)을 불러오면 시장이 자동으로 맞춰집니다. '
+                '시장은 원고의 인물·사건·결말을 바꾸지 않습니다. 레드라인은 새로 쓰는 문장에만 적용되고, '
+                '시장 처방은 아래에서 직접 체크한 항목만 반영됩니다.</div>', unsafe_allow_html=True)
+
+    codes = list(MARKET_CODES)
+    if "market_primary_select" not in st.session_state:
+        st.session_state["market_primary_select"] = st.session_state.get("market_ui_primary") or "KR"
+    if st.session_state["market_primary_select"] not in codes:
+        st.session_state["market_primary_select"] = "KR"
+
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        primary = st.selectbox("1차 시장", options=codes, key="market_primary_select",
+                               format_func=lambda c: get_market_label(c))
+    sec_options = [""] + [c for c in codes if c != primary]
+    if "market_secondary_select" not in st.session_state:
+        st.session_state["market_secondary_select"] = st.session_state.get("market_ui_secondary") or ""
+    if st.session_state["market_secondary_select"] not in sec_options:
+        st.session_state["market_secondary_select"] = ""
+    with mc2:
+        secondary = st.selectbox("2차 시장", options=sec_options, key="market_secondary_select",
+                                 format_func=lambda c: get_market_label(c) if c else "없음")
+
+    st.session_state.market_ui_primary = primary
+    st.session_state.market_ui_secondary = secondary
+    meta, res = get_market_context()
+
+    if meta.get("has_market"):
+        st.caption(
+            f"Rewrite JSON (schema {meta.get('schema_version')}) 시장: "
+            f"1차 {get_market_label(meta.get('primary'))} / "
+            f"2차 {get_market_label(meta.get('secondary')) if meta.get('secondary') else '없음'} · "
+            f"자료 기준일 {meta.get('data_as_of') or '미표기'}"
+        )
+        if res.get("manual_override"):
+            st.warning("화면 선택이 Rewrite JSON 시장과 다릅니다. 화면 값을 따르며, "
+                       "검증 리포트에 '시장 수동 변경'으로 기록됩니다.")
+    elif meta:
+        st.caption(f"불러온 Rewrite JSON은 schema {meta.get('schema_version')}입니다. "
+                   "시장 정보가 없어 화면 선택값을 사용합니다.")
+
+    if not market_is_active(res, meta):
+        st.caption("한국 단독 · 규제 플래그 없음 — 시장 단계 없이 기존 각색 동작 그대로 진행합니다.")
+
+    if "JP" in (res.get("primary"), res.get("secondary")) and \
+            str(meta.get("jp_track", "")).strip().upper() == "NONE":
+        st.warning("일본 진입 트랙 없음 (렌즈 판정). 각색은 그대로 진행되고, 리포트 상단에 표시됩니다.")
+
+    mf = meta.get("market_fit") or {}
+    if mf.get("verdict"):
+        st.markdown(f"**Rewrite 시장 적합성:** {mf.get('verdict')} — {mf.get('genre_group','')}")
+
+    flags = meta.get("regulation_flags") or []
+    if flags:
+        with st.expander(f"규제 플래그 {len(flags)}건 (검증 단계에서 각색 전후 비교)"):
+            for f in flags:
+                st.markdown(f"- **{f.get('scene','')}** · {f.get('clause','')} · 예상 {f.get('expected_rating','')} "
+                            f"· {f.get('grade','')}  \n  {f.get('issue','')}")
+
+    rx_list = meta.get("market_rx") or []
+    adopted_ids = []
+    if rx_list:
+        st.markdown("**시장 처방 (market_rx)** — 체크한 항목만 각색에 반영됩니다. 기본값은 모두 해제입니다.")
+        prev = set(st.session_state.get("market_rx_adopted") or [])
+        for rx in rx_list:
+            rid = rx.get("rx_id")
+            key = f"mrx_adopt_{rid}"
+            blocked = ""
+            if rx.get("conflict_with_asset"):
+                blocked = f"보호 자산 충돌: {rx['conflict_with_asset']}"
+            elif not rx.get("scene_addressable"):
+                blocked = "씬 지정이 없는 처방이라 원고 각색으로 이행할 수 없습니다. 리포트에 '미채택'으로 남습니다."
+            if blocked:
+                st.session_state[key] = False
+            elif key not in st.session_state:
+                st.session_state[key] = rid in prev
+            checked = st.checkbox(f"[{rid}] {rx.get('target','')}  ·  {rx.get('grade','') or '등급 미표기'}",
+                                  key=key, disabled=bool(blocked))
+            detail = (f"<div style='margin:-6px 0 10px 28px; font-size:0.85rem; color:#374151;'>"
+                      f"<b>처방</b> {rx.get('prescription','')}<br>"
+                      f"<b>유지(keeps)</b> {rx.get('keeps','') or '-'}<br>"
+                      f"<span style='color:#8E8E99;'>근거: {rx.get('linked','') or '-'}</span>")
+            if blocked:
+                detail += f"<br><span style='color:#E14444;'>{blocked}</span>"
+            detail += "</div>"
+            st.markdown(detail, unsafe_allow_html=True)
+            if checked and not blocked:
+                adopted_ids.append(rid)
+        st.caption(f"채택 {len(adopted_ids)}개 / 전체 {len(rx_list)}개 · 채택 처방은 모든 각색 차수가 끝난 뒤 "
+                   "'시장 처방 반영' 단계에서 한 번에 반영됩니다.")
+    st.session_state.market_rx_adopted = adopted_ids
+
+
+def render_market_stage2_panel(batch_results: dict, all_done: bool) -> dict:
+    """STEP 2 — 시장 처방 반영 단계. 채택 처방이 없으면 안내 한 줄만."""
+    meta, res = get_market_context()
+    adopted = get_adopted_market_rx()
+    if not adopted:
+        if market_is_active(res, meta):
+            st.caption(f"🌏 시장 {get_market_label(res.get('primary'))} — 채택된 시장 처방 없음. "
+                       "레드라인은 각 차수에 적용되었고, 규제 재검사는 검증 단계에서 진행됩니다.")
+        return {"needed": False, "applied": False}
+
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:1.0rem; font-weight:800; color:#191970; margin-bottom:2px;">'
+        '<span style="background:#B45309; color:#FFFFFF; border-radius:50%; '
+        'display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; '
+        'font-size:0.75rem; margin-right:7px;">M</span>시장 처방 반영</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"모든 각색 차수가 끝난 뒤, 채택하신 시장 처방 {len(adopted)}개만 반영합니다. "
+               "각색 결과를 바탕으로 해당 씬만 고치며, 인물·사건·결말은 바꾸지 않습니다.")
+    for rx in adopted:
+        st.markdown(f"- [{rx['rx_id']}] **{rx.get('target','')}** — {rx.get('prescription','')[:90]}…")
+
+    ma = get_valid_market_apply(batch_results)
+    if st.session_state.get("market_apply") and not ma:
+        st.warning("각색 결과나 채택 항목이 바뀌어 이전 반영 결과를 쓸 수 없습니다. 다시 실행해 주세요.")
+
+    label = "🔄 시장 처방 다시 반영" if ma else "▶️ 시장 처방 반영 실행"
+    if st.button(label, key="run_market_rx", disabled=not all_done,
+                 type="secondary" if ma else "primary", use_container_width=True,
+                 help="모든 각색 차수가 끝나야 열립니다."):
+        client = get_client()
+        if client:
+            with st.spinner(f"🌏 시장 처방 {len(adopted)}개 반영 중... (Opus 4.6)"):
+                out = run_market_rx_pass(client, batch_results)
+            if out:
+                st.session_state.market_apply = out
+                st.rerun()
+            else:
+                st.error("시장 처방 반영에 실패했습니다. 다시 시도해 주세요.")
+
+    if ma:
+        st.success(f"시장 처방 반영 완료 ({ma.get('ran_at','')}) — 고친 씬 {len(ma.get('scenes', []))}개")
+        for r in ma.get("rx_results", []):
+            line = f"[{r['rx_id']}] **{r['status']}** · {r.get('target','')}"
+            if r.get("where"):
+                line += f" → {r['where']}"
+            if r.get("reason"):
+                line += f"  \n  사유: {r['reason']}"
+            st.markdown(line)
+        for w in ma.get("warnings", []):
+            st.warning(w)
+        if ma.get("scenes"):
+            with st.expander("시장 처방으로 고친 씬 보기"):
+                for sc in ma["scenes"]:
+                    st.markdown(f"**{sc.get('scene_id','')}** — {sc.get('what_changed','')}")
+                    st.text(sc.get("revised_content", ""))
+    elif not all_done:
+        st.caption("남은 각색 차수를 먼저 끝내 주세요.")
+    return {"needed": True, "applied": bool(ma)}
+
+
+def render_market_report_ui(report):
+    """STEP 3 — 시장 검증 결과 표시."""
+    if not report:
+        return
+    st.markdown("---")
+    st.markdown('<div class="rev-card-title">🌏 시장 검증</div>', unsafe_allow_html=True)
+    if report.get("error"):
+        st.error(f"시장 검증 중 오류: {report['error']}")
+        return
+    mc = report.get("market_context") or {}
+    if not report.get("has_market_info"):
+        st.caption("시장 정보 없음 — Rewrite JSON에 시장 키가 없어(schema 1.1 이하) 화면 기본값 한국으로 진행했습니다.")
+        if not report.get("regulation_check"):
+            return
+
+    for a in report.get("alerts") or []:
+        st.warning(a)
+    st.markdown(f"**1차 시장** {mc.get('primary_label','')}  ·  **2차** {mc.get('secondary_label','없음')}  ·  "
+                f"**자료 기준일** {mc.get('data_as_of') or '미표기'}  ·  **결정** {mc.get('source_label','')}")
+
+    rx_rows = [{"#": r.get("rx_id"), "대상": r.get("target"), "상태": r.get("status"),
+                "수정 씬": r.get("where") or "-", "사유": r.get("reason") or "", "등급": r.get("grade")}
+               for r in report.get("market_rx_results") or []]
+    rx_rows += [{"#": r.get("rx_id"), "대상": r.get("target"), "상태": "미채택", "수정 씬": "-",
+                 "사유": r.get("note") or "", "등급": r.get("grade")}
+                for r in report.get("market_rx_unadopted") or []]
+    if rx_rows:
+        st.markdown("**시장 처방 반영 결과**")
+        st.table(rx_rows)
+
+    reg = report.get("regulation_check") or []
+    if reg:
+        st.markdown("**규제 재검사** (신규 발생·강화가 위)")
+        st.table([{"상태": r.get("status"), "조항": r.get("clause"), "씬": r.get("scene"),
+                   "각색 전": r.get("before"), "각색 후": r.get("after"),
+                   "예상 등급": r.get("expected_rating"), "근거 등급": r.get("grade")} for r in reg])
+
+    chk = report.get("localization_checklist") or []
+    if chk:
+        st.markdown("**고증 체크리스트** (판정 없음 — 작가·현지 자문 확인용)")
+        st.table([{"시장": get_market_label(c.get("market", "")), "확인 항목": c.get("item"),
+                   "후보 씬": ", ".join(c.get("scenes") or []) or "(자동 탐지 없음)",
+                   "판정": c.get("grade")} for c in chk])
+
+    for w in report.get("warnings") or []:
+        st.caption(f"⚠️ {w}")
+    if report.get("vn_sources"):
+        with st.expander("VN Market Lens 출처"):
+            st.text(report["vn_sources"])
+
+
 # =================================================================
 # [7] UI 컴포넌트
 # =================================================================
 def render_hero():
-    st.markdown("""
+    st.markdown(f"""
     <div class="rev-hero">
         <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">v3.5.2</span></div>
+        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">{ENGINE_VERSION}</span></div>
         <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
     </div>
     """, unsafe_allow_html=True)
@@ -5763,6 +6481,19 @@ def show_step_0_input():
                     st.session_state.rewrite_json_text = json_source
                     st.session_state.rewrite_metadata = None  # 캐시 무효화
 
+                    # ★ v3.6.0 — 시장 정보 흡수 (market_rx는 지시문에 넣지 않는다 — 작가 채택 전용)
+                    _mm = absorb_market_metadata(json_source)
+                    st.session_state.market_meta = _mm
+                    st.session_state.market_rx_adopted = []
+                    st.session_state.market_apply = None
+                    for _k in [k for k in list(st.session_state.keys()) if str(k).startswith("mrx_adopt_")]:
+                        del st.session_state[_k]
+                    if _mm.get("has_market"):
+                        st.session_state.market_ui_primary = _mm["primary"]
+                        st.session_state.market_ui_secondary = _mm.get("secondary", "")
+                        st.session_state["market_primary_select"] = _mm["primary"]
+                        st.session_state["market_secondary_select"] = _mm.get("secondary", "")
+
                     converted = parse_rewrite_engine_json(json_source)
                     if converted:
                         # 기존 지시문이 있으면 추가, 없으면 대체
@@ -5941,6 +6672,9 @@ def show_step_0_input():
                     "또는 Rewrite Engine의 진단·처방 내용을 그대로 붙여넣기도 가능합니다.",
         label_visibility="collapsed",
     )
+
+    # ★ v3.6.0 — 시장 (Market Lens)
+    render_market_step0_panel()
 
     # ── LOCKED ──
     st.markdown('<div class="rev-card-title">3. LOCKED — 절대 건드리지 말 요소</div>', unsafe_allow_html=True)
@@ -7013,6 +7747,12 @@ def show_step_2_revise():
                 "work_mode": st.session_state.work_mode,
                 "protected_ranges": st.session_state.protected_ranges,
                 "revision_ranges": st.session_state.revision_ranges,
+                # ★ v3.6.0 — 시장 상태
+                "market_meta": st.session_state.get("market_meta"),
+                "market_ui_primary": st.session_state.get("market_ui_primary", "KR"),
+                "market_ui_secondary": st.session_state.get("market_ui_secondary", ""),
+                "market_rx_adopted": st.session_state.get("market_rx_adopted", []),
+                "market_apply": st.session_state.get("market_apply"),
             }
             backup_json = _json.dumps(backup_data, ensure_ascii=False, indent=2)
             # ★ v3.3.2: 백업 파일명에 라운드 번호 + 안전한 제목 처리
@@ -7066,6 +7806,16 @@ def show_step_2_revise():
                             st.session_state.protected_ranges = loaded["protected_ranges"]
                         if loaded.get("revision_ranges"):
                             st.session_state.revision_ranges = loaded["revision_ranges"]
+                        # ★ v3.6.0 — 시장 상태 복구 (위젯 값은 다음 STEP 0 진입 시 이 값으로 맞춰짐)
+                        if loaded.get("market_meta") is not None:
+                            st.session_state.market_meta = loaded["market_meta"]
+                            st.session_state.market_ui_primary = loaded.get("market_ui_primary", "KR") or "KR"
+                            st.session_state.market_ui_secondary = loaded.get("market_ui_secondary", "") or ""
+                            st.session_state.market_rx_adopted = loaded.get("market_rx_adopted", []) or []
+                            st.session_state.market_apply = loaded.get("market_apply")
+                            for _wk in ["market_primary_select", "market_secondary_select"] + \
+                                    [k for k in list(st.session_state.keys()) if str(k).startswith("mrx_adopt_")]:
+                                st.session_state.pop(_wk, None)
 
                         restored_count = len(st.session_state.batch_results)
                         st.success(f"✅ 복구 완료: {restored_count}차 각색 결과 복원됨")
@@ -7333,6 +8083,9 @@ def show_step_2_revise():
     # v3.5.1 — 상단 안내판이 이미 계산한 결과를 재사용
     render_prescription_audit_panel(batches, batch_results, audit=audit)
 
+    # ★ v3.6.0 — 시장 처방 반영 단계 (채택 처방이 있을 때만)
+    market_stage = render_market_stage2_panel(batch_results, completed_count == total_batches)
+
     st.markdown("---")
     st.markdown(
         '<div style="font-size:1.0rem; font-weight:800; color:#191970; margin-bottom:2px;">'
@@ -7370,6 +8123,10 @@ def show_step_2_revise():
         )
         st.session_state.allow_pending_verify = gate_open
 
+    if all_done and market_stage.get("needed") and not market_stage.get("applied"):
+        st.warning("채택하신 시장 처방이 아직 반영되지 않았습니다. 이대로 검증하면 채택 처방 전부가 "
+                   "'미반영'으로 기록됩니다. 위 [시장 처방 반영 실행]을 먼저 누르시기를 권합니다.")
+
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         if st.button("✅ ③ 검증 시작 (VERIFY)",
@@ -7383,6 +8140,10 @@ def show_step_2_revise():
                 all_results,
                 diagnose_result=st.session_state.diagnose_result,
             )
+            # ★ v3.6.0 — 시장 처방 반영 결과를 마지막에 덧씌움 (각색 처방 결과 위에)
+            _ma = get_valid_market_apply(batch_results)
+            if _ma and _ma.get("scenes"):
+                merged = apply_market_overlay(merged, _ma["scenes"])
             st.session_state.revise_result = merged
 
             client = get_client()
@@ -7391,6 +8152,11 @@ def show_step_2_revise():
                     result = run_verify(client)
                     if result:
                         st.session_state.verify_result = result
+                        # ★ v3.6.0 — 시장 검증 (규제 재검사 + 고증 체크리스트)
+                        try:
+                            st.session_state.market_report = build_market_report(client, merged)
+                        except Exception as _me:
+                            st.session_state.market_report = {"error": f"{type(_me).__name__}: {_me}"}
                         st.session_state.step = 3
                         st.rerun()
                     else:
@@ -7430,6 +8196,9 @@ def show_step_2_revise():
             st.session_state.prescription_audit = None
             st.session_state.retry_rounds = 0
             st.session_state.allow_pending_verify = False
+            # ★ v3.6.0 — 시장 단계 결과도 초기화
+            st.session_state.market_apply = None
+            st.session_state.market_report = None
             st.rerun()
 
 
@@ -7540,6 +8309,9 @@ def show_step_3_verify():
         for r in recs:
             st.markdown(f"• {r}")
 
+    # ★ v3.6.0 — 시장 검증
+    render_market_report_ui(st.session_state.get("market_report"))
+
     st.markdown("---")
 
     # 완료로 이동
@@ -7552,6 +8324,7 @@ def show_step_3_verify():
         if st.button("◀ 집필 결과로 돌아가기", use_container_width=True):
             st.session_state.step = 2
             st.session_state.verify_result = None
+            st.session_state.market_report = None
             st.rerun()
 
 
@@ -7622,6 +8395,7 @@ def show_step_4_complete():
             verify_bytes = create_verify_docx(
                 st.session_state.verify_result,
                 title=title,
+                market_report=st.session_state.get("market_report"),   # ★ v3.6.0
             )
             st.download_button(
                 "✅ 검증 보고서 (DOCX)",
@@ -7685,7 +8459,7 @@ def show_step_4_complete():
                 "genre": genre,
                 "intensity": st.session_state.intensity,
                 "generated_at": datetime.now().isoformat(),
-                "engine": "BLUE JEANS REVISE ENGINE v3.5.2",
+                "engine": f"BLUE JEANS REVISE ENGINE {ENGINE_VERSION}",
             },
             "input": {
                 "instruction": st.session_state.instruction,
@@ -7695,6 +8469,8 @@ def show_step_4_complete():
             "revise":   st.session_state.revise_result,
             "verify":   st.session_state.verify_result,
         }
+        # ★ v3.6.0 — 시장 키 4종 (market_context / market_rx_results / regulation_check / localization_checklist)
+        full_state.update(build_market_json_payload(st.session_state.get("market_report")))
         json_bytes = json.dumps(full_state, ensure_ascii=False, indent=2).encode("utf-8")
         safe_title = re.sub(r'[/*?:"<>|]', '_', title)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")  # ★ v3.3.2: 시·분 추가
@@ -7742,7 +8518,7 @@ elif step == 4:
 st.markdown("---")
 st.markdown(
     '<div style="text-align:center; color:#8E8E99; font-size:0.75rem; padding:20px 0;">'
-    'BLUE JEANS PICTURES · REVISE ENGINE v3.5.2  ·  '
+    f'BLUE JEANS PICTURES · REVISE ENGINE {ENGINE_VERSION}  ·  '
     'Powered by Claude Opus 4.6 + Sonnet 4.6  ·  '
     '<span style="color:#10B981;">Auto Batch Split</span>  ·  '
     '<span style="color:#F59E0B;">Beat-Aware Diagnose</span>  ·  '
@@ -7751,7 +8527,8 @@ st.markdown(
     '<span style="color:#0EA5E9;">Writer v3.5.1 Sync</span>  ·  '
     '<span style="color:#8B5CF6;">Round N+1 Cycle</span>  ·  '
     '<span style="color:#DC2626;">Prescription Audit</span>  ·  '
-    '<span style="color:#0891B2;">Step Guide</span>'
+    '<span style="color:#0891B2;">Step Guide</span>  ·  '
+    '<span style="color:#B45309;">Market Lens</span>'
     '</div>',
     unsafe_allow_html=True,
 )

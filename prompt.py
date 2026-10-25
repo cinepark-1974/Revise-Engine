@@ -43,6 +43,24 @@
 # - 대응 4 — split_into_batches(index_offset) : 미이행 씬 재투입 배치를 기존 배치 뒤에 이어붙임.
 # - 대응 5 — merge_batch_results(diagnose_result) : 통합 시 note 자동 정제 +
 #   batch_summary를 "산출 개수"가 아니라 "처방 이행률" 기준으로 산출 + prescription_audit 첨부.
+#
+# v3.6.0 (2026-10-25) ★ 국가별 Market Lens 연동 — Rewrite Engine v2.4 schema 1.2 흡수.
+# - 근거: revise_engine_market_lens_handoff.md / Idea Engine Market Lens Pack v1.1 (VN 기준일 2026-10-23)
+# - 실제 샘플 기준 구현: 「THE CRIMSON ROBE」 Rewrite v2.4 진단 JSON (schema 1.2, VN)
+# - 신규 [13] 섹션:
+#   absorb_market_metadata      — market_context / market_fit / market_rx / regulation_flags /
+#                                 protected_assets 흡수. schema 1.2 미만은 시장 키 무시 (하위 호환)
+#   resolve_revise_market       — JSON 시장 vs 화면 선택 결정 + 수동 변경 기록
+#   build_market_context_block  — 일반 각색 배치용 [시장 정보]+[시장 레드라인]
+#                                 (한국 단독·플래그 없음이면 빈 문자열 → 기존 프롬프트와 동일)
+#   build_market_rx_apply_prompt — 채택 처방 전용 '시장 처방 반영' 단계 (모든 배치 이후 1회)
+#   normalize_market_rx_results — 채택 항목마다 결과 1건 강제, 누락은 '미반영' 자동 기록
+#   build_market_regulation_check_prompt / normalize_regulation_check
+#                               — 각색 전후 비교, 유지/완화/강화/신규 발생. 등급은 올리지 않음
+#   apply_market_overlay / build_final_scene_text_map / build_market_localization_checklist
+# - build_revise_prompt(market_block=) 인자 추가. 채택 처방은 일반 배치에 넣지 않음 (handoff 8절).
+# - 고증 checklist는 프롬프트에 넣지 않음 (handoff 5-2). 리포트 전용.
+# - market_revise_pack.py v1.0.0 / market_lens_pack.py v1.1 연동 (없어도 엔진은 정상 동작).
 # =================================================================
 
 
@@ -103,6 +121,53 @@ except ImportError:
     def _get_genre_override(g):
         return ""
     def _get_genre_enforcement(g):
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────
+# ★ v3.6.0 — Market Revise Pack / Market Lens Pack 연동 (선택적 — 없어도 엔진은 정상 동작)
+# ─────────────────────────────────────────────────────────────────
+try:
+    from market_revise_pack import (
+        normalize_market_code,
+        get_market_label,
+        get_redlines as get_market_redlines,
+        format_redlines_for_prompt as format_market_redlines,
+        build_localization_checklist,
+        has_vietnamese_chars,
+        MARKET_CODES,
+        GRADE_CREATIVE as GRADE_CREATIVE_JUDGMENT,
+    )
+    MARKET_REVISE_PACK_AVAILABLE = True
+except ImportError:
+    MARKET_REVISE_PACK_AVAILABLE = False
+    MARKET_CODES = ["KR", "JP", "ID", "VN"]
+    GRADE_CREATIVE_JUDGMENT = "CREATIVE_JUDGMENT"
+    _MKT_FALLBACK_LABELS = {"KR": "한국", "JP": "일본", "ID": "인도네시아", "VN": "베트남"}
+    def normalize_market_code(code):
+        c = str(code or "").strip().upper()
+        return c if c in MARKET_CODES else ""
+    def get_market_label(code, with_flag=False):
+        return _MKT_FALLBACK_LABELS.get(normalize_market_code(code), "없음")
+    def get_market_redlines(code):
+        return []
+    def format_market_redlines(code):
+        return []
+    def build_localization_checklist(code, scene_text_map):
+        return []
+    def has_vietnamese_chars(text):
+        return False
+
+try:
+    from market_lens_pack import (
+        VN_DATA_AS_OF as MARKET_VN_DATA_AS_OF,
+        get_vn_sources_text as get_market_vn_sources_text,
+    )
+    MARKET_LENS_PACK_AVAILABLE = True
+except ImportError:
+    MARKET_LENS_PACK_AVAILABLE = False
+    MARKET_VN_DATA_AS_OF = ""
+    def get_market_vn_sources_text():
         return ""
 
 
@@ -1522,6 +1587,9 @@ def absorb_rewrite_engine_metadata(rewrite_json) -> dict:
     """Rewrite Engine JSON에서 메타데이터를 구조화 추출.
 
     v2.3 확장 — MOON 의견 + REWRITE 제안 + ADD 제안까지 흡수.
+    v3.6.0 — 시장 키(market_context·market_fit·market_rx·regulation_flags)는 이 함수가 아니라
+    absorb_market_metadata()가 따로 흡수한다. market_rx는 자동 적용 대상이 아니므로
+    rewrite_suggestions 흐름(진단 Fast Path)에 섞지 않는다.
 
     Rewrite Engine의 진짜 처방 구조:
       - chris_analysis: 구조·플롯·페이싱
@@ -2778,7 +2846,8 @@ def build_revise_prompt(
     protected_ranges: list = None,
     revision_ranges: list = None,
     cascade_analysis: dict = None,
-    boundary_info: str = ""
+    boundary_info: str = "",
+    market_block: str = ""
 ) -> str:
     """Stage 2: Stage 1의 수정 플랜에 따라 실제 수정본을 집필.
     Opus 4.6 사용 필수 (집필).
@@ -2791,6 +2860,8 @@ def build_revise_prompt(
                   None이면 전체 씬 (구버전 호환).
     batch_index: 현재 배치 번호 (1부터).
     total_batches: 전체 배치 수.
+    market_block: (v3.6.0) build_market_context_block() 결과 — [시장 정보]+[시장 레드라인].
+                  빈 문자열이면 기존 프롬프트와 동일하다. 채택 처방은 여기에 넣지 않는다.
     """
 
     import json as _json
@@ -3113,6 +3184,7 @@ Stage 1에서 생성된 수정 플랜에 따라, 원본 시나리오의 지정�
 
 {AI_ESCAPE_BLOCK}
 {genre_enforce_section}
+{market_block}
 
 [집필 원칙]
 1. Stage 1의 target_scenes 각 항목에 대해 수정된 씬 전문(全文)을 작성하라.
@@ -3127,6 +3199,8 @@ Stage 1에서 생성된 수정 플랜에 따라, 원본 시나리오의 지정�
 10. 역사영화 유형 블록이 주입된 경우, 정통/팩션/퓨전 각 유형의 톤을 일관되게 유지하라.
 11. 실화 기반 블록이 주입된 경우, 실명 사용·특정 가능 디테일을 반드시 회피하라.
 12. 장르 ENFORCEMENT 체크리스트가 주입된 경우, 모든 수정 씬이 통과해야 한다.
+13. 시장 레드라인이 주입된 경우, 새로 쓰거나 고쳐 쓰는 문장이 그 위험을 새로 만들거나 키우지 않게 한다.
+    기존 묘사를 시장을 이유로 지우거나 완화하지 않는다. 인물·사건 순서·반전·결말은 시장과 무관하게 유지한다.
 
 [Type별 처리 방법]
 13. type="REWRITE": 기존 씬 전문을 다시 쓴다. revised_content에 전체 씬 본문.
@@ -4336,3 +4410,897 @@ def build_pending_retry_block(pending_items: list) -> str:
 # =================================================================
 # END OF prompt.py
 # =================================================================
+
+
+# =================================================================
+# [13] ★ v3.6.0 — 국가별 Market Lens 연동 (Rewrite Engine v2.4 schema 1.2)
+# =================================================================
+# 설계 원칙 (revise_engine_market_lens_handoff.md)
+#   1. 시장은 원고의 방향을 바꾸지 않는다. 인물·사건 순서·반전·결말 불변.
+#      Rewrite의 protected_assets와 LOCKED가 우선한다.
+#   2. market_rx는 자동 적용하지 않는다. 작가가 체크한 항목만 반영한다.
+#   3. 규제는 수정 대상이 아니라 검증 대상이다. 엔진은 원고를 지우거나
+#      완화하지 않고, 각색 전후를 비교해 보고만 한다.
+#   4. 반영 추적은 별도 배열(market_rx_results)로 남긴다.
+#      unchanged_scenes_note에 묻히지 않게 한다.
+#   5. 근거 등급(VERIFIED / INFERENCE / CREATIVE_JUDGMENT /
+#      VERIFICATION_REQUIRED)은 Rewrite 값을 그대로 전달한다. 올리지 않는다.
+#
+# 처리 순서 (handoff 8절):
+#   기존 각색 배치 전부 → (작가가 채택한 처방이 있으면) 시장 처방 반영 단계
+#   → 검증 → 규제 재검사 → 고증 체크리스트(코드, 판정 없음)
+# =================================================================
+
+MARKET_SCHEMA_MIN = (1, 2)
+
+MARKET_RX_STATUSES = ("반영", "부분 반영", "미반영")
+REGULATION_STATUSES = ("유지", "완화", "강화", "신규 발생")
+REGULATION_STATUS_MISSING = "검사 누락"   # 엔진이 해당 플래그를 보고하지 않았을 때 코드가 기록
+
+
+def _schema_tuple(v) -> tuple:
+    """'1.2' → (1, 2). 읽을 수 없으면 (0, 0)."""
+    import re as _re
+    nums = _re.findall(r'\d+', str(v or ""))
+    if not nums:
+        return (0, 0)
+    major = int(nums[0])
+    minor = int(nums[1]) if len(nums) > 1 else 0
+    return (major, minor)
+
+
+def _load_json_any(rewrite_json):
+    import json as _json
+    if isinstance(rewrite_json, dict):
+        return rewrite_json
+    if isinstance(rewrite_json, str):
+        try:
+            d = _json.loads(rewrite_json)
+            return d if isinstance(d, dict) else {}
+        except (_json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _s(v) -> str:
+    """None·숫자·리스트가 와도 안전하게 문자열로."""
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_s(x) for x in v if _s(x))
+    return str(v).strip()
+
+
+def absorb_market_metadata(rewrite_json) -> dict:
+    """Rewrite Engine JSON(schema 1.2+)에서 시장 정보를 구조화 추출.
+
+    실제 샘플(「THE CRIMSON ROBE」 Rewrite v2.4, schema 1.2) 기준 키 위치:
+      market_context   : 최상위 (primary / secondary / data_as_of / lens_version)
+      market_fit       : 최상위 + chris_analysis.market_fit (같은 내용)
+      market_rx        : 최상위 + shiho_prescription.market_rx (같은 내용)
+      regulation_flags : 최상위 + market_fit.regulation_flags (같은 내용)
+      protected_assets : 최상위 + chris_analysis.protected_assets
+    최상위를 먼저 읽고, 없을 때만 하위 위치를 읽는다.
+
+    schema_version이 1.2 미만이면 시장 키가 있어도 has_market=False로 둔다
+    (handoff 2-1). 이 경우 기존 각색 동작이 그대로 유지된다.
+    """
+    data = _load_json_any(rewrite_json)
+    chris = data.get("chris_analysis") if isinstance(data.get("chris_analysis"), dict) else {}
+    shiho = data.get("shiho_prescription") if isinstance(data.get("shiho_prescription"), dict) else {}
+    meta_blk = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+
+    schema_version = _s(data.get("schema_version"))
+    schema_ok = _schema_tuple(schema_version) >= MARKET_SCHEMA_MIN
+
+    result = {
+        "schema_version": schema_version or "(표기 없음)",
+        "schema_ok": schema_ok,
+        "has_market": False,
+        "primary": "",
+        "secondary": "",
+        "data_as_of": "",
+        "lens_version": "",
+        "market_fit": {},
+        "jp_track": "",
+        "market_rx": [],
+        "regulation_flags": [],
+        "protected_assets": [],
+        "source_engine": _s(data.get("engine_version")),
+    }
+
+    # protected_assets는 시장과 무관하게 흡수 (시장 처방의 충돌 기준)
+    pa = data.get("protected_assets")
+    if not isinstance(pa, list):
+        pa = chris.get("protected_assets") if isinstance(chris.get("protected_assets"), list) else []
+    result["protected_assets"] = [
+        {
+            "asset": _s(a.get("asset")),
+            "kind": _s(a.get("kind")),
+            "where": _s(a.get("where")),
+            "why": _s(a.get("why")),
+            "do_not": _s(a.get("do_not")),
+        }
+        for a in pa if isinstance(a, dict) and _s(a.get("asset"))
+    ]
+
+    if not schema_ok:
+        return result
+
+    mc = data.get("market_context") if isinstance(data.get("market_context"), dict) else {}
+    mf = data.get("market_fit") if isinstance(data.get("market_fit"), dict) else {}
+    if not mf and isinstance(chris.get("market_fit"), dict):
+        mf = chris.get("market_fit")
+
+    primary = _s(mc.get("primary")) or _s(mf.get("primary")) or _s(meta_blk.get("market_primary"))
+    secondary = _s(mc.get("secondary")) or _s(mf.get("secondary")) or _s(meta_blk.get("market_secondary"))
+    primary = normalize_market_code(primary)
+    secondary = normalize_market_code(secondary)
+    if secondary == primary:
+        secondary = ""
+
+    if not primary:
+        return result
+
+    result["has_market"] = True
+    result["primary"] = primary
+    result["secondary"] = secondary
+    result["data_as_of"] = (_s(mc.get("data_as_of")) or _s(mf.get("data_as_of"))
+                            or _s(meta_blk.get("market_data_as_of")))
+    result["lens_version"] = _s(mc.get("lens_version"))
+    result["jp_track"] = _s(mf.get("jp_track"))
+    result["market_fit"] = {
+        "verdict": _s(mf.get("verdict")),
+        "verdict_reason": _s(mf.get("verdict_reason")),
+        "genre_group": _s(mf.get("genre_group")),
+        "buyer_coordinate": _s(mf.get("buyer_coordinate")),
+        "localization_conditions": [_s(x) for x in (mf.get("localization_conditions") or []) if _s(x)],
+        "verification_required": [_s(x) for x in (mf.get("verification_required") or []) if _s(x)],
+        "risks": [_s(x) for x in (mf.get("risks") or []) if _s(x)],
+    }
+
+    # market_rx
+    rx_list = data.get("market_rx")
+    if not isinstance(rx_list, list):
+        rx_list = shiho.get("market_rx") if isinstance(shiho.get("market_rx"), list) else []
+    for i, rx in enumerate(rx_list):
+        if not isinstance(rx, dict):
+            continue
+        target = _s(rx.get("target"))
+        keys = extract_scene_keys(target)
+        result["market_rx"].append({
+            "rx_id": i + 1,
+            "target": target or "(대상 미표기)",
+            "target_keys": [k for k in keys if k.startswith("S#")],
+            "scene_addressable": any(k.startswith("S#") for k in keys),
+            "linked": _s(rx.get("linked")),
+            "prescription": _s(rx.get("prescription")),
+            "keeps": _s(rx.get("keeps")),
+            "conflict_with_asset": _s(rx.get("conflict_with_asset")),
+            "grade": _s(rx.get("grade")),
+            "optional": bool(rx.get("optional", True)),
+        })
+
+    # regulation_flags
+    flags = data.get("regulation_flags")
+    if not isinstance(flags, list):
+        flags = mf.get("regulation_flags") if isinstance(mf.get("regulation_flags"), list) else []
+    for i, fl in enumerate(flags):
+        if not isinstance(fl, dict):
+            continue
+        scene = _s(fl.get("scene"))
+        result["regulation_flags"].append({
+            "flag_id": i + 1,
+            "clause": _s(fl.get("clause")),
+            "scene": scene,
+            "scene_keys": [k for k in extract_scene_keys(scene) if k.startswith("S#")],
+            "issue": _s(fl.get("issue")),
+            "expected_rating": _s(fl.get("expected_rating")),
+            "grade": _s(fl.get("grade")),
+        })
+
+    return result
+
+
+def resolve_revise_market(market_meta: dict, ui_primary: str = "", ui_secondary: str = "") -> dict:
+    """작품에 적용할 시장을 결정한다 (handoff 2-1).
+
+    - Rewrite JSON(schema 1.2+)에 시장이 있으면 그 값을 기준으로 한다.
+      JSON을 불러올 때 화면 선택 상자도 JSON 값으로 맞춰 두므로,
+      화면 값이 JSON과 다르면 작가가 화면에서 바꾼 것이다 → 화면 값을 따르고
+      manual_override=True로 기록한다 (리포트에 "시장 수동 변경" 표시).
+    - JSON에 시장이 없으면 화면 값을 쓴다. 화면 기본값은 한국.
+    """
+    meta = market_meta if isinstance(market_meta, dict) else {}
+    up = normalize_market_code(ui_primary) or "KR"
+    us = normalize_market_code(ui_secondary)
+    if us == up:
+        us = ""
+
+    jp = meta.get("primary", "") if meta.get("has_market") else ""
+    js = meta.get("secondary", "") if meta.get("has_market") else ""
+
+    res = {
+        "primary": up,
+        "secondary": us,
+        "json_primary": jp,
+        "json_secondary": js,
+        "source": "",
+        "manual_override": False,
+        "has_json_market": bool(jp),
+        "schema_version": meta.get("schema_version", ""),
+        "data_as_of": "",
+    }
+
+    if jp:
+        if (up, us) == (jp, js):
+            res["source"] = "json"
+        else:
+            res["source"] = "manual"
+            res["manual_override"] = True
+        res["data_as_of"] = meta.get("data_as_of", "")
+    else:
+        res["source"] = "ui" if (up != "KR" or us) else "default"
+
+    if not res["data_as_of"] and "VN" in (res["primary"], res["secondary"]):
+        res["data_as_of"] = MARKET_VN_DATA_AS_OF
+    return res
+
+
+def market_is_active(market_res: dict, market_meta: dict = None) -> bool:
+    """시장 단계를 돌릴 필요가 있는지.
+
+    한국 단독 + Rewrite 규제 플래그 없음 → False (기존 동작 그대로).
+    """
+    if not isinstance(market_res, dict):
+        return False
+    codes = [c for c in (market_res.get("primary"), market_res.get("secondary")) if c]
+    has_redlines = any(get_market_redlines(c) for c in codes)
+    flags = (market_meta or {}).get("regulation_flags") or []
+    return bool(has_redlines or flags)
+
+
+def build_market_redline_lines(market_res: dict, market_meta: dict = None) -> list:
+    """프롬프트·검사용 레드라인 문자열 (market_revise_pack redlines + Rewrite regulation_flags)."""
+    lines = []
+    seen = set()
+    for c in (market_res.get("primary"), market_res.get("secondary")):
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        lines.extend(format_market_redlines(c))
+    for fl in (market_meta or {}).get("regulation_flags") or []:
+        lines.append(
+            f"- [Rewrite 규제 플래그 {fl.get('flag_id')}] {fl.get('clause','')} — "
+            f"{fl.get('scene','')}: {fl.get('issue','')} "
+            f"(예상 등급 {fl.get('expected_rating','') or '미표기'} · {fl.get('grade','') or '등급 미표기'})"
+        )
+    return lines
+
+
+def _market_info_line(market_res: dict) -> str:
+    p = get_market_label(market_res.get("primary", ""))
+    s = get_market_label(market_res.get("secondary", "")) if market_res.get("secondary") else "없음"
+    d = market_res.get("data_as_of") or "미표기"
+    return f"1차 시장: {p} / 2차 시장: {s} / 자료 기준일: {d}"
+
+
+def build_market_context_block(market_res: dict, market_meta: dict = None) -> str:
+    """일반 각색 배치 프롬프트에 넣는 블록 — [시장 정보] + [시장 레드라인].
+
+    채택된 시장 처방은 여기에 넣지 않는다. 처방은 모든 각색 배치가 끝난 뒤
+    별도 '시장 처방 반영' 단계에서만 다룬다 (handoff 8절: 각색 처방이 시장
+    처방에 덮이지 않게). 고증 checklist도 넣지 않는다 (handoff 5-2).
+
+    한국 단독 + 규제 플래그 없음이면 빈 문자열 → 기존 프롬프트와 동일.
+    """
+    if not market_is_active(market_res, market_meta):
+        return ""
+    lines = build_market_redline_lines(market_res, market_meta)
+    redline_str = "\n".join(lines) if lines else "(해당 없음)"
+    return f"""
+
+[시장 정보]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{_market_info_line(market_res)}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[시장 레드라인 — 각색 중 새로 만들지 말 것]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{redline_str}
+━━━━━━━━━━━━━━━━━━━━━━━━
+※ 이 목록은 기존 묘사를 지우라는 지시가 아니다.
+  각색 과정에서 새로 쓰거나 고쳐 쓰는 문장이 이 위험을 새로 만들거나 키우지 않게 하라는 지시다.
+※ 시장을 이유로 인물·사건 순서·반전·결말을 바꾸지 않는다."""
+
+
+def split_screenplay_scene_map(text: str) -> dict:
+    """원고를 {"S#3": "씬 전문", ...}으로 나눈다. 'S#번호'로 시작하는 줄을 씬 경계로 본다.
+
+    같은 번호가 두 번 나오면 첫 번째를 쓴다. S# 표기가 없는 원고(EXT/INT만)는 빈 dict.
+    """
+    import re as _re
+    out = {}
+    if not text:
+        return out
+    cur_key, buf = None, []
+    for line in text.split("\n"):
+        m = _re.match(r'^\s*\**\s*S\s*#\s*(\d+)(?:\s*-\s*(\d+))?', line)
+        if m:
+            if cur_key and cur_key not in out:
+                out[cur_key] = "\n".join(buf).strip()
+            n1, n2 = m.group(1), m.group(2)
+            cur_key = f"S#{int(n1)}" + (f"-{int(n2)}" if n2 else "")
+            buf = [line]
+        elif cur_key:
+            buf.append(line)
+    if cur_key and cur_key not in out:
+        out[cur_key] = "\n".join(buf).strip()
+    return out
+
+
+def _revised_scene_list(revise_result: dict) -> list:
+    rr = (revise_result or {}).get("revision_result", {}) if isinstance(revise_result, dict) else {}
+    scenes = rr.get("revised_scenes", []) if isinstance(rr, dict) else []
+    return [s for s in scenes if isinstance(s, dict)]
+
+
+def collect_market_scene_versions(adopted_rx: list, raw_text: str, revise_result: dict) -> tuple:
+    """채택된 처방의 대상 씬마다 '지금 버전'을 모은다.
+
+    이미 각색된 씬이면 각색본, 아니면 원본. 삭제된 씬은 처방 대상에서 빠진다.
+    MERGE로 합쳐진 씬(S#9-10)은 한 번만 넣는다.
+
+    Returns:
+        (versions, unresolved)
+        versions   : [{"scene_id", "keys", "source": "각색본"|"원본", "content", "rx_ids": [...]}]
+        unresolved : {rx_id: "사유"} — 대상 씬을 원고에서 찾지 못했거나 삭제된 경우
+    """
+    orig_map = split_screenplay_scene_map(raw_text)
+    revised = _revised_scene_list(revise_result)
+
+    by_id = {}
+    order = []
+    unresolved = {}
+
+    for rx in adopted_rx or []:
+        rid = rx.get("rx_id")
+        found_any = False
+        reasons = []
+        for key in rx.get("target_keys", []):
+            hit = None
+            for sc in revised:
+                if key in extract_scene_keys(_s(sc.get("scene_id"))):
+                    hit = sc
+                    break
+            if hit is not None:
+                if _s(hit.get("type")).upper() == "DELETE":
+                    reasons.append(f"{key} 씬은 각색 단계에서 삭제됨")
+                    continue
+                sid = _s(hit.get("scene_id")) or key
+                content = _s(hit.get("revised_content"))
+                source = "각색본"
+            elif key in orig_map:
+                sid, content, source = key, orig_map[key], "원본"
+            else:
+                reasons.append(f"원고에서 {key} 씬을 찾지 못함")
+                continue
+            found_any = True
+            if sid not in by_id:
+                by_id[sid] = {"scene_id": sid, "keys": [], "source": source,
+                              "content": content, "rx_ids": []}
+                order.append(sid)
+            if key not in by_id[sid]["keys"]:
+                by_id[sid]["keys"].append(key)
+            if rid not in by_id[sid]["rx_ids"]:
+                by_id[sid]["rx_ids"].append(rid)
+        if not found_any:
+            unresolved[rid] = " / ".join(reasons) if reasons else "씬 지정이 없는 처방"
+    return [by_id[s] for s in order], unresolved
+
+
+def build_market_rx_apply_prompt(adopted_rx: list, scene_versions: list,
+                                 market_res: dict, market_meta: dict = None,
+                                 locked: str = "") -> str:
+    """시장 처방 반영 단계 프롬프트 (Opus). 모든 일반 각색 배치가 끝난 뒤 1회 실행."""
+    import json as _json
+    market_meta = market_meta or {}
+
+    rx_lines = []
+    for rx in adopted_rx:
+        rx_lines.append(
+            f"[처방 {rx['rx_id']}] 대상: {rx.get('target','')}\n"
+            f"  처방: {rx.get('prescription','')}\n"
+            f"  유지할 방향(keeps): {rx.get('keeps','') or '(미표기)'}\n"
+            f"  근거: {rx.get('linked','') or '(미표기)'}"
+        )
+    rx_block = "\n".join(rx_lines) if rx_lines else "(없음)"
+
+    pa_lines = []
+    for a in market_meta.get("protected_assets") or []:
+        pa_lines.append(f"- {a.get('asset','')} (위치: {a.get('where','')}) → 금지: {a.get('do_not','')}")
+    pa_block = "\n".join(pa_lines) if pa_lines else "(없음)"
+
+    redlines = build_market_redline_lines(market_res, market_meta)
+    redline_block = "\n".join(redlines) if redlines else "(해당 없음)"
+
+    scenes_payload = [
+        {"scene_id": v["scene_id"], "current_version": v["source"],
+         "rx_ids": v["rx_ids"], "content": v["content"]}
+        for v in scene_versions
+    ]
+    scenes_json = _json.dumps(scenes_payload, ensure_ascii=False, indent=2)
+    locked_text = (locked or "").strip() or "(명시된 LOCKED 요소 없음)"
+
+    return f"""
+[TASK — 시장 처방 반영 (Market Rx Pass)]
+일반 각색은 이미 끝났다. 아래 씬들은 '지금 버전'(각색본 또는 원본)이다.
+작가(Mr. MOON)가 직접 채택한 시장 처방만, 이 씬들에 반영하라.
+
+[시장 정보]
+{_market_info_line(market_res)}
+
+[채택된 시장 처방 — 작가가 체크한 항목만]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{rx_block}
+━━━━━━━━━━━━━━━━━━━━━━━━
+이 처방은 원고의 인물·사건·결말을 바꾸지 않는 범위에서만 이행한다.
+keeps에 적힌 방향을 해치면 그 처방은 이행하지 말고, 이유를 market_rx_results에 적는다.
+
+[시장 레드라인 — 각색 중 새로 만들지 말 것]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{redline_block}
+━━━━━━━━━━━━━━━━━━━━━━━━
+이 목록은 기존 묘사를 지우라는 지시가 아니다.
+고쳐 쓰는 문장이 이 위험을 새로 만들거나 키우지 않게 하라는 지시다.
+
+[보호 자산 — Rewrite protected_assets (절대 훼손 금지)]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{pa_block}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[LOCKED]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{locked_text}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[대상 씬 — 지금 버전]
+━━━━━━━━━━━━━━━━━━━━━━━━
+{scenes_json}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+[반영 원칙]
+1. 각 씬은 rx_ids에 적힌 처방만 적용한다. 다른 수정은 하지 않는다.
+   지금 버전의 대사·지문·소품·동선은 처방이 요구하는 부분 외에 그대로 둔다.
+2. 인물, 사건 순서, 반전, 결말, 씬 번호, 장소, 시간대는 바꾸지 않는다.
+3. 처방에 촬영·편집 지시(컷, 클로즈업, 엘립시스 등)나 숫자 시간이 있어도,
+   원고에는 '무엇을 보여주고 무엇을 보여주지 않는가'로 옮긴다.
+   숫자 시간 표기는 쓰지 않는다 (A29). 카메라 용어로 지문을 채우지 않는다.
+4. 처방을 반영하지 않기로 했으면 그 씬은 출력하지 않고 market_rx_results에 사유를 남긴다.
+   처방 하나가 여러 씬을 대상으로 하면, 씬마다 반영 여부가 다를 수 있다 → 부분 반영.
+5. 출력하는 씬은 씬 헤더부터 끝까지 전문이다. 줄바꿈은 \\n, 대사는 "인물명\\t\\t대사".
+   씬 헤딩 시간대는 지금 버전 표기를 그대로 둔다.
+6. 채택된 처방 {len(adopted_rx)}개 각각에 대해 market_rx_results를 하나씩 쓴다. 빠뜨리지 않는다.
+   status는 "반영" / "부분 반영" / "미반영" 중 하나. 반영이 아니면 reason을 반드시 쓴다.
+
+[출력 형식 — JSON 단일 객체]
+{{
+  "market_revision": {{
+    "revised_scenes": [
+      {{
+        "scene_id": "입력의 scene_id 그대로",
+        "scene_header": "씬 헤더 한 줄",
+        "revised_content": "씬 전문",
+        "applied_rx_ids": [1],
+        "what_changed": "처방 때문에 바뀐 부분만 한두 줄"
+      }}
+    ],
+    "market_rx_results": [
+      {{
+        "rx_id": 1,
+        "status": "반영 | 부분 반영 | 미반영",
+        "where": "실제로 고친 씬 번호 (예: S#54, S#56)",
+        "reason": "부분 반영·미반영 사유. 반영이면 빈 문자열"
+      }}
+    ]
+  }}
+}}
+
+JSON만 출력하라. 설명·마크다운 금지.
+""".strip()
+
+
+def _norm_rx_status(v) -> str:
+    t = _s(v).replace(" ", "")
+    if not t:
+        return ""
+    if "부분" in t or t.lower().startswith("partial"):
+        return "부분 반영"
+    if "미반영" in t or "반영안" in t or t.upper().startswith("N") or "불가" in t:
+        return "미반영"
+    if "반영" in t or t.upper().startswith("Y"):
+        return "반영"
+    return ""
+
+
+def normalize_market_rx_results(adopted_rx: list, market_revision: dict,
+                                unresolved: dict = None) -> tuple:
+    """엔진이 보고한 market_rx_results를 채택 항목 기준으로 정리한다.
+
+    - 채택 항목마다 정확히 하나의 결과를 만든다. 엔진이 빠뜨리면 '미반영'으로 자동 기록.
+    - 대상 씬을 찾지 못한 처방(unresolved)은 엔진 보고와 무관하게 '미반영'.
+    - 반영이 아닌데 사유가 비어 있으면 경고.
+    - 근거 등급은 Rewrite 값을 그대로 붙인다.
+
+    Returns: (results, warnings)
+    """
+    unresolved = unresolved or {}
+    mr = market_revision if isinstance(market_revision, dict) else {}
+    raw = mr.get("market_rx_results") if isinstance(mr.get("market_rx_results"), list) else []
+    scenes = mr.get("revised_scenes") if isinstance(mr.get("revised_scenes"), list) else []
+    warnings = []
+
+    # 대상 씬을 찾지 못한 처방은 엔진에 보내지 않으므로 개수 비교에서 뺀다
+    sent_ids = [rx.get("rx_id") for rx in adopted_rx or [] if rx.get("rx_id") not in unresolved]
+    if sent_ids and len(raw) != len(sent_ids):
+        warnings.append(
+            f"엔진에 보낸 채택 처방은 {len(sent_ids)}개인데 엔진이 보고한 결과는 {len(raw)}개입니다."
+        )
+
+    raw_by_id = {}
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        try:
+            rid = int(str(r.get("rx_id")).strip())
+        except (TypeError, ValueError):
+            continue
+        raw_by_id.setdefault(rid, r)
+
+    scenes_by_rx = {}
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            continue
+        for rid in sc.get("applied_rx_ids") or []:
+            try:
+                rid = int(rid)
+            except (TypeError, ValueError):
+                continue
+            scenes_by_rx.setdefault(rid, []).append(_s(sc.get("scene_id")))
+
+    results = []
+    for rx in adopted_rx or []:
+        rid = rx.get("rx_id")
+        row = {
+            "rx_id": rid,
+            "target": rx.get("target", ""),
+            "prescription": rx.get("prescription", ""),
+            "keeps": rx.get("keeps", ""),
+            "grade": rx.get("grade", ""),
+            "status": "",
+            "where": "",
+            "reason": "",
+            "auto_recorded": False,
+        }
+        if rid in unresolved:
+            row.update(status="미반영",
+                       reason=f"대상 씬 확인 불가 — {unresolved[rid]} (자동 기록)",
+                       auto_recorded=True)
+        elif rid not in raw_by_id:
+            row.update(status="미반영",
+                       reason="엔진이 이 처방의 결과를 보고하지 않았습니다 (자동 기록)",
+                       auto_recorded=True)
+            warnings.append(f"처방 {rid}: 엔진 보고 누락 → 미반영으로 자동 기록했습니다.")
+        else:
+            r = raw_by_id[rid]
+            status = _norm_rx_status(r.get("status"))
+            if not status:
+                status = "미반영"
+                warnings.append(f"처방 {rid}: 상태 값을 읽을 수 없어 미반영으로 기록했습니다.")
+            row["status"] = status
+            row["where"] = _s(r.get("where")) or ", ".join(scenes_by_rx.get(rid, []))
+            row["reason"] = "" if status == "반영" else _s(r.get("reason"))
+            if status != "반영" and not row["reason"]:
+                warnings.append(f"처방 {rid}: {status}인데 사유가 비어 있습니다.")
+            if status in ("반영", "부분 반영") and not scenes_by_rx.get(rid):
+                warnings.append(
+                    f"처방 {rid}: 상태가 '{status}'인데 이 처방으로 고친 씬이 산출되지 않았습니다."
+                )
+        results.append(row)
+    return results, warnings
+
+
+def apply_market_overlay(revise_result: dict, market_scenes: list) -> dict:
+    """시장 처방으로 고친 씬을 각색 결과에 덮어쓴다 (원본 dict는 건드리지 않음).
+
+    - 같은 scene_id(또는 같은 씬 번호)의 각색 씬이 있으면 그 내용만 교체.
+    - 각색되지 않았던 씬이면 REWRITE 항목으로 추가 (DOCX 통합 시 원본 씬을 대체).
+    - 중복 씬을 만들지 않는다 (A33 Phase 1이 두 번째 항목을 지우므로 교체 방식 필수).
+    """
+    import copy as _copy
+    res = _copy.deepcopy(revise_result) if isinstance(revise_result, dict) else {}
+    rr = res.setdefault("revision_result", {})
+    scenes = rr.setdefault("revised_scenes", [])
+    replaced, added, applied_ids = 0, 0, []
+
+    for ms in market_scenes or []:
+        if not isinstance(ms, dict):
+            continue
+        content = _s(ms.get("revised_content"))
+        msid = _s(ms.get("scene_id"))
+        if not content or not msid:
+            continue
+        mkeys = set(k for k in extract_scene_keys(msid) if k.startswith("S#"))
+        target = None
+        for sc in scenes:
+            if not isinstance(sc, dict):
+                continue
+            sid = _s(sc.get("scene_id"))
+            if sid == msid:
+                target = sc
+                break
+        if target is None and mkeys:
+            for sc in scenes:
+                if not isinstance(sc, dict) or _s(sc.get("type")).upper() in ("ADD", "DELETE"):
+                    continue
+                if mkeys & set(extract_scene_keys(_s(sc.get("scene_id")))):
+                    target = sc
+                    break
+        rx_ids = ms.get("applied_rx_ids") or []
+        if target is not None:
+            target["revised_content"] = content
+            if _s(ms.get("scene_header")):
+                target["scene_header"] = _s(ms.get("scene_header"))
+            notes = target.get("revision_notes")
+            if not isinstance(notes, dict):
+                notes = {}
+                target["revision_notes"] = notes
+            notes["market_rx_applied"] = rx_ids
+            notes["market_what_changed"] = _s(ms.get("what_changed"))
+            replaced += 1
+        else:
+            scenes.append({
+                "scene_id": msid,
+                "scene_header": _s(ms.get("scene_header")) or msid,
+                "priority": "MARKET",
+                "type": "REWRITE",
+                "original_excerpt": "",
+                "revised_content": content,
+                "insert_position": "",
+                "revision_notes": {
+                    "prescription_applied": "Y — 시장 처방 반영 단계",
+                    "what_changed": _s(ms.get("what_changed")),
+                    "market_rx_applied": rx_ids,
+                },
+            })
+            added += 1
+        applied_ids.append(msid)
+
+    rr["market_overlay"] = {"replaced": replaced, "added": added, "scene_ids": applied_ids}
+    return res
+
+
+def build_final_scene_text_map(raw_text: str, revise_result: dict) -> dict:
+    """각색 완료본 기준 {씬키: 전문}. 고증 체크리스트·규제 재검사 입력용."""
+    final = dict(split_screenplay_scene_map(raw_text))
+    for sc in _revised_scene_list(revise_result):
+        sid = _s(sc.get("scene_id"))
+        typ = _s(sc.get("type")).upper()
+        keys = [k for k in extract_scene_keys(sid) if k.startswith("S#")]
+        if typ == "DELETE":
+            for k in keys:
+                final.pop(k, None)
+            continue
+        content = _s(sc.get("revised_content"))
+        if not content:
+            continue
+        if typ == "ADD" or not keys:
+            final[sid or f"ADD-{len(final)+1}"] = content
+        else:
+            for k in keys:
+                final.pop(k, None)
+            final[keys[0] if len(keys) == 1 else sid] = content
+    return final
+
+
+def build_regulation_scene_pairs(raw_text: str, revise_result: dict,
+                                 market_meta: dict = None, max_chars: int = 6000) -> list:
+    """규제 재검사용 씬 쌍 — 각색으로 바뀐 씬 전부 + 규제 플래그가 걸린 씬."""
+    orig = split_screenplay_scene_map(raw_text)
+    pairs, covered, deleted = [], set(), set()
+
+    def _cut(t):
+        t = t or ""
+        return t if len(t) <= max_chars else t[:max_chars] + "\n…(이하 생략)"
+
+    for sc in _revised_scene_list(revise_result):
+        sid = _s(sc.get("scene_id"))
+        typ = _s(sc.get("type")).upper()
+        keys = [k for k in extract_scene_keys(sid) if k.startswith("S#")]
+        if typ == "DELETE":
+            deleted.update(keys)
+            continue
+        after = _s(sc.get("revised_content"))
+        if typ == "ADD":
+            pairs.append({"scene": sid, "change_type": "신규 추가", "before": "", "after": _cut(after)})
+        else:
+            before = "\n\n".join(orig.get(k, "") for k in keys if orig.get(k))
+            pairs.append({"scene": sid, "change_type": "수정", "before": _cut(before), "after": _cut(after)})
+        covered.update(keys)
+
+    for fl in (market_meta or {}).get("regulation_flags") or []:
+        for k in fl.get("scene_keys", []):
+            if k in covered or k not in orig:
+                continue
+            covered.add(k)
+            if k in deleted:
+                pairs.append({"scene": k, "change_type": "삭제", "before": _cut(orig[k]),
+                              "after": "(각색에서 삭제됨)"})
+                continue
+            pairs.append({"scene": k, "change_type": "변경 없음",
+                          "before": "(변경 없음 — after와 동일)", "after": _cut(orig[k])})
+    return pairs
+
+
+def build_market_regulation_check_prompt(market_res: dict, market_meta: dict,
+                                         scene_pairs: list) -> str:
+    """규제 재검사 프롬프트 (Sonnet). 원고를 고치지 않고 비교·보고만 한다."""
+    import json as _json
+    market_meta = market_meta or {}
+    flags = market_meta.get("regulation_flags") or []
+    flag_lines = [
+        f"[플래그 {f['flag_id']}] 조항: {f.get('clause','')} / 씬: {f.get('scene','')} / "
+        f"쟁점: {f.get('issue','')} / 예상 등급: {f.get('expected_rating','')}"
+        for f in flags
+    ]
+    redlines = []
+    for c in (market_res.get("primary"), market_res.get("secondary")):
+        if c:
+            redlines.extend(format_market_redlines(c))
+    pairs_json = _json.dumps(scene_pairs, ensure_ascii=False, indent=2)
+
+    return f"""
+[TASK — 시장 규제 재검사 (Regulation Re-check)]
+각색 전(before)과 각색 후(after) 원고를 비교해, 시장 규제 위험이 어떻게 바뀌었는지 보고하라.
+원고를 고치지 않는다. 수정 제안도 하지 않는다. 비교와 보고만 한다.
+
+[시장 정보]
+{_market_info_line(market_res)}
+
+[Rewrite 규제 플래그 — 각색 전 진단]
+{chr(10).join(flag_lines) if flag_lines else "(없음)"}
+
+[시장 레드라인 — 신규 발생 판정 기준]
+{chr(10).join(redlines) if redlines else "(없음)"}
+
+[씬 쌍 — change_type: 수정 / 신규 추가 / 삭제 / 변경 없음]
+{pairs_json}
+
+[판정 규칙]
+1. 규제 플래그마다 정확히 한 줄을 쓴다 (flag_id 필수). 플래그의 씬 전체를 보고 판정한다.
+   status: "유지"(위험 수준 같음) / "완화"(줄었음) / "강화"(커졌음).
+2. 플래그에 없던 위험이 '수정' 또는 '신규 추가' 씬에서 새로 생겼으면 flag_id를 null로 두고
+   status "신규 발생"으로 한 줄씩 쓴다. clause에는 위 레드라인의 id(예: VN-R3)와 내용을 적는다.
+   레드라인 목록에 없는 법령·조항을 만들어내지 않는다.
+3. '변경 없음'·'삭제' 씬에서는 신규 발생을 판정하지 않는다. 삭제된 씬의 위험은 사라진 것으로 본다.
+4. before / after는 각각 한 줄로 쓴다. 장면 묘사의 강도·노출 범위 중심.
+5. expected_rating은 판단값이다 (예: T16, T18, C). 확신이 없으면 플래그의 예상 등급을 유지한다.
+6. 허용·금지를 단정하지 않는다. 위험의 증감만 보고한다.
+
+[출력 형식 — JSON 단일 객체]
+{{
+  "regulation_check": [
+    {{
+      "flag_id": 1,
+      "clause": "조항",
+      "scene": "S#번호",
+      "before": "각색 전 상태 1줄",
+      "after": "각색 후 상태 1줄",
+      "status": "유지 | 완화 | 강화 | 신규 발생",
+      "expected_rating": "T18"
+    }}
+  ]
+}}
+
+JSON만 출력하라.
+""".strip()
+
+
+def _norm_reg_status(v) -> str:
+    t = _s(v).replace(" ", "")
+    if "신규" in t or t.lower().startswith("new"):
+        return "신규 발생"
+    if "강화" in t:
+        return "강화"
+    if "완화" in t:
+        return "완화"
+    if "유지" in t:
+        return "유지"
+    return ""
+
+
+def normalize_regulation_check(market_meta: dict, raw_result: dict) -> tuple:
+    """규제 재검사 결과 정리. 등급은 올리지 않는다.
+
+    - 기존 플래그 행: grade = Rewrite 플래그의 grade 그대로.
+    - 신규 발생 행: grade = CREATIVE_JUDGMENT (엔진 판단).
+    - 엔진이 빠뜨린 플래그: status '검사 누락'.
+    - 정렬: 신규 발생 → 강화 → 검사 누락 → 완화 → 유지.
+
+    Returns: (rows, warnings)
+    """
+    flags = (market_meta or {}).get("regulation_flags") or []
+    raw = (raw_result or {}).get("regulation_check") if isinstance(raw_result, dict) else None
+    raw = raw if isinstance(raw, list) else []
+    warnings = []
+
+    by_flag = {}
+    new_rows = []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        status = _norm_reg_status(r.get("status"))
+        fid = r.get("flag_id")
+        try:
+            fid = int(str(fid).strip()) if fid not in (None, "", "null") else None
+        except (TypeError, ValueError):
+            fid = None
+        if fid is not None and any(f["flag_id"] == fid for f in flags):
+            by_flag.setdefault(fid, (r, status))
+        elif status == "신규 발생" and _s(r.get("clause")):
+            new_rows.append({
+                "flag_id": None,
+                "clause": _s(r.get("clause")),
+                "scene": _s(r.get("scene")),
+                "before": _s(r.get("before")) or "(위험 없음)",
+                "after": _s(r.get("after")),
+                "status": "신규 발생",
+                "expected_rating": _s(r.get("expected_rating")),
+                "grade": GRADE_CREATIVE_JUDGMENT,
+            })
+
+    rows = []
+    for f in flags:
+        hit = by_flag.get(f["flag_id"])
+        if hit is None:
+            rows.append({
+                "flag_id": f["flag_id"], "clause": f.get("clause", ""), "scene": f.get("scene", ""),
+                "before": f.get("issue", ""), "after": "",
+                "status": REGULATION_STATUS_MISSING,
+                "expected_rating": f.get("expected_rating", ""),
+                "grade": f.get("grade", ""),
+            })
+            warnings.append(f"규제 플래그 {f['flag_id']}: 엔진이 재검사 결과를 보고하지 않았습니다.")
+            continue
+        r, status = hit
+        if not status or status == "신규 발생":
+            warnings.append(f"규제 플래그 {f['flag_id']}: 상태 값 '{_s(r.get('status'))}'를 '유지'로 기록했습니다.")
+            status = "유지"
+        rows.append({
+            "flag_id": f["flag_id"],
+            "clause": f.get("clause", ""),
+            "scene": f.get("scene", ""),
+            "before": _s(r.get("before")),
+            "after": _s(r.get("after")),
+            "status": status,
+            "expected_rating": _s(r.get("expected_rating")) or f.get("expected_rating", ""),
+            "grade": f.get("grade", ""),
+        })
+    rows.extend(new_rows)
+
+    order = {"신규 발생": 0, "강화": 1, REGULATION_STATUS_MISSING: 2, "완화": 3, "유지": 4}
+    rows.sort(key=lambda x: order.get(x["status"], 9))
+    return rows, warnings
+
+
+def build_market_localization_checklist(market_res: dict, scene_text_map: dict) -> list:
+    """1차·2차 시장 고증 체크리스트 (씬 번호만 붙이고 판정하지 않음)."""
+    out = []
+    for c in (market_res.get("primary"), market_res.get("secondary")):
+        if not c:
+            continue
+        for row in build_localization_checklist(c, scene_text_map):
+            row = dict(row)
+            row["market"] = c
+            out.append(row)
+    return out
