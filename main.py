@@ -191,6 +191,7 @@ import io
 from datetime import datetime
 
 import streamlit as st
+from bj_header import render_header  # 공통 헤더 (Writer Engine 기준)
 import anthropic
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
@@ -5905,13 +5906,7 @@ def render_market_report_ui(report):
 # [7] UI 컴포넌트
 # =================================================================
 def render_hero():
-    st.markdown(f"""
-    <div class="rev-hero">
-        <div class="brand">B L U E &nbsp; J E A N S &nbsp; P I C T U R E S</div>
-        <div class="title">REVISE ENGINE <span style="font-size:0.45em; vertical-align:middle; background:#FFCB05; color:#191970; padding:3px 10px; border-radius:12px; margin-left:10px; font-weight:700; letter-spacing:1px;">{ENGINE_VERSION}</span></div>
-        <div class="tag">D I A G N O S E &nbsp; · &nbsp; R E V I S E &nbsp; · &nbsp; V E R I F Y</div>
-    </div>
-    """, unsafe_allow_html=True)
+    render_header("REVISE ENGINE", note=f"{ENGINE_VERSION} · DIAGNOSE · REVISE · VERIFY")
 
 
 def render_stepbar():
