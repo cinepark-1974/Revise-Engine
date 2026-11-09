@@ -5906,7 +5906,7 @@ def render_market_report_ui(report):
 # [7] UI 컴포넌트
 # =================================================================
 def render_hero():
-    render_header("REVISE ENGINE", note=f"{ENGINE_VERSION} · DIAGNOSE · REVISE · VERIFY")
+    render_header("REVISE ENGINE", tagline="SCREENPLAY REVISION", note=f"{ENGINE_VERSION} · DIAGNOSE · REVISE · VERIFY")
 
 
 def render_stepbar():
